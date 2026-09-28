@@ -20,7 +20,8 @@ services:
       # bind-mount your dashboard certs there too or switch dashboard.tls to
       # absolute /etc/ssl/brew/... paths like the others.
       - ./tls:/etc/ssl/brew:ro
-      # Persists brew-history.bin (completed calls/SDS log, [storage] enabled)
+      # Persists brew-history.bin (completed calls/SDS log, [storage] enabled),
+      # sms-center.json (SMS Center queue, [sms_center] enabled)
       # and any SIP registration/dialog state across container restarts.
       - brew-server-data:/var/lib/brew-server
     environment:

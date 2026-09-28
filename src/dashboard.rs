@@ -43,6 +43,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
         .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
         .route("/api/config/bts-locations/{username}", axum::routing::post(upsert_bts_location).delete(delete_bts_location))
+        .route("/api/sms-center/{id}", axum::routing::delete(sms_center_delete))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     let app = Router::new()
@@ -68,6 +69,8 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/sip", get(sip_snapshot))
         .route("/api/sip/config", get(sip_config))
         .route("/api/whoami", get(whoami))
+        .route("/sms-center", get(sms_center_page))
+        .route("/api/sms-center", get(sms_center_snapshot))
         .merge(settings_routes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
         .with_state(state.clone());
@@ -245,6 +248,13 @@ static REGISTRATIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::ne
     "d",
     "`<tr><td>${dt(x.at_ms)}</td><td>${esc(x.bts)}</td><td>${x.issi}</td><td>${x.kind==='register'?'<span class=\"badge badge-reg-in\">Registered</span>':x.kind==='deregister'?'<span class=\"badge badge-reg-out\">Deregistered</span>':'<span class=\"badge badge-reg-timeout\">Timed out</span>'}</td></tr>`",
     &["Time", "BTS", "ISSI", "Event"], 15, "No registration events yet",
+));
+
+static SMS_CENTER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
+    "SMS Center", "/api/sms-center",
+    "(d.messages||[]).slice().sort((a,b)=>b.stored_at_ms-a.stored_at_ms)",
+    "`<tr><td>${new Date(x.stored_at_ms).toLocaleString()}</td><td>${x.source_issi}</td><td>${x.destination}</td><td>${x.text?esc(x.text):'<span class=muted>'+esc(x.data_hex.slice(0,24))+'</span>'}</td><td>${x.in_flight?'<span class=\"badge badge-reg-timeout\">Delivering</span>':'<span class=\"badge badge-sds\">Waiting</span>'}</td><td>${x.attempts}</td><td>${new Date(x.expires_at_ms).toLocaleString()}</td><td><button onclick=\"if(confirm('Delete this stored message?'))fetch('/api/sms-center/${x.id}',{method:'DELETE'}).then(load)\">Delete</button></td></tr>`",
+    &["Stored", "From", "To", "Message", "Status", "Attempts", "Expires", ""], 20, "No stored messages",
 ));
 
 /// Standalone map page. Plots the latest decoded MS positions on an
@@ -596,6 +606,12 @@ pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
 }
 
 pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
+pub async fn sms_center_page() -> Html<&'static str> { Html(SMS_CENTER_HTML.as_str()) }
+pub async fn sms_center_snapshot(State(state): State<Arc<AppState>>) -> Json<crate::sms_center::Snapshot> { Json(state.sms_center.snapshot()) }
+/// Admin only: discard one stored message.
+pub async fn sms_center_delete(State(state): State<Arc<AppState>>, Path(id): Path<uuid::Uuid>) -> StatusCode {
+    if state.sms_center.delete(id) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+}
 
 #[derive(serde::Serialize)]
 pub struct BtsLocation {
@@ -927,7 +943,7 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sms-center">SMS Center<span class=sub>Messages stored for offline radios</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class=bts-grid id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
@@ -1089,6 +1105,7 @@ mod tests {
         assert!(h.contains("href=\"/sds\""));
         assert!(h.contains("href=\"/telemetry-sds\""));
         assert!(h.contains("href=\"/registrations\""));
+        assert!(h.contains("href=\"/sms-center\""));
         // the three moved tables must be gone from the main page
         assert!(!h.contains("id=sdstable"), "recent SDS table removed from index");
         assert!(!h.contains("id=history"), "recent calls table removed from index");
@@ -1102,6 +1119,7 @@ mod tests {
             ("sds", SDS_HTML.as_str(), "/api/status"),
             ("telemetry", TELEMETRY_SDS_HTML.as_str(), "/api/telemetry"),
             ("registrations", REGISTRATIONS_HTML.as_str(), "/api/registrations"),
+            ("sms_center", SMS_CENTER_HTML.as_str(), "/api/sms-center"),
         ] {
             assert!(!html.contains("__STYLE__"), "{name}: style substituted");
             assert!(html.contains("id=log"), "{name}: log table body present");

@@ -34,6 +34,10 @@ pub struct Config {
     pub sip: SipConfig,
     pub federation: FederationConfig,
     pub aprs: AprsConfig,
+    /// Store-and-forward for individual SDS addressed to a subscriber that is
+    /// not currently registered on any connected Basestation/peer. See
+    /// `sms_center`.
+    pub sms_center: SmsCenterConfig,
     /// Fixed geographic locations for Basestations, keyed by the same numeric
     /// Brew username each one authenticates with under `[auth.users]` -- so a
     /// location entry automatically matches whichever connection actually
@@ -56,6 +60,70 @@ pub struct BtsLocationConfig {
 impl Default for BtsLocationConfig {
     fn default() -> Self {
         Self { name: String::new(), lat: 0.0, lon: 0.0 }
+    }
+}
+
+/// SMS Center: store-and-forward of individual SDS for offline subscribers.
+///
+/// When an SDS arrives for an ISSI that is not registered anywhere on the
+/// Brew network, the message is written to a JSON file instead of being
+/// dropped, and delivered as soon as that ISSI registers again (on any
+/// Basestation or federation peer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmsCenterConfig {
+    pub enabled: bool,
+    /// JSON file holding the queue and the set of known ISSIs.
+    pub path: PathBuf,
+    /// How long an undelivered message is kept before it is discarded.
+    pub message_ttl_seconds: u64,
+    /// Only queue SDS for ISSIs that have registered on this server at least
+    /// once. Prevents queuing for gateway/app ISSIs that never register (e.g.
+    /// LIP beacons to a dispatcher address) and for GSSIs with no members.
+    pub only_known_destinations: bool,
+    /// SDS protocol identifiers (first payload byte) that are never stored.
+    /// Default: 10 (0x0A, LIP location reports -- stale positions are useless).
+    pub exclude_protocol_ids: Vec<u8>,
+    /// Per-destination queue limit.
+    pub max_messages_per_destination: usize,
+    /// Global queue limit.
+    pub max_messages_total: usize,
+    /// Send the originator an SDS-TL report "destination not reachable,
+    /// message stored" (0x22) when a message is queued, and "validity period
+    /// expired" (0x48) / "delivery failed" (0x4A) if it is later discarded.
+    /// Only for SDS-TL messages whose sender asked for a delivery report.
+    pub send_status_reports: bool,
+    /// Wait this long after a subscriber registers before delivering its
+    /// queued messages, so the Basestation finishes registration signalling.
+    pub delivery_delay_ms: u64,
+    /// Gap between consecutive queued messages delivered to the same ISSI.
+    pub delivery_spacing_ms: u64,
+    /// If the destination Basestation does not answer a delivery with an
+    /// SDS_REPORT within this time, the attempt is considered failed.
+    pub ack_timeout_seconds: u64,
+    /// Minimum time between retries while the destination stays registered.
+    pub retry_interval_seconds: u64,
+    /// Delivery attempts before a message is dropped (0 = unlimited, until TTL).
+    pub max_attempts: u32,
+}
+
+impl Default for SmsCenterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: PathBuf::from("sms-center.json"),
+            message_ttl_seconds: 7 * 24 * 3600,
+            only_known_destinations: true,
+            exclude_protocol_ids: vec![0x0A],
+            max_messages_per_destination: 50,
+            max_messages_total: 5000,
+            send_status_reports: true,
+            delivery_delay_ms: 2000,
+            delivery_spacing_ms: 1500,
+            ack_timeout_seconds: 30,
+            retry_interval_seconds: 60,
+            max_attempts: 10,
+        }
     }
 }
 
@@ -474,6 +542,7 @@ impl Default for Config {
             sip: SipConfig::default(),
             federation: FederationConfig::default(),
             aprs: AprsConfig::default(),
+            sms_center: SmsCenterConfig::default(),
             bts_locations: HashMap::new(),
         }
     }

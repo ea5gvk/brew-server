@@ -223,10 +223,20 @@ async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
     // SDS_TRANSFER can be attributed (and its position decoded) even when the
     // destination is not a registered Brew subscriber — position beacons are
     // often addressed to an external app/gateway ISSI that never registers.
-    inner.sds_routes.insert(id, SdsRoute { source_client: source, targets: targets.clone(), source_issi, destination, created_at: Instant::now() });
+    // SMS Center: an individual destination that is offline everywhere (not a
+    // GSSI with affiliated members) is kept for later delivery once the
+    // SDS_TRANSFER carrying the payload arrives.
+    let store_offline = targets.is_empty()
+        && !inner.group_clients.contains_key(&destination)
+        && state.sms_center.wants(destination);
+    inner.sds_routes.insert(id, SdsRoute { source_client: source, targets: targets.clone(), source_issi, destination, created_at: Instant::now(), store_offline });
     if targets.is_empty() {
         drop(inner);
-        warn!(%source, uuid=%id, channel="brew", source_issi, destination, lip=sds_is_lip(&raw), "SDS has no registered destination (position still tracked)");
+        if store_offline {
+            info!(%source, uuid=%id, source_issi, destination, "SDS destination offline; SMS Center will store it");
+        } else {
+            warn!(%source, uuid=%id, channel="brew", source_issi, destination, lip=sds_is_lip(&raw), "SDS has no registered destination (position still tracked)");
+        }
         return;
     }
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
@@ -239,18 +249,25 @@ async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
 async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
     // Look up the route (stored by the SHORT_TRANSFER header, even when the SDS
     // was undeliverable) to recover the source ISSI and any delivery targets.
-    let (source_issi, txs) = {
-        let inner = state.inner.read().await;
-        match inner.sds_routes.get(&id) {
+    let (source_issi, txs, store_for) = {
+        let mut inner = state.inner.write().await;
+        match inner.sds_routes.get_mut(&id) {
             Some(route) if route.source_client == source => {
-                let txs = route.targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
-                (route.source_issi, txs)
+                // Store at most once per transaction, even if a client repeats the frame.
+                let store_for = std::mem::take(&mut route.store_offline).then_some(route.destination);
+                let (source_issi, targets) = (route.source_issi, route.targets.clone());
+                let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
+                (source_issi, txs, store_for)
             }
             Some(_) => { warn!(%source, uuid=%id, "SDS_TRANSFER from non-originating client"); return; }
-            None => { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)"); (0u32, Vec::new()) }
+            None => { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)"); (0u32, Vec::new(), None) }
         }
     };
     for tx in &txs { let _ = tx.send(raw.clone()); }
+
+    if let Some(destination) = store_for {
+        store_offline_sds(state, source, id, source_issi, destination, &raw).await;
+    }
 
     // TEMPORARY (position debugging): dump the raw SDS_TRANSFER frame so the LIP
     // payload offset can be confirmed against live traffic. Remove once binary
@@ -265,6 +282,29 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
         state.telemetry.write().await.record_sds_position(source_issi, lat, lon, now, note);
         crate::aprs::report_position(state, source_issi, lat, lon);
         info!(uuid=%id, source_issi, lat, lon, "decoded MS position from SDS");
+    }
+}
+
+/// Hands an undeliverable SDS to the SMS Center and, when the sender asked
+/// for an SDS-TL report, tells it the message was stored.
+async fn store_offline_sds(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, source_issi: u32, destination: u32, raw: &[u8]) {
+    let Ok(BrewMessage::Frame(frame)) = protocol::parse(raw) else { return };
+    use crate::sms_center::{report_to_originator, status, StoreOutcome};
+    match state.sms_center.store(source_issi, destination, frame.length_bits, &frame.data, crate::telemetry::now_ms()) {
+        StoreOutcome::Stored(m) => {
+            info!(uuid=%id, sms_id=%m.id, source_issi, destination, text=?m.text, "SMS Center: stored SDS for offline subscriber");
+            state.monitor.sds(id, source_issi, destination).await;
+            report_to_originator(state, source_issi, destination, &frame.data, status::DEST_NOT_REACHABLE_STORED, Some(source)).await;
+        }
+        StoreOutcome::Duplicate(m) => {
+            debug!(uuid=%id, sms_id=%m.id, source_issi, destination, "SMS Center: retransmission of an already stored SDS");
+            report_to_originator(state, source_issi, destination, &frame.data, status::DEST_NOT_REACHABLE_STORED, Some(source)).await;
+        }
+        StoreOutcome::QueueFull => {
+            warn!(uuid=%id, source_issi, destination, "SMS Center: queue full, SDS not stored");
+            report_to_originator(state, source_issi, destination, &frame.data, status::DEST_QUEUE_FULL, Some(source)).await;
+        }
+        StoreOutcome::Skipped(why) => debug!(uuid=%id, source_issi, destination, why, "SMS Center: SDS not stored"),
     }
 }
 
@@ -326,6 +366,11 @@ async fn handle_sds_report(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
     // For unicast the transaction is complete. For multicast keep it until TTL so multiple reports can return.
     if route.targets.len() == 1 { inner.sds_routes.remove(&id); }
     drop(inner);
+    if route.source_client == crate::sms_center::SMS_CENTER_CLIENT {
+        if let Some(m) = state.sms_center.on_report(id) {
+            info!(%source, uuid=%id, sms_id=%m.id, source_issi=m.source_issi, destination=m.destination, attempts=m.attempts, "SMS Center: stored SDS delivered");
+        }
+    }
     if let Some(tx) = tx { let _ = tx.send(raw); }
     state.monitor.sds_report(id).await;
     info!(%source, uuid=%id, source_issi=route.source_issi, destination=route.destination, "routed SDS report");
@@ -536,6 +581,8 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     // released (mirrors how position decoding logs via `state.telemetry`
     // outside of the `inner` lock elsewhere in this module).
     let mut ms_reg_event: Option<&'static str> = None;
+    // Set when an ISSI (re)registers, to flush its SMS Center queue.
+    let mut registered_issi: Option<u32> = None;
     // Captured before the match below (which may consume `msg.groups`), for
     // the federation relay after it.
     let relay_groups = msg.groups.clone();
@@ -552,6 +599,7 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
             }
             inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups, mode: source_mode });
             info!(%source, issi=msg.issi, mode=source_mode.as_str(), "subscriber registered");
+            registered_issi = Some(msg.issi);
             if source_mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("register"); }
         }
         SUB_DEREGISTER => {
@@ -614,6 +662,13 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     // an MS registering directly over the Brew protocol is visible there too.
     if let Some(kind) = ms_reg_event {
         state.telemetry.write().await.record_brew_registration(msg.issi, kind);
+    }
+    if let Some(issi) = registered_issi {
+        state.sms_center.note_known(issi);
+        if state.sms_center.has_pending_for(issi) {
+            info!(issi, "SMS Center: subscriber back online, delivering stored SDS");
+            tokio::spawn(crate::sms_center::deliver_pending(state.clone(), issi, true));
+        }
     }
 }
 

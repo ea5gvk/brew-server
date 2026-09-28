@@ -119,6 +119,9 @@ pub struct SdsRoute {
     pub source_issi: u32,
     pub destination: u32,
     pub created_at: Instant,
+    /// Nobody could receive this SDS and the SMS Center wants to keep it: the
+    /// following `SDS_TRANSFER` payload is stored for later delivery.
+    pub store_offline: bool,
 }
 
 #[derive(Default)]
@@ -240,6 +243,8 @@ pub struct AppState {
     /// or SDS routing. Sends are safely dropped if `aprs::run` was never
     /// started or has exited.
     pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
+    /// Store-and-forward queue for SDS to offline subscribers.
+    pub sms_center: crate::sms_center::SmsCenter,
 }
 
 /// Runtime handles for the SIP subsystem, shared with the dashboard.
@@ -273,6 +278,7 @@ impl AppState {
             None => TelemetryState::default(),
         };
         let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
+        let sms_center = crate::sms_center::SmsCenter::open(config.sms_center.clone());
         (
             Self {
                 config,
@@ -283,6 +289,7 @@ impl AppState {
                 control: RwLock::new(ControlState::default()),
                 sip: RwLock::new(None),
                 aprs_tx,
+                sms_center,
             },
             aprs_rx,
         )
