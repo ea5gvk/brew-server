@@ -2,6 +2,26 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.10.0 adds:
+
+- **SMS Center (store-and-forward SDS).** An individual SDS addressed to an
+  ISSI that is offline everywhere on the Brew network used to be dropped
+  ("SDS has no registered destination"). It is now stored in a JSON file
+  (`[sms_center].path`, default `sms-center.json`) and delivered when that
+  ISSI registers again on any Basestation or federation peer: the server
+  originates a normal `SHORT_TRANSFER` + `SDS_TRANSFER` from the original
+  sender, so the radio sees the real source and its own SDS-TL report goes
+  back end-to-end. A message stays queued until the destination Basestation
+  answers with `SDS_REPORT`; unanswered attempts are retried
+  (`ack_timeout_seconds`, `retry_interval_seconds`, `max_attempts`) until
+  `message_ttl_seconds`. If the sender requested an SDS-TL delivery report it
+  receives "destination not reachable, message stored" (0x22) on queueing,
+  and "validity period expired" (0x48) / "delivery failed" (0x4A) if the
+  message is later discarded. By default only ISSIs that have registered
+  before are eligible, and LIP positions (PID 0x0A) are never stored. New
+  dashboard page `/sms-center` and API `GET /api/sms-center`,
+  `DELETE /api/sms-center/{id}` (admins).
+
 Version 1.9.1 adds:
 
 - **Call inactivity timeout.** New top-level `call_inactivity_timeout_seconds`

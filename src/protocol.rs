@@ -523,6 +523,33 @@ pub fn build_subscriber_message(msg_type: u8, issi: u32, groups: &[u32]) -> Vec<
     out
 }
 
+/// Builds a `CALL_SHORT_TRANSFER` (SDS header) exactly as Basestation/
+/// FlowStation send it: uuid, source ISSI, destination ISSI and a 32-byte
+/// zero-filled external `number` field (58 bytes total). Used by the SMS
+/// Center to originate a stored SDS towards its destination.
+pub fn build_short_transfer(id: &Uuid, source: u32, destination: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(58);
+    out.push(CLASS_CALL_CONTROL);
+    out.push(CALL_SHORT_TRANSFER);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source.to_le_bytes());
+    out.extend_from_slice(&destination.to_le_bytes());
+    out.extend_from_slice(&[0u8; 32]);
+    out
+}
+
+/// Builds a `FRAME_SDS_TRANSFER` carrying the SDS user data that follows a
+/// `CALL_SHORT_TRANSFER` with the same uuid.
+pub fn build_sds_transfer_frame(id: &Uuid, length_bits: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + data.len());
+    out.push(CLASS_FRAME);
+    out.push(FRAME_SDS_TRANSFER);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&length_bits.to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 pub fn raw_peer_pair(payload: &CallPayload) -> Option<(u32, u32)> {
     let CallPayload::Raw(raw) = payload else { return None };
     if raw.len() < 8 { return None; }
@@ -722,6 +749,31 @@ pub fn build_dtmf_frame(id: &Uuid, digit: u8) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_transfer_and_sds_frame_round_trip() {
+        let id = Uuid::new_v4();
+        let st = build_short_transfer(&id, 1001, 2002);
+        assert_eq!(st.len(), 58);
+        match parse(&st).unwrap() {
+            BrewMessage::CallControl(cc) => {
+                assert_eq!(cc.call_state, CALL_SHORT_TRANSFER);
+                assert_eq!(cc.identifier, id);
+                assert!(matches!(cc.payload, CallPayload::ShortTransfer { source: 1001, destination: 2002 }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let fr = build_sds_transfer_frame(&id, 40, &[0x82, 0x04, 0x07, 0x01, b'H']);
+        match parse(&fr).unwrap() {
+            BrewMessage::Frame(f) => {
+                assert_eq!(f.frame_type, FRAME_SDS_TRANSFER);
+                assert_eq!(f.identifier, id);
+                assert_eq!(f.length_bits, 40);
+                assert_eq!(f.data, vec![0x82, 0x04, 0x07, 0x01, b'H']);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     #[test]
     fn build_call_control_empty_round_trips_as_empty_payload() {

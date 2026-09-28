@@ -10,6 +10,7 @@ mod protocol;
 mod router;
 mod server;
 mod sip;
+mod sms_center;
 mod state;
 mod store;
 mod telemetry;
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(federation::run(state.clone()));
     tokio::spawn(aprs::run(state.clone(), aprs_rx));
+    tokio::spawn(sms_center::run(state.clone()));
 
     tokio::try_join!(
         server::run(state.clone()),
