@@ -1014,7 +1014,8 @@ function renderTelemetry(stations){
   // currently registered on each connected station.
   $('registrations').innerHTML=stations.length?stations.map(s=>{
     const issis=s.registrations_list||[];
-    const chips=issis.length?`<div class=reg-list>${issis.map(i=>`<span class=reg-issi>${esc(String(i))}</span>`).join('')}</div>`:'<div class="bts-meta muted" style="margin-top:8px">No subscribers registered</div>';
+    const cellOf={};(s.ms_cell_out||[]).forEach(([i,c])=>{cellOf[i]=c;});
+    const chips=issis.length?`<div class=reg-list>${issis.map(i=>`<span class=reg-issi>${esc(String(i))}${cellOf[i]!=null?` <span class=muted>cell ${cellOf[i]}</span>`:''}</span>`).join('')}</div>`:'<div class="bts-meta muted" style="margin-top:8px">No subscribers registered</div>';
     return `<div class=bts-card><div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}</h3><span class=reg-count>${issis.length} registered</span></div>${chips}</div>`;
   }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
 }

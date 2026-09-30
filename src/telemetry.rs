@@ -160,6 +160,8 @@ pub enum TelemetryEvent {
 
     BrewConnected { connected: bool, server_version: u8 },
     DapnetLog { direction: String, id: String, callsign: String, recipient: String, text: String, priority: Option<u8>, paths: Vec<String> },
+    /// Multi-cell station: the MS that just registered is on this cell (0 = primary).
+    MsCell { issi: u32, cell: u8 },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -253,6 +255,11 @@ pub struct TelemetryBts {
     pub recent_regs: VecDeque<RegLogEntry>,
     /// Serialized view of `recent_regs` for the dashboard.
     pub recent_regs_out: Vec<RegLogEntry>,
+    /// Multi-cell stations only: cell each registered ISSI is on (0 = primary).
+    #[serde(skip)]
+    pub ms_cell: HashMap<u32, u8>,
+    /// Serialized view of `ms_cell` as sorted `[issi, cell]` pairs.
+    pub ms_cell_out: Vec<(u32, u8)>,
     pub active_calls: HashMap<u16, TelemetryCall>,
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
@@ -327,6 +334,8 @@ impl TelemetryBts {
             registrations_list: Vec::new(),
             recent_regs: VecDeque::new(),
             recent_regs_out: Vec::new(),
+            ms_cell: HashMap::new(),
+            ms_cell_out: Vec::new(),
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
             last_tx_quality: None,
@@ -402,6 +411,11 @@ impl TelemetryBts {
     /// Recomputes the serialized registration view (count + sorted ISSI list)
     /// after the `registrations` set changes.
     fn sync_registrations(&mut self) {
+        let regs = &self.registrations;
+        self.ms_cell.retain(|issi, _| regs.contains(issi));
+        let mut cells: Vec<(u32, u8)> = self.ms_cell.iter().map(|(k, v)| (*k, *v)).collect();
+        cells.sort_unstable_by_key(|(k, _)| *k);
+        self.ms_cell_out = cells;
         self.registration_count = self.registrations.len();
         let mut list: Vec<u32> = self.registrations.iter().copied().collect();
         list.sort_unstable();
@@ -660,6 +674,11 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
             bts.registrations.remove(&issi); bts.sync_registrations();
             bts.push_reg(issi, "deregister");
         }
+        TelemetryEvent::MsCell { issi, cell } => {
+            if bts.registrations.contains(&issi) {
+                bts.ms_cell.insert(issi, cell); bts.sync_registrations();
+            }
+        }
         TelemetryEvent::MsTimeoutDrop { issi } => {
             bts.registrations.remove(&issi); bts.sync_registrations();
             bts.push_reg(issi, "timeout");
@@ -794,6 +813,25 @@ mod tests {
         bts.sync_registrations();
         assert_eq!(bts.registration_count, 2);
         assert_eq!(bts.registrations_list, vec![10, 30]);
+    }
+
+    #[test]
+    fn ms_cell_tracks_registered_issis_only() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.registrations.insert(7);
+        bts.ms_cell.insert(7, 1);
+        bts.ms_cell.insert(8, 0);
+        bts.sync_registrations();
+        assert_eq!(bts.ms_cell_out, vec![(7, 1)], "cell of an unregistered ISSI is dropped");
+        bts.registrations.remove(&7);
+        bts.sync_registrations();
+        assert!(bts.ms_cell_out.is_empty());
+    }
+
+    #[test]
+    fn ms_cell_event_decodes() {
+        let e: TelemetryEvent = serde_json::from_str(r#"{"MsCell":{"issi":7,"cell":1}}"#).unwrap();
+        assert!(matches!(e, TelemetryEvent::MsCell { issi: 7, cell: 1 }));
     }
 
     #[test]
