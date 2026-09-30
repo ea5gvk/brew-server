@@ -179,6 +179,10 @@ pub struct CellInfo {
     pub neighbours: u16,
     pub device: Option<String>,
     pub registered_radios: u32,
+    /// ISSIs registered on this cell. `None` from FlowStation builds that
+    /// predate the field; those keep the event-derived registration list.
+    #[serde(default)]
+    pub registered_issis: Option<Vec<u32>>,
     pub rf_state: Option<String>,
     pub rf_detail: Option<String>,
 }
@@ -454,6 +458,27 @@ impl TelemetryBts {
         self.registrations_list = list;
     }
 
+    /// Stores a `CellsSnapshot`. When every cell lists its registered ISSIs,
+    /// the station's registration list (and each ISSI's cell) is resynced from
+    /// it, repairing whatever registration events were missed -- e.g. radios
+    /// that registered before the telemetry connection (re)started.
+    fn apply_cells_snapshot(&mut self, cells: Vec<CellInfo>) {
+        if cells.iter().all(|c| c.registered_issis.is_some()) {
+            self.registrations.clear();
+            self.ms_cell.clear();
+            for c in &cells {
+                for &issi in c.registered_issis.iter().flatten() {
+                    self.registrations.insert(issi);
+                    if cells.len() > 1 {
+                        self.ms_cell.insert(issi, c.id);
+                    }
+                }
+            }
+            self.sync_registrations();
+        }
+        self.cells = cells;
+    }
+
     /// Appends a registration lifecycle event to the rolling log (newest
     /// first, capped at 50 like `recent_sds`).
     fn push_reg(&mut self, issi: u32, kind: &'static str) {
@@ -714,7 +739,7 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         }
         TelemetryEvent::CellsSnapshot { site_linked, cells } => {
             bts.site_linked = Some(site_linked);
-            bts.cells = cells;
+            bts.apply_cells_snapshot(cells);
         }
         TelemetryEvent::MsTimeoutDrop { issi } => {
             bts.registrations.remove(&issi); bts.sync_registrations();
@@ -876,6 +901,35 @@ mod tests {
         assert!(site_linked);
         assert_eq!(cells[0].carriers[0].tx_freq_hz, 438_025_000);
         assert_eq!(cells[0].rf_state.as_deref(), Some("online"));
+    }
+
+    fn cell(id: u8, issis: Option<Vec<u32>>) -> CellInfo {
+        CellInfo {
+            id, primary: id == 0, main_carrier: 1, secondary_carrier: None, carriers: Vec::new(),
+            colour_code: 1, location_area: 1, neighbours: 0, device: None,
+            registered_radios: issis.as_ref().map_or(0, |v| v.len() as u32),
+            registered_issis: issis, rf_state: None, rf_detail: None,
+        }
+    }
+
+    #[test]
+    fn cells_snapshot_resyncs_registrations() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.registrations.insert(99); // stale: deregistered while telemetry was down
+        bts.apply_cells_snapshot(vec![cell(0, Some(vec![1, 2])), cell(1, Some(vec![3]))]);
+        assert_eq!(bts.registrations_list, vec![1, 2, 3]);
+        assert_eq!(bts.registration_count, 3);
+        assert_eq!(bts.ms_cell_out, vec![(1, 0), (2, 0), (3, 1)]);
+    }
+
+    #[test]
+    fn cells_snapshot_without_issis_keeps_event_registrations() {
+        let mut bts = TelemetryBts::new("bts-1".to_string(), None);
+        bts.registrations.insert(7);
+        bts.sync_registrations();
+        bts.apply_cells_snapshot(vec![cell(0, None)]);
+        assert_eq!(bts.registrations_list, vec![7]);
+        assert_eq!(bts.cells.len(), 1);
     }
 
     #[test]
