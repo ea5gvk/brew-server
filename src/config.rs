@@ -88,11 +88,17 @@ pub struct SmsCenterConfig {
     pub max_messages_per_destination: usize,
     /// Global queue limit.
     pub max_messages_total: usize,
-    /// Send the originator an SDS-TL report "destination not reachable,
-    /// message stored" (0x22) when a message is queued, and "validity period
+    /// Send the originator an SDS-TL report (`stored_report_status`) when a
+    /// message is queued, and "validity period
     /// expired" (0x48) / "delivery failed" (0x4A) if it is later discarded.
     /// Only for SDS-TL messages whose sender asked for a delivery report.
     pub send_status_reports: bool,
+    /// SDS-TL delivery status reported to the sender when its message is
+    /// queued. Default 0x00 ("receipt acknowledged by destination"): terminals
+    /// show any non-zero status -- including the ETSI-correct 0x22
+    /// "destination not reachable, message stored" -- as "failed". Set 34
+    /// (0x22) for radios that render temporary-error statuses properly.
+    pub stored_report_status: u8,
     /// Wait this long after a subscriber registers before delivering its
     /// queued messages, so the Basestation finishes registration signalling.
     pub delivery_delay_ms: u64,
@@ -118,6 +124,7 @@ impl Default for SmsCenterConfig {
             max_messages_per_destination: 50,
             max_messages_total: 5000,
             send_status_reports: true,
+            stored_report_status: 0x00,
             delivery_delay_ms: 2000,
             delivery_spacing_ms: 1500,
             ack_timeout_seconds: 30,

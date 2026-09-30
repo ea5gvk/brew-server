@@ -2,6 +2,21 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.11.0 adds:
+
+- **Basestation cells in the telemetry dashboard.** Each Basestation card
+  shows its cells from FlowStation's `CellsSnapshot` telemetry: carriers with
+  TX/RX frequencies, colour code / location area, neighbours, registered
+  radios, RF state and SDR, and whether the cells are site-linked. On
+  multi-cell stations the active-calls table gains a Cell column and
+  registered ISSIs show their cell. Telemetry cards are wider (at least
+  480 px). `/api/telemetry` gains `cells`, `site_linked` and `ms_cell_out`.
+- **Multi-cell telemetry.** The `MsCell` event is decoded instead of being
+  logged as a malformed event.
+- **Registration list resync.** A station's registration list used to start
+  empty on every telemetry reconnect, so radios registered earlier never
+  showed. It is now rebuilt from each `CellsSnapshot` (FlowStation v0.5.1+).
+
 Version 1.10.0 adds:
 
 - **SMS Center (store-and-forward SDS).** An individual SDS addressed to an
@@ -15,7 +30,8 @@ Version 1.10.0 adds:
   answers with `SDS_REPORT`; unanswered attempts are retried
   (`ack_timeout_seconds`, `retry_interval_seconds`, `max_attempts`) until
   `message_ttl_seconds`. If the sender requested an SDS-TL delivery report it
-  receives "destination not reachable, message stored" (0x22) on queueing,
+  receives a report on queueing (`stored_report_status`, default 0x00
+  "received", because radios show the ETSI 0x22 "stored" status as failed),
   and "validity period expired" (0x48) / "delivery failed" (0x4A) if the
   message is later discarded. By default only ISSIs that have registered
   before are eligible, and LIP positions (PID 0x0A) are never stored. New
