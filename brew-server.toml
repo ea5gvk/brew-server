@@ -216,6 +216,8 @@ exclude_protocol_ids = [10]           # never store LIP (0x0A) position reports
 max_messages_per_destination = 50
 max_messages_total = 5000
 send_status_reports = true            # SDS-TL "stored" / "expired" reports to the sender
+stored_report_status = 0              # status sent on queueing: 0 = "received" (radio shows
+                                      # delivered); 34 (0x22) = ETSI "stored", but most radios show "failed"
 delivery_delay_ms = 2000              # wait after registration before delivering
 delivery_spacing_ms = 1500            # gap between queued messages to one ISSI
 ack_timeout_seconds = 30              # no SDS_REPORT from the BS within this -> retry

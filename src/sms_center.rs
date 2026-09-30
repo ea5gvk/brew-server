@@ -47,6 +47,8 @@ pub const SMS_CENTER_CLIENT: ClientId = Uuid::nil();
 
 /// SDS-TL delivery status codes (ETSI EN 300 392-2, clause 29.4.3.2).
 pub mod status {
+    /// ETSI "destination not reachable, message stored"; see `stored_report_status`.
+    #[allow(dead_code)]
     pub const DEST_NOT_REACHABLE_STORED: u8 = 0x22;
     pub const VALIDITY_EXPIRED_NOT_RECEIVED: u8 = 0x48;
     pub const DELIVERY_FAILED: u8 = 0x4A;
@@ -708,7 +710,7 @@ mod tests {
         let hdr = parse(&a_rx.try_recv().unwrap()).unwrap();
         assert!(matches!(hdr, BrewMessage::CallControl(CallControlMessage { payload: CallPayload::ShortTransfer { source: 2002, destination: 1001 }, .. })));
         let BrewMessage::Frame(f) = parse(&a_rx.try_recv().unwrap()).unwrap() else { panic!() };
-        assert_eq!(f.data, vec![0x82, 0x10, status::DEST_NOT_REACHABLE_STORED, 7]);
+        assert_eq!(f.data, vec![0x82, 0x10, 0x00, 7]);
 
         // 2002 comes back on B: the stored SDS is delivered from 1001.
         pkt(&state, b, build_subscriber_message(SUB_REGISTER, 2002, &[])).await;

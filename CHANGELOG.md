@@ -15,7 +15,8 @@ Version 1.10.0 adds:
   answers with `SDS_REPORT`; unanswered attempts are retried
   (`ack_timeout_seconds`, `retry_interval_seconds`, `max_attempts`) until
   `message_ttl_seconds`. If the sender requested an SDS-TL delivery report it
-  receives "destination not reachable, message stored" (0x22) on queueing,
+  receives a report on queueing (`stored_report_status`, default 0x00
+  "received", because radios show the ETSI 0x22 "stored" status as failed),
   and "validity period expired" (0x48) / "delivery failed" (0x4A) if the
   message is later discarded. By default only ISSIs that have registered
   before are eligible, and LIP positions (PID 0x0A) are never stored. New

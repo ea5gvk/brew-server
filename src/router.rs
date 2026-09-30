@@ -294,11 +294,11 @@ async fn store_offline_sds(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
         StoreOutcome::Stored(m) => {
             info!(uuid=%id, sms_id=%m.id, source_issi, destination, text=?m.text, "SMS Center: stored SDS for offline subscriber");
             state.monitor.sds(id, source_issi, destination).await;
-            report_to_originator(state, source_issi, destination, &frame.data, status::DEST_NOT_REACHABLE_STORED, Some(source)).await;
+            report_to_originator(state, source_issi, destination, &frame.data, state.sms_center.config().stored_report_status, Some(source)).await;
         }
         StoreOutcome::Duplicate(m) => {
             debug!(uuid=%id, sms_id=%m.id, source_issi, destination, "SMS Center: retransmission of an already stored SDS");
-            report_to_originator(state, source_issi, destination, &frame.data, status::DEST_NOT_REACHABLE_STORED, Some(source)).await;
+            report_to_originator(state, source_issi, destination, &frame.data, state.sms_center.config().stored_report_status, Some(source)).await;
         }
         StoreOutcome::QueueFull => {
             warn!(uuid=%id, source_issi, destination, "SMS Center: queue full, SDS not stored");
