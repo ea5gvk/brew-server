@@ -2,6 +2,21 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.11.0 adds:
+
+- **Basestation cells in the telemetry dashboard.** Each Basestation card
+  shows its cells from FlowStation's `CellsSnapshot` telemetry: carriers with
+  TX/RX frequencies, colour code / location area, neighbours, registered
+  radios, RF state and SDR, and whether the cells are site-linked. On
+  multi-cell stations the active-calls table gains a Cell column and
+  registered ISSIs show their cell. Telemetry cards are wider (at least
+  480 px). `/api/telemetry` gains `cells`, `site_linked` and `ms_cell_out`.
+- **Multi-cell telemetry.** The `MsCell` event is decoded instead of being
+  logged as a malformed event.
+- **Registration list resync.** A station's registration list used to start
+  empty on every telemetry reconnect, so radios registered earlier never
+  showed. It is now rebuilt from each `CellsSnapshot` (FlowStation v0.5.1+).
+
 Version 1.10.0 adds:
 
 - **SMS Center (store-and-forward SDS).** An individual SDS addressed to an
