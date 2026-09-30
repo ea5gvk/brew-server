@@ -989,6 +989,19 @@ function tsGrid(calls){
   }).join('');
   return `<div class=ts-wrap>${rows}<div class=ts-legend><span><span class="ts-dot" style="background:#173822;border:1px solid #245c37"></span>busy</span><span><span class="ts-dot" style="background:#0d1826;border:1px solid #203047"></span>available</span></div></div>`;
 }
+const mhz=hz=>(hz/1e6).toFixed(4);
+const rfPill=st=>{const c={online:'#5fd08a',starting:'#e0b050',error:'#ff6b6b',offline:'#8fa2b8'}[st]||'#8fa2b8';return `<span style="color:${c}">${esc(st||'unknown')}</span>`;};
+// Cells table for one Basestation, from its CellsSnapshot telemetry.
+function cellsTable(s){
+  const cells=s.cells||[];
+  if(!cells.length)return '';
+  const linked=s.site_linked==null?'':` &middot; ${s.site_linked?'site-linked':'independent'}`;
+  const rows=cells.map(c=>{
+    const carriers=(c.carriers||[]).map(k=>`${k.carrier_num} <span class=muted>TX ${mhz(k.tx_freq_hz)} / RX ${mhz(k.rx_freq_hz)}</span>`).join('<br>')||c.main_carrier;
+    return `<tr><td>${c.id}${c.primary?' <span class=muted>(primary)</span>':''}</td><td>${carriers}</td><td>${c.colour_code}/${c.location_area}</td><td>${c.neighbours}</td><td>${c.registered_radios}</td><td title="${esc(c.rf_detail||'')}">${rfPill(c.rf_state)}</td><td class=muted>${esc(c.device||'')}</td></tr>`;
+  }).join('');
+  return `<div class="bts-meta muted" style="margin-top:10px">${cells.length} cell(s)${linked}</div><table><thead><tr><th>Cell</th><th>Carrier (MHz)</th><th>CC/LA</th><th>Nbrs</th><th>Radios</th><th>RF</th><th>SDR</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 function renderTelemetry(stations){
   tsnap=stations;
   const emergencies=stations.flatMap(s=>(s.emergencies||[]).map(issi=>({bts:s.id,issi})));
@@ -996,6 +1009,8 @@ function renderTelemetry(stations){
   if(emergencies.length){banner.style.display='block';banner.textContent='EMERGENCY ACTIVE: '+emergencies.map(e=>`ISSI ${e.issi} on ${e.bts}`).join(', ');}else{banner.style.display='none';}
   $('telemetry-stations').innerHTML=stations.length?stations.map(s=>{
     const calls=Object.values(s.active_calls||{});
+    const cellOfCarrier={};(s.cells||[]).forEach(c=>(c.carriers||[]).forEach(k=>{cellOfCarrier[k.carrier_num]=c.id;}));
+    const multi=(s.cells||[]).length>1;
     const backhaul=s.backhaul_connected===true?'up':s.backhaul_connected===false?'down':'unknown';
     const q=s.last_tx_quality,sdr=s.last_sdr_health;
     const ipLabel=s.ip?` <span class=muted style="font-weight:400">- ${esc(s.ip)}</span>`:'';
@@ -1006,7 +1021,8 @@ function renderTelemetry(stations){
       <div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}${ipLabel}</h3>${healthPill(s.health&&s.health.overall)}</div>
       <div class="bts-meta muted">Backhaul ${backhaul} &middot; ${s.registration_count} registered &middot; ${calls.length} active call(s)</div>
       ${sig?`<div class="bts-meta muted" title="EVM is transmit error-vector magnitude (SNR proxy); RSSI is received signal strength — neither is a true SNR">${sig}${q?` &middot; PAPR ${q.papr_db.toFixed(1)}dB`:''}${sdr&&sdr.temperature_c!=null?` &middot; SDR ${sdr.temperature_c.toFixed(1)}&deg;C`:''}</div>`:''}
-      ${calls.length?`<table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Carrier/TS</th><th>Pri</th></tr></thead><tbody>${calls.map(c=>`<tr><td>${c.is_group?'Group':'Private'}</td><td>${c.source_issi}</td><td>${c.gssi_or_called}</td><td>${c.carrier_num}/${c.ts}</td><td>${c.priority}</td></tr>`).join('')}</tbody></table>`:''}
+      ${calls.length?`<table><thead><tr><th>Type</th><th>From</th><th>To</th>${multi?'<th>Cell</th>':''}<th>Carrier/TS</th><th>Pri</th></tr></thead><tbody>${calls.map(c=>`<tr><td>${c.is_group?'Group':'Private'}</td><td>${c.source_issi}</td><td>${c.gssi_or_called}</td>${multi?`<td>${cellOfCarrier[c.carrier_num]??'&ndash;'}</td>`:''}<td>${c.carrier_num}/${c.ts}</td><td>${c.priority}</td></tr>`).join('')}</tbody></table>`:''}
+      ${cellsTable(s)}
       ${tsGrid(calls)}
     </div>`;
   }).join(''):'<div class=muted>No Basestation telemetry connections</div>';

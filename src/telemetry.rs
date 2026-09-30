@@ -162,6 +162,32 @@ pub enum TelemetryEvent {
     DapnetLog { direction: String, id: String, callsign: String, recipient: String, text: String, priority: Option<u8>, paths: Vec<String> },
     /// Multi-cell station: the MS that just registered is on this cell (0 = primary).
     MsCell { issi: u32, cell: u8 },
+    /// Every cell the station runs (primary first), sent periodically.
+    CellsSnapshot { site_linked: bool, cells: Vec<CellInfo> },
+}
+
+/// One cell of a Basestation, from its `CellsSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellInfo {
+    pub id: u8,
+    pub primary: bool,
+    pub main_carrier: u16,
+    pub secondary_carrier: Option<u16>,
+    pub carriers: Vec<CellCarrierInfo>,
+    pub colour_code: u8,
+    pub location_area: u16,
+    pub neighbours: u16,
+    pub device: Option<String>,
+    pub registered_radios: u32,
+    pub rf_state: Option<String>,
+    pub rf_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellCarrierInfo {
+    pub carrier_num: u16,
+    pub tx_freq_hz: u32,
+    pub rx_freq_hz: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -260,6 +286,10 @@ pub struct TelemetryBts {
     pub ms_cell: HashMap<u32, u8>,
     /// Serialized view of `ms_cell` as sorted `[issi, cell]` pairs.
     pub ms_cell_out: Vec<(u32, u8)>,
+    /// Latest `CellsSnapshot`: the station's cells, primary first (empty until one arrives).
+    pub cells: Vec<CellInfo>,
+    /// Whether the cells share the backhaul through the site switch.
+    pub site_linked: Option<bool>,
     pub active_calls: HashMap<u16, TelemetryCall>,
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
@@ -336,6 +366,8 @@ impl TelemetryBts {
             recent_regs_out: Vec::new(),
             ms_cell: HashMap::new(),
             ms_cell_out: Vec::new(),
+            cells: Vec::new(),
+            site_linked: None,
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
             last_tx_quality: None,
@@ -662,7 +694,8 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     // ~5/s) is still recorded below but picked up by the existing 2s poll.
     let notify = !matches!(event, TelemetryEvent::TxVisual(_) | TelemetryEvent::TxQuality(_)
         | TelemetryEvent::SdrHealth(_) | TelemetryEvent::SysHealth(_)
-        | TelemetryEvent::MsRssi { .. } | TelemetryEvent::TsVoiceActivity { .. });
+        | TelemetryEvent::MsRssi { .. } | TelemetryEvent::TsVoiceActivity { .. }
+        | TelemetryEvent::CellsSnapshot { .. });
 
     let mut sds_entry: Option<SdsLogEntry> = None;
     match event {
@@ -678,6 +711,10 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
             if bts.registrations.contains(&issi) {
                 bts.ms_cell.insert(issi, cell); bts.sync_registrations();
             }
+        }
+        TelemetryEvent::CellsSnapshot { site_linked, cells } => {
+            bts.site_linked = Some(site_linked);
+            bts.cells = cells;
         }
         TelemetryEvent::MsTimeoutDrop { issi } => {
             bts.registrations.remove(&issi); bts.sync_registrations();
@@ -826,6 +863,19 @@ mod tests {
         bts.registrations.remove(&7);
         bts.sync_registrations();
         assert!(bts.ms_cell_out.is_empty());
+    }
+
+    #[test]
+    fn cells_snapshot_decodes() {
+        let json = r#"{"CellsSnapshot":{"site_linked":true,"cells":[{"id":0,"primary":true,"main_carrier":1521,
+            "secondary_carrier":null,"carriers":[{"carrier_num":1521,"tx_freq_hz":438025000,"rx_freq_hz":433025000}],
+            "colour_code":1,"location_area":2,"neighbours":1,"device":"driver=plutosdr","registered_radios":3,
+            "rf_state":"online","rf_detail":"ok"}]}}"#;
+        let e: TelemetryEvent = serde_json::from_str(json).unwrap();
+        let TelemetryEvent::CellsSnapshot { site_linked, cells } = e else { panic!("expected CellsSnapshot") };
+        assert!(site_linked);
+        assert_eq!(cells[0].carriers[0].tx_freq_hz, 438_025_000);
+        assert_eq!(cells[0].rf_state.as_deref(), Some("online"));
     }
 
     #[test]
