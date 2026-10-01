@@ -167,6 +167,10 @@ pub enum TelemetryEvent {
     /// Sent by Bost FlowStation first on every telemetry connect: its release
     /// ("v0.5.1"), release plus build hash, and upstream FlowStation version.
     StationVersion { version: String, build: String, upstream: String },
+    /// Multi-cell: TxVisual/TxQuality/SdrHealth from an additional cell's SDR.
+    /// Accepted so it is not logged as malformed; the per-BTS view only shows
+    /// the primary cell's RF, so the payload is not kept.
+    CellRf { cell: u8, event: serde_json::Value },
 }
 
 /// One cell of a Basestation, from its `CellsSnapshot`.
@@ -713,6 +717,12 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
 async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     let event: TelemetryEvent = match serde_json::from_slice(data) {
         Ok(e) => e,
+        // A newer Basestation may send event types this server does not know
+        // yet; skip those quietly instead of warning on every message.
+        Err(e) if e.to_string().starts_with("unknown variant") => {
+            debug!(bts = %id, error = %e, "skipping unknown telemetry event");
+            return;
+        }
         Err(e) => {
             warn!(bts = %id, error = %e, bytes = data.len(), "dropping malformed telemetry event");
             return;
@@ -1165,5 +1175,13 @@ mod version_tests {
         let json = serde_json::to_string(&bts).unwrap();
         assert!(json.contains("\"version\":\"v0.5.1\""));
         assert!(json.contains("\"build\":\"v0.5.1-3ac72f7\""));
+    }
+
+    #[test]
+    fn cell_rf_parses() {
+        let ev: TelemetryEvent = serde_json::from_str(
+            r#"{"CellRf":{"cell":1,"event":{"SdrHealth":{"temperature_c":41.0,"tx_gains":[],"rx_gains":[]}}}}"#,
+        ).unwrap();
+        assert!(matches!(ev, TelemetryEvent::CellRf { cell: 1, .. }));
     }
 }
