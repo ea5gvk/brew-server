@@ -1001,8 +1001,13 @@ function cellsTable(s){
   const rows=cells.map(c=>{
     const carriers=(c.carriers||[]).map(k=>`<span class=cell-carrier title="Carrier ${k.carrier_num}: TX ${mhz(k.tx_freq_hz)} MHz, RX ${mhz(k.rx_freq_hz)} MHz"><b>${k.carrier_num}</b> TX ${mhz(k.tx_freq_hz)} &middot; RX ${mhz(k.rx_freq_hz)}</span>`).join('');
     const dev=c.device?`<span class=cell-dev title="${esc(c.device)}">${esc(c.device)}</span>`:'';
+    // This cell's own SDR metrics: the primary's arrive untagged, the others' via CellRf.
+    const rf=c.primary?{q:s.last_tx_quality,h:s.last_sdr_health}:(x=>({q:x&&x.tx_quality,h:x&&x.sdr_health}))((s.cell_rf||{})[c.id]);
+    const rfm=[rf.q?`EVM ${rf.q.evm_pct.toFixed(2)}%`:'',rf.q?`PAPR ${rf.q.papr_db.toFixed(1)}dB`:'',
+      rf.h&&rf.h.temperature_c!=null?`SDR ${rf.h.temperature_c.toFixed(1)}&deg;C`:''].filter(Boolean).join(' &middot; ');
     return `<div class=cell-row>
       <div class=cell-head><b>Cell ${c.id}</b>${c.primary?' <span class=muted>primary</span>':''} &middot; <span title="${esc(c.rf_detail||'')}">${rfPill(c.rf_state)}</span> &middot; CC ${c.colour_code} / LA ${c.location_area} &middot; ${c.neighbours} nbr &middot; ${c.registered_radios} radio(s)${dev?' &middot; '+dev:''}</div>
+      ${rfm?`<div class="bts-meta muted" title="This cell's transmit EVM / PAPR and SDR temperature">${rfm}</div>`:''}
       <div class=cell-carriers>${carriers}</div>
     </div>`;
   }).join('');
