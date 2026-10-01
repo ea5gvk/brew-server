@@ -1019,7 +1019,7 @@ function renderTelemetry(stations){
     const multi=(s.cells||[]).length>1;
     const backhaul=s.backhaul_connected===true?'up':s.backhaul_connected===false?'down':'unknown';
     const q=s.last_tx_quality,sdr=s.last_sdr_health;
-    const ipLabel=s.ip?` <span class=muted style="font-weight:400">- ${esc(s.ip)}</span>`:'';
+    const ipLabel=(s.ip||s.version)?` <span class=muted style="font-weight:400">${s.ip?`- ${esc(s.ip)}`:''}${s.version?` <span title="${esc(s.build||s.version)}">&middot; ${esc(s.version)}</span>`:''}</span>`:'';
     const evm=(s.evm_pct!=null)?`EVM ${s.evm_pct.toFixed(2)}%`:(q?`EVM ${q.evm_pct.toFixed(2)}%`:'');
     const rssi=(s.rssi_dbfs!=null)?`RSSI ${s.rssi_dbfs.toFixed(1)} dBFS`:'';
     const sig=[evm,rssi].filter(Boolean).join(' &middot; ');

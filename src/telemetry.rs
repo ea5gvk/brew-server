@@ -164,6 +164,9 @@ pub enum TelemetryEvent {
     MsCell { issi: u32, cell: u8 },
     /// Every cell the station runs (primary first), sent periodically.
     CellsSnapshot { site_linked: bool, cells: Vec<CellInfo> },
+    /// Sent by Bost FlowStation first on every telemetry connect: its release
+    /// ("v0.5.1"), release plus build hash, and upstream FlowStation version.
+    StationVersion { version: String, build: String, upstream: String },
 }
 
 /// One cell of a Basestation, from its `CellsSnapshot`.
@@ -268,6 +271,11 @@ pub struct TelemetryBts {
     /// Remote IP address of the Basestation's telemetry connection, e.g.
     /// "10.19.144.201". `None` if the peer address could not be determined.
     pub ip: Option<String>,
+    /// Software release the Basestation reported (`StationVersion`), e.g.
+    /// "v0.5.1". `None` for stations that do not announce one.
+    pub version: Option<String>,
+    /// Release plus build hash, e.g. "v0.5.1-3ac72f7".
+    pub build: Option<String>,
     pub connected_at_ms: u64,
     pub last_event_at_ms: u64,
     pub health: Option<HealthSnapshot>,
@@ -359,6 +367,8 @@ impl TelemetryBts {
         Self {
             id,
             ip,
+            version: None,
+            build: None,
             connected_at_ms: now_ms(),
             last_event_at_ms: now_ms(),
             health: None,
@@ -774,6 +784,11 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         TelemetryEvent::EmergencyAlarm { source_issi, .. } => { bts.emergencies.insert(source_issi); }
         TelemetryEvent::EmergencyCancel { source_issi } => { bts.emergencies.remove(&source_issi); }
         TelemetryEvent::BrewConnected { connected, .. } => bts.backhaul_connected = Some(connected),
+        TelemetryEvent::StationVersion { version, build, .. } => {
+            info!(bts = %id, %version, %build, "Basestation version");
+            bts.version = Some(version);
+            bts.build = Some(build);
+        }
         TelemetryEvent::MsRssi { issi, rssi_dbfs } => {
             bts.rssi_dbfs = Some(rssi_dbfs);
             bts.ms_rssi.insert(issi, rssi_dbfs);
@@ -1131,5 +1146,24 @@ mod registration_log_tests {
             t.stations.get_mut("bts-1").unwrap().push_reg(i, "register");
         }
         assert_eq!(t.registration_log().len(), 100);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn station_version_parses_and_serializes() {
+        let ev: TelemetryEvent = serde_json::from_str(
+            r#"{"StationVersion":{"version":"v0.5.1","build":"v0.5.1-3ac72f7","upstream":"0.1.0"}}"#,
+        ).unwrap();
+        let TelemetryEvent::StationVersion { version, build, .. } = ev else { panic!("wrong variant") };
+        let mut bts = TelemetryBts::new("bts".into(), None);
+        bts.version = Some(version);
+        bts.build = Some(build);
+        let json = serde_json::to_string(&bts).unwrap();
+        assert!(json.contains("\"version\":\"v0.5.1\""));
+        assert!(json.contains("\"build\":\"v0.5.1-3ac72f7\""));
     }
 }
