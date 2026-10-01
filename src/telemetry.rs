@@ -6,7 +6,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -167,6 +167,25 @@ pub enum TelemetryEvent {
     /// Sent by Bost FlowStation first on every telemetry connect: its release
     /// ("v0.5.1"), release plus build hash, and upstream FlowStation version.
     StationVersion { version: String, build: String, upstream: String },
+    /// Multi-cell: RF data from an additional cell's SDR (the primary's comes
+    /// untagged, as `TxQuality` / `SdrHealth`).
+    CellRf { cell: u8, event: CellRfEvent },
+}
+
+/// The RF events an additional cell reports inside `CellRf`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CellRfEvent {
+    /// Spectrum snapshot; newer Basestations keep it off the backhaul. Not used.
+    TxVisual(serde_json::Value),
+    TxQuality(TxQuality),
+    SdrHealth(SdrHealth),
+}
+
+/// Latest RF metrics of one additional cell.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CellRfState {
+    pub tx_quality: Option<TxQuality>,
+    pub sdr_health: Option<SdrHealth>,
 }
 
 /// One cell of a Basestation, from its `CellsSnapshot`.
@@ -306,6 +325,9 @@ pub struct TelemetryBts {
     pub emergencies: HashSet<u32>,
     pub last_tx_quality: Option<TxQuality>,
     pub last_sdr_health: Option<SdrHealth>,
+    /// Multi-cell: latest RF metrics of each additional cell, keyed by cell id
+    /// (the primary's are `last_tx_quality` / `last_sdr_health`).
+    pub cell_rf: BTreeMap<u8, CellRfState>,
     pub last_sys_health: Option<SysHealthInfo>,
     #[serde(skip)]
     pub recent_sds: VecDeque<SdsLogEntry>,
@@ -386,6 +408,7 @@ impl TelemetryBts {
             emergencies: HashSet::new(),
             last_tx_quality: None,
             last_sdr_health: None,
+            cell_rf: BTreeMap::new(),
             last_sys_health: None,
             recent_sds: VecDeque::new(),
             recent_sds_out: Vec::new(),
@@ -713,6 +736,12 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
 async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     let event: TelemetryEvent = match serde_json::from_slice(data) {
         Ok(e) => e,
+        // A newer Basestation may send event types this server does not know
+        // yet; skip those quietly instead of warning on every message.
+        Err(e) if e.to_string().starts_with("unknown variant") => {
+            debug!(bts = %id, error = %e, "skipping unknown telemetry event");
+            return;
+        }
         Err(e) => {
             warn!(bts = %id, error = %e, bytes = data.len(), "dropping malformed telemetry event");
             return;
@@ -730,7 +759,7 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     let notify = !matches!(event, TelemetryEvent::TxVisual(_) | TelemetryEvent::TxQuality(_)
         | TelemetryEvent::SdrHealth(_) | TelemetryEvent::SysHealth(_)
         | TelemetryEvent::MsRssi { .. } | TelemetryEvent::TsVoiceActivity { .. }
-        | TelemetryEvent::CellsSnapshot { .. });
+        | TelemetryEvent::CellsSnapshot { .. } | TelemetryEvent::CellRf { .. });
 
     let mut sds_entry: Option<SdsLogEntry> = None;
     match event {
@@ -779,6 +808,14 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         }
         TelemetryEvent::TxQuality(q) => { bts.evm_pct = Some(q.evm_pct); bts.last_tx_quality = Some(q); }
         TelemetryEvent::SdrHealth(h) => bts.last_sdr_health = Some(h),
+        TelemetryEvent::CellRf { cell, event } => {
+            let rf = bts.cell_rf.entry(cell).or_default();
+            match event {
+                CellRfEvent::TxQuality(q) => rf.tx_quality = Some(q),
+                CellRfEvent::SdrHealth(h) => rf.sdr_health = Some(h),
+                CellRfEvent::TxVisual(_) => {}
+            }
+        }
         TelemetryEvent::SysHealth(h) => bts.last_sys_health = Some(h),
         TelemetryEvent::HealthSnapshot(h) => bts.health = Some(h),
         TelemetryEvent::EmergencyAlarm { source_issi, .. } => { bts.emergencies.insert(source_issi); }
@@ -1165,5 +1202,14 @@ mod version_tests {
         let json = serde_json::to_string(&bts).unwrap();
         assert!(json.contains("\"version\":\"v0.5.1\""));
         assert!(json.contains("\"build\":\"v0.5.1-3ac72f7\""));
+    }
+
+    #[test]
+    fn cell_rf_parses() {
+        let ev: TelemetryEvent = serde_json::from_str(
+            r#"{"CellRf":{"cell":1,"event":{"SdrHealth":{"temperature_c":41.0,"tx_gains":[],"rx_gains":[]}}}}"#,
+        ).unwrap();
+        let TelemetryEvent::CellRf { cell: 1, event: CellRfEvent::SdrHealth(h) } = ev else { panic!("wrong event") };
+        assert_eq!(h.temperature_c, Some(41.0));
     }
 }

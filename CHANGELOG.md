@@ -2,6 +2,19 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.12.0 adds:
+
+- **Basestation version.** Each Basestation card shows the software version
+  next to its IP (build hash on hover), from the `StationVersion` event that
+  FlowStation v0.5.2+ sends on every telemetry connect. `/api/telemetry` gains
+  `version` and `build`.
+- **Per-cell RF metrics.** On multi-cell stations each cell row shows that
+  cell's EVM, PAPR and SDR temperature, from the `CellRf` events of the
+  additional cells. `/api/telemetry` gains `cell_rf`.
+- **Quieter logs for newer Basestations.** `CellRf` is decoded instead of
+  being logged as malformed several times a second, and any other unknown
+  event type is logged at debug level instead of as a warning.
+
 Version 1.11.0 adds:
 
 - **Basestation cells in the telemetry dashboard.** Each Basestation card
