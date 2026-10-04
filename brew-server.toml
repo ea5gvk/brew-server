@@ -277,6 +277,7 @@ name = "Athens HQ"
 lat = 37.9917
 lon = 23.7640
 
+# See https://github.com/ysamouhos/brew-server/wiki/High-Availability.
 # Active/standby high availability: two brew-servers on the same LAN / Layer 2
 # segment (or the same host, each with its own real IP) share one virtual IP.
 # Basestations, terminals and federation peers connect to the VIP; when the

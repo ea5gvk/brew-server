@@ -81,6 +81,9 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/sms-center", get(sms_center_snapshot))
         .merge(settings_routes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
+        // Unauthenticated liveness probe that works on both HA nodes (the
+        // Brew listener's /healthz only exists on the Active one).
+        .route("/healthz", get(dashboard_healthz))
         .with_state(state.clone());
 
     if cfg.tls.enabled {
@@ -1224,6 +1227,17 @@ pub async fn ha_config_put(State(state): State<Arc<AppState>>, Json(ha): Json<co
         let _ = state.ha.command(|tx| crate::ha::HaCommand::SetPersist(None, tx)).await;
     }
     Json(saved_note(&state)).into_response()
+}
+
+/// `ok active` / `ok standby` / ... (or plain `ok` without HA): this process
+/// is up and serving its dashboard, whatever its role.
+async fn dashboard_healthz(State(state): State<Arc<AppState>>) -> String {
+    if state.config.ha.enabled {
+        let role = serde_json::to_value(state.ha.status.borrow().role).unwrap_or_default();
+        format!("ok {}\n", role.as_str().unwrap_or("unknown"))
+    } else {
+        "ok\n".into()
+    }
 }
 
 pub async fn ha_page() -> Html<&'static str> { Html(HA_HTML.as_str()) }

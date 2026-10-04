@@ -2,6 +2,32 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.14.0 adds:
+
+- **Active/standby high availability.** New `[ha]` section (off by
+  default): two brew-servers on one LAN / Layer 2 segment, or on one host,
+  share a virtual IP. They elect an Active node over HMAC-signed UDP
+  heartbeats: the higher `weight` wins, and `persist = true` keeps a node
+  Active even when a higher-weight peer comes back. The Active node holds
+  the VIP (`ip addr` + gratuitous ARP; needs `CAP_NET_ADMIN` and
+  `CAP_NET_RAW`) and alone runs the Brew, telemetry, control and SIP
+  listeners and the background tasks, binding the VIP for listeners set to
+  `0.0.0.0`. On failure the Standby takes over within `dead_after_ms`
+  (default 2 s), and Basestations reconnect to the same address. A node
+  that leaves Active restarts into Standby. Optional `check_gateway` keeps a
+  node without an uplink from taking the VIP. See
+  [High Availability](https://github.com/ysamouhos/brew-server/wiki/High-Availability).
+- **High Availability dashboard page** (`/ha`): both nodes' role, weight,
+  persist, VIP holder, heartbeat and role-change log, plus a role badge in
+  every page header. Admins can switch the Active node, set persist (kept
+  in `ha-state.json`, no restart), edit `[ha]` and apply the saved config.
+- **No automatic config reload with HA.** With `[ha]` enabled, config file
+  changes are applied only from the dashboard's **Apply saved config**,
+  which hands an Active node over to its Standby before restarting it.
+- **Dashboard `/healthz`.** The dashboard listener answers an
+  unauthenticated `/healthz` (`ok`, or `ok active` / `ok standby` with HA),
+  for health checks that must pass on both HA nodes.
+
 Version 1.13.0 adds:
 
 - **Federation discovery identifies the peer.** The discovery `GET` of an
