@@ -471,10 +471,9 @@ impl Default for VoiceRouteConfig {
 /// transparently hop to hop the same way they already route to any other
 /// connected client: call/SDS routing has no federation-specific code at all,
 /// it Just Works once a remote ISSI/GSSI's registration has propagated to
-/// this server. This is correct for a loop-free topology (a chain or a star,
-/// i.e. any tree of peer links); a topology with a cycle (e.g. a full mesh)
-/// is not safe with split-horizon alone and needs additional loop prevention
-/// (hop count / path vector) not implemented here.
+/// this server. Split-horizon alone is only correct for a loop-free topology
+/// (a chain or a star, i.e. any tree of peer links); with `loop_safe` on
+/// every server any topology is, rings and full meshes included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FederationConfig {

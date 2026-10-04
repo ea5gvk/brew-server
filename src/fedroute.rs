@@ -770,3 +770,485 @@ mod tests {
     }
 }
 
+/// Whole servers wired together in process: each node is a real `AppState`
+/// with one fake Basestation, links are `federation::attach_client` peer
+/// connections whose queues are delivered to the far node's router, and
+/// `Net::pump` runs the network until it is quiet -- failing if that takes
+/// more than `PUMP_LIMIT` messages, i.e. if anything would circulate forever.
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+    use crate::protocol::{
+        build_call_cause, build_circular_call_setup, build_group_tx, build_short_transfer,
+        build_subscriber_message, build_traffic_frame, ACELP_CODED_FRAME_BYTES, CALL_ALERT, CALL_GROUP_IDLE,
+        CALL_GROUP_TX, CALL_SETUP_REQUEST, CLASS_CALL_CONTROL, CLASS_FRAME, FRAME_SDS_REPORT, FRAME_TRAFFIC_CHANNEL,
+        SUB_AFFILIATE, SUB_DEREGISTER, SUB_REGISTER,
+    };
+    use crate::protocol::ConnVersion;
+    use crate::router::handle_packet;
+    use crate::state::Client;
+    use std::collections::HashSet;
+    use tokio::sync::mpsc;
+
+    const PUMP_LIMIT: usize = 2000;
+
+    struct Node {
+        state: Arc<AppState>,
+        bs: ClientId,
+        bs_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    /// One direction of a link: what node `from` queues on its link
+    /// `from_link` arrives at node `to` from its link `to_link`.
+    struct Wire {
+        rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        from: usize,
+        from_link: ClientId,
+        to: usize,
+        to_link: ClientId,
+        negotiated: bool,
+    }
+
+    struct Net {
+        nodes: Vec<Node>,
+        wires: Vec<Wire>,
+    }
+
+    fn connection(mode: ClientMode) -> (Client, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Client { tx, mode, version: ConnVersion::V1, remote_addr: None, connected_at_ms: 0, username: None }, rx)
+    }
+
+    impl Net {
+        /// `n` servers, each with `loop_safe` as given and one Basestation.
+        async fn new(n: usize, loop_safe: bool) -> Self {
+            let mut nodes = Vec::new();
+            for _ in 0..n {
+                let mut config = crate::config::Config::default();
+                config.storage.enabled = false;
+                config.sms_center.enabled = false;
+                config.federation.loop_safe = loop_safe;
+                let state = Arc::new(AppState::new(config, "test.toml".into()).0);
+                let (bs_client, bs_rx) = connection(ClientMode::Basestation);
+                let bs = Uuid::new_v4();
+                crate::federation::attach_client(&state, bs, bs_client, None).await;
+                nodes.push(Node { state, bs, bs_rx });
+            }
+            Net { nodes, wires: Vec::new() }
+        }
+
+        async fn id(&self, node: usize) -> u64 {
+            self.nodes[node].state.inner.read().await.fed.self_id
+        }
+
+        /// Links `a` and `b`, loop-safe when `negotiated` (both ends must
+        /// enable it), and lets the initial syncs settle.
+        async fn link(&mut self, a: usize, b: usize, negotiated: bool) {
+            let (la, lb) = (Uuid::new_v4(), Uuid::new_v4());
+            let (ida, idb) = (self.id(a).await, self.id(b).await);
+            let (ca, rxa) = connection(ClientMode::Peer);
+            let (cb, rxb) = connection(ClientMode::Peer);
+            crate::federation::attach_client(&self.nodes[a].state, la, ca, negotiated.then_some(idb)).await;
+            crate::federation::attach_client(&self.nodes[b].state, lb, cb, negotiated.then_some(ida)).await;
+            self.wires.push(Wire { rx: rxa, from: a, from_link: la, to: b, to_link: lb, negotiated });
+            self.wires.push(Wire { rx: rxb, from: b, from_link: lb, to: a, to_link: la, negotiated });
+            self.pump().await;
+        }
+
+        /// Drops every link between `a` and `b` (whatever is in flight is lost).
+        async fn unlink(&mut self, a: usize, b: usize) {
+            let (gone, kept): (Vec<Wire>, Vec<Wire>) = std::mem::take(&mut self.wires).into_iter()
+                .partition(|w| (w.from, w.to) == (a, b) || (w.from, w.to) == (b, a));
+            self.wires = kept;
+            for w in gone {
+                self.nodes[w.from].state.cleanup_client(w.from_link).await;
+            }
+            self.pump().await;
+        }
+
+        /// Delivers queued messages round-robin, one per wire per pass, until
+        /// no wire has anything left; returns how many were delivered.
+        async fn pump(&mut self) -> usize {
+            let mut delivered = 0;
+            loop {
+                let mut progressed = false;
+                for i in 0..self.wires.len() {
+                    let Ok(msg) = self.wires[i].rx.try_recv() else { continue };
+                    let w = &self.wires[i];
+                    assert!(w.negotiated || msg.first() != Some(&CLASS_FEDERATION), "federation message on a legacy link");
+                    let (state, link) = (self.nodes[w.to].state.clone(), w.to_link);
+                    handle_packet(state, link, msg).await;
+                    delivered += 1;
+                    progressed = true;
+                    assert!(delivered <= PUMP_LIMIT, "network not quiet after {PUMP_LIMIT} messages: something circulates");
+                }
+                if !progressed {
+                    return delivered;
+                }
+            }
+        }
+
+        /// The Basestation of `node` sends `msg`; the network settles.
+        /// Returns how many messages crossed links meanwhile.
+        async fn bs_send(&mut self, node: usize, msg: Vec<u8>) -> usize {
+            let (state, bs) = (self.nodes[node].state.clone(), self.nodes[node].bs);
+            handle_packet(state, bs, msg).await;
+            self.pump().await
+        }
+
+        async fn register(&mut self, node: usize, issi: u32, groups: &[u32]) {
+            self.bs_send(node, build_subscriber_message(SUB_REGISTER, issi, &[])).await;
+            if !groups.is_empty() {
+                self.bs_send(node, build_subscriber_message(SUB_AFFILIATE, issi, groups)).await;
+            }
+        }
+
+        /// What the Basestation of `node` was sent since the last call.
+        fn heard(&mut self, node: usize) -> Vec<Vec<u8>> {
+            std::iter::from_fn(|| self.nodes[node].bs_rx.try_recv().ok()).collect()
+        }
+
+        async fn route(&self, node: usize, issi: u32) -> Option<Subscriber> {
+            self.nodes[node].state.inner.read().await.subscribers.get(&issi).cloned()
+        }
+
+        /// The servers `node` reaches `issi` through (empty: registered there).
+        async fn path(&self, node: usize, issi: u32) -> Option<Vec<u64>> {
+            self.route(node, issi).await.map(|s| s.route.path)
+        }
+
+        /// Every node's effective table and group sets agree with what was
+        /// advertised: each one is consistent on its own (`group_clients`
+        /// built from the routes), and no route crosses a server twice.
+        async fn check_tables(&self) {
+            for node in &self.nodes {
+                let inner = node.state.inner.read().await;
+                for (issi, sub) in &inner.subscribers {
+                    let mut seen = HashSet::new();
+                    assert!(sub.route.path.iter().all(|id| seen.insert(*id)), "ISSI {issi}: loop in {:?}", sub.route.path);
+                    assert!(!sub.route.path.contains(&inner.fed.self_id), "ISSI {issi}: route through ourselves");
+                    for g in &sub.groups {
+                        assert!(inner.group_clients.get(g).is_some_and(|m| m.contains(&sub.client_id)), "ISSI {issi}: group {g} not routed");
+                    }
+                }
+                for (g, members) in &inner.group_clients {
+                    for m in members {
+                        assert!(inner.subscribers.values().any(|s| s.client_id == *m && s.groups.contains(g)), "group {g}: stale member");
+                    }
+                }
+            }
+        }
+    }
+
+    fn of_type(msgs: &[Vec<u8>], class: u8, kind: u8) -> usize {
+        msgs.iter().filter(|m| m.len() > 1 && m[0] == class && m[1] == kind).count()
+    }
+
+    fn voice(id: &Uuid) -> Vec<u8> {
+        build_traffic_frame(id, &[0x11; ACELP_CODED_FRAME_BYTES], &[0x22; ACELP_CODED_FRAME_BYTES])
+    }
+
+    #[tokio::test]
+    async fn ring_converges_on_shortest_paths_and_fails_over() {
+        let mut net = Net::new(4, true).await;
+        for i in 0..4 {
+            net.link(i, (i + 1) % 4, true).await;
+        }
+        let ids = [net.id(0).await, net.id(1).await, net.id(2).await, net.id(3).await];
+        net.register(0, 1001, &[91]).await;
+
+        assert_eq!(net.path(0, 1001).await, Some(vec![]));
+        assert_eq!(net.path(1, 1001).await, Some(vec![ids[0]]));
+        assert_eq!(net.path(3, 1001).await, Some(vec![ids[0]]));
+        assert_eq!(net.path(2, 1001).await.unwrap().len(), 2, "opposite side: two hops either way");
+        assert!(net.route(2, 1001).await.unwrap().groups.contains(&91));
+        net.check_tables().await;
+
+        // The direct link goes: node 1 now gets there the long way round.
+        net.unlink(0, 1).await;
+        assert_eq!(net.path(1, 1001).await, Some(vec![ids[2], ids[3], ids[0]]));
+        assert_eq!(net.path(2, 1001).await, Some(vec![ids[3], ids[0]]));
+        net.check_tables().await;
+
+        // Gone from the network once deregistered.
+        net.bs_send(0, build_subscriber_message(SUB_DEREGISTER, 1001, &[])).await;
+        for node in 0..4 {
+            assert!(net.route(node, 1001).await.is_none(), "node {node}");
+            assert!(net.nodes[node].state.inner.read().await.fed.rib_in.is_empty(), "node {node}: stale offer");
+        }
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn ring_partition_withdraws_everything_behind_it() {
+        let mut net = Net::new(4, true).await;
+        for i in 0..4 {
+            net.link(i, (i + 1) % 4, true).await;
+        }
+        net.register(2, 1002, &[91]).await;
+        assert!(net.route(0, 1002).await.is_some());
+        net.unlink(1, 2).await;
+        assert!(net.route(0, 1002).await.is_some(), "still reachable through node 3");
+        net.unlink(2, 3).await;
+        for node in [0, 1, 3] {
+            assert!(net.route(node, 1002).await.is_none(), "node {node}: cut off");
+        }
+        assert!(net.route(2, 1002).await.is_some(), "still registered where it is");
+        // Linked back: learnt again from the initial sync.
+        net.link(2, 3, true).await;
+        for node in 0..4 {
+            assert!(net.route(node, 1002).await.is_some(), "node {node}");
+        }
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn ring_group_call_and_private_call_go_round_once() {
+        let mut net = Net::new(6, true).await;
+        for i in 0..6 {
+            net.link(i, (i + 1) % 6, true).await;
+        }
+        for node in 0..6 {
+            net.register(node, 2000 + node as u32, &[91]).await;
+        }
+        let id = Uuid::new_v4();
+        net.bs_send(0, build_group_tx(&id, 2000, 91, 0)).await;
+        net.bs_send(0, voice(&id)).await;
+        for node in 1..6 {
+            let heard = net.heard(node);
+            assert_eq!(of_type(&heard, CLASS_CALL_CONTROL, CALL_GROUP_TX), 1, "node {node}");
+            assert_eq!(of_type(&heard, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL), 1, "node {node}");
+        }
+        let call = Uuid::new_v4();
+        net.bs_send(1, build_circular_call_setup(&call, 2001, 2004, 0)).await;
+        assert_eq!(of_type(&net.heard(4), CLASS_CALL_CONTROL, CALL_SETUP_REQUEST), 1);
+        net.check_tables().await;
+    }
+
+    /// A full mesh of 5 with one member of group 91 behind each server.
+    async fn mesh() -> Net {
+        let mut net = Net::new(5, true).await;
+        for a in 0..5 {
+            for b in a + 1..5 {
+                net.link(a, b, true).await;
+            }
+        }
+        for node in 0..5 {
+            net.register(node, 2000 + node as u32, &[91]).await;
+        }
+        for node in 0..5 {
+            net.heard(node);
+        }
+        net
+    }
+
+    #[tokio::test]
+    async fn full_mesh_routes_every_issi_directly() {
+        let net = mesh().await;
+        for node in 0..5 {
+            for other in 0..5 {
+                let path = net.path(node, 2000 + other as u32).await.expect("routed");
+                let want = if node == other { vec![] } else { vec![net.id(other).await] };
+                assert_eq!(path, want, "node {node} to {other}");
+            }
+        }
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn full_mesh_group_call_reaches_every_site_once() {
+        let mut net = mesh().await;
+        let id = Uuid::new_v4();
+        net.bs_send(0, build_group_tx(&id, 2000, 91, 0)).await;
+        // Every other server got the call straight from node 0 and pruned
+        // the copies the others relayed: voice crosses 4 links, not 16.
+        for node in 1..5 {
+            let inner = net.nodes[node].state.inner.read().await;
+            assert_eq!(inner.calls[&id].peers, HashSet::from([net.nodes[node].bs]), "node {node}");
+        }
+        assert_eq!(net.bs_send(0, voice(&id)).await, 4);
+        net.bs_send(0, voice(&id)).await;
+        net.bs_send(0, build_call_cause(CALL_GROUP_IDLE, &id, 0)).await;
+        assert!(net.heard(0).is_empty(), "the talker's own site hears nothing back");
+        for node in 1..5 {
+            let heard = net.heard(node);
+            assert_eq!(of_type(&heard, CLASS_CALL_CONTROL, CALL_GROUP_TX), 1, "node {node}");
+            assert_eq!(of_type(&heard, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL), 2, "node {node}");
+            assert_eq!(of_type(&heard, CLASS_CALL_CONTROL, CALL_GROUP_IDLE), 1, "node {node}");
+        }
+        for node in 0..5 {
+            let inner = net.nodes[node].state.inner.read().await;
+            assert!(inner.calls.is_empty() && inner.group_floor.is_empty(), "node {node}: call left behind");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_mesh_answer_from_another_site_is_heard_everywhere_once() {
+        let mut net = mesh().await;
+        let id = Uuid::new_v4();
+        net.bs_send(0, build_group_tx(&id, 2000, 91, 0)).await;
+        // Same call, the radio behind node 3 answers.
+        net.bs_send(3, build_group_tx(&id, 2003, 91, 0)).await;
+        net.bs_send(3, voice(&id)).await;
+        for node in [1, 2, 4] {
+            let heard = net.heard(node);
+            assert_eq!(of_type(&heard, CLASS_CALL_CONTROL, CALL_GROUP_TX), 2, "node {node}");
+            assert_eq!(of_type(&heard, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL), 1, "node {node}");
+        }
+        let heard = net.heard(0);
+        assert_eq!(of_type(&heard, CLASS_CALL_CONTROL, CALL_GROUP_TX), 1, "the first talker's site hears the answer");
+        assert_eq!(of_type(&heard, CLASS_FRAME, FRAME_TRAFFIC_CHANNEL), 1);
+    }
+
+    #[tokio::test]
+    async fn full_mesh_private_call_and_sds_take_one_path() {
+        let mut net = mesh().await;
+        let call = Uuid::new_v4();
+        net.bs_send(0, build_circular_call_setup(&call, 2000, 2003, 0)).await;
+        assert_eq!(of_type(&net.heard(3), CLASS_CALL_CONTROL, CALL_SETUP_REQUEST), 1);
+        net.bs_send(3, build_call_cause(CALL_ALERT, &call, 0)).await;
+        assert_eq!(of_type(&net.heard(0), CLASS_CALL_CONTROL, CALL_ALERT), 1, "the answer finds its way back");
+
+        let sds = Uuid::new_v4();
+        net.bs_send(1, build_short_transfer(&sds, 2001, 2004)).await;
+        net.bs_send(1, crate::protocol::build_sds_transfer_frame(&sds, 16, b"hi")).await;
+        assert_eq!(net.heard(4).len(), 2, "header and payload, once");
+        let mut report = vec![CLASS_FRAME, FRAME_SDS_REPORT];
+        report.extend_from_slice(sds.as_bytes());
+        report.extend_from_slice(&8u16.to_le_bytes());
+        report.push(0);
+        net.bs_send(4, report.clone()).await;
+        assert_eq!(net.heard(1), vec![report]);
+        for node in [0, 2, 3] {
+            assert!(net.heard(node).is_empty(), "node {node} is not on the way");
+        }
+
+        // A group SDS reaches every member's site once.
+        let group_sds = Uuid::new_v4();
+        net.bs_send(0, build_short_transfer(&group_sds, 2000, 91)).await;
+        for node in 1..5 {
+            assert_eq!(net.heard(node).len(), 1, "node {node}");
+        }
+    }
+
+    #[tokio::test]
+    async fn roaming_moves_the_issi_everywhere() {
+        let mut net = mesh().await;
+        let id3 = net.id(3).await;
+        // 2000 shows up at node 3: the newer registration wins everywhere,
+        // including at node 0, where the stale local one is dropped.
+        net.register(3, 2000, &[92]).await;
+        for node in [0, 1, 2, 4] {
+            assert_eq!(net.path(node, 2000).await, Some(vec![id3]), "node {node}");
+            assert_eq!(net.route(node, 2000).await.unwrap().groups, HashSet::from([91, 92]), "node {node}");
+        }
+        assert_eq!(net.path(3, 2000).await, Some(vec![]));
+        // Node 0's Basestation no longer owns it: its stale DEREGISTER is ignored.
+        net.bs_send(0, build_subscriber_message(SUB_DEREGISTER, 2000, &[])).await;
+        assert_eq!(net.path(1, 2000).await, Some(vec![id3]));
+        // Back at node 0 (re-registers): it moves back.
+        net.register(0, 2000, &[]).await;
+        let id0 = net.id(0).await;
+        for node in 1..5 {
+            assert_eq!(net.path(node, 2000).await, Some(vec![id0]), "node {node}");
+        }
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_registrations_of_one_issi_agree_everywhere() {
+        let mut net = mesh().await;
+        // 3000 registers at nodes 1 and 3 before either hears of the other.
+        for node in [1, 3] {
+            let (state, bs) = (net.nodes[node].state.clone(), net.nodes[node].bs);
+            handle_packet(state, bs, build_subscriber_message(SUB_REGISTER, 3000, &[])).await;
+        }
+        net.pump().await;
+        let mut origins = HashSet::new();
+        for node in 0..5 {
+            let path = net.path(node, 3000).await.expect("routed");
+            origins.insert(match path.last() { Some(id) => *id, None => net.id(node).await });
+        }
+        assert_eq!(origins.len(), 1, "one winner, the same everywhere: {origins:?}");
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_links_between_two_servers() {
+        let mut net = Net::new(2, true).await;
+        net.link(0, 1, true).await;
+        net.link(0, 1, true).await;
+        net.register(0, 1001, &[91]).await;
+        let id = Uuid::new_v4();
+        net.bs_send(1, build_group_tx(&id, 3000, 91, 0)).await;
+        assert_eq!(of_type(&net.heard(0), CLASS_CALL_CONTROL, CALL_GROUP_TX), 1);
+        assert!(net.route(1, 1001).await.is_some());
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_hangs_off_the_mesh() {
+        let mut net = Net::new(4, true).await;
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            net.link(a, b, true).await;
+        }
+        // Node 3 dialled in without loop-safe mode (an older server).
+        net.link(3, 0, false).await;
+        net.register(3, 1003, &[91]).await;
+        net.register(1, 1001, &[91]).await;
+        let id0 = net.id(0).await;
+        assert_eq!(net.path(0, 1003).await, Some(vec![]), "local to the server it hangs off");
+        assert_eq!(net.path(2, 1003).await, Some(vec![id0]));
+        assert!(net.route(3, 1001).await.is_some(), "learnt as a plain SUB_REGISTER");
+        assert!(net.route(3, 1001).await.unwrap().groups.contains(&91));
+
+        let id = Uuid::new_v4();
+        net.bs_send(3, build_group_tx(&id, 1003, 91, 0)).await;
+        assert_eq!(of_type(&net.heard(1), CLASS_CALL_CONTROL, CALL_GROUP_TX), 1);
+        net.bs_send(1, build_subscriber_message(SUB_DEREGISTER, 1001, &[])).await;
+        assert!(net.route(3, 1001).await.is_none());
+        net.unlink(3, 0).await;
+        for node in 0..3 {
+            assert!(net.route(node, 1003).await.is_none(), "node {node}");
+        }
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_chain_still_relays_registrations() {
+        let mut net = Net::new(3, false).await;
+        net.link(0, 1, false).await;
+        net.link(1, 2, false).await;
+        net.register(0, 1001, &[91]).await;
+        assert!(net.route(2, 1001).await.unwrap().groups.contains(&91));
+        net.bs_send(0, build_subscriber_message(SUB_DEREGISTER, 1001, &[])).await;
+        assert!(net.route(2, 1001).await.is_none());
+        net.check_tables().await;
+    }
+
+    #[tokio::test]
+    async fn adverts_that_cannot_be_trusted_are_withdrawals() {
+        let mut net = Net::new(2, true).await;
+        net.link(0, 1, true).await;
+        let (id0, id1) = (net.id(0).await, net.id(1).await);
+        let link = net.wires.iter().find(|w| w.to == 0).unwrap().to_link;
+        let state = net.nodes[0].state.clone();
+        handle_packet(state.clone(), link, build_route(1001, 5, &[id1], &[91])).await;
+        assert!(net.route(0, 1001).await.is_some());
+        // Our own id on the path: a loop, so that link has no route.
+        handle_packet(state.clone(), link, build_route(1001, 6, &[id1, id0, 77], &[91])).await;
+        assert!(net.route(0, 1001).await.is_none());
+        // A clock over a day ahead: refused too.
+        let far = crate::telemetry::now_ms() + 2 * MAX_FUTURE_MS;
+        handle_packet(state.clone(), link, build_route(1002, far, &[id1], &[])).await;
+        assert!(net.route(0, 1002).await.is_none());
+        // A SUB message on a loop-safe link is ignored.
+        handle_packet(state.clone(), link, build_subscriber_message(SUB_REGISTER, 1003, &[])).await;
+        assert!(net.route(0, 1003).await.is_none());
+        // A federation message on a plain connection is dropped.
+        let bs = net.nodes[0].bs;
+        handle_packet(state.clone(), bs, build_route(1004, 5, &[id1], &[])).await;
+        assert!(net.route(0, 1004).await.is_none());
+        net.check_tables().await;
+    }
+}

@@ -40,6 +40,15 @@ Unreleased adds:
   `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client
   announces on its discovery `GET` now also apply to its WebSocket upgrade
   from the same address.
+- **Loop-safe federation (opt-in).** With `[federation] loop_safe = true` on
+  both ends, peers negotiate it at connect time (`X-Brew-Federation` /
+  `X-Brew-Server-Id`) and exchange path-vector route adverts instead of
+  relayed SUB messages, so rings, full meshes and redundant links are safe:
+  the newest registration wins network-wide, reached by the shortest
+  loop-free path, with failover when a link drops. Older peers keep working
+  as tree leaves: a server without it must hang off the mesh by a single
+  link. Enable it everywhere before adding redundant links, and keep the
+  servers' clocks on NTP.
 - **Duplicate calls and SDS across peer links are dropped.** A `GROUP_TX`,
   private `SETUP_REQUEST` or SDS reaching a server a second time over another
   peer link (a ring, a mesh, two links between the same servers) is

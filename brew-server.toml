@@ -181,10 +181,17 @@ enabled = true
 # SDS and subscriber/group registrations can reach a remote site's stations.
 # Registrations propagate peer to peer automatically (each server relays
 # what it learns to its *other* peers) -- no per-ISSI/GSSI config needed
-# here, only which servers to link to. Safe for a chain or star (any
-# loop-free topology); a topology with a cycle (full mesh) is not supported.
+# here, only which servers to link to. Without loop_safe this is safe for a
+# chain or star (any loop-free topology) only. With loop_safe = true on every
+# server, rings, full meshes and redundant links are safe too; a server
+# without it (older version or loop_safe = false) must still be linked by a
+# single link. Enable it on all servers first, then add the redundant links.
+# It is negotiated per link (X-Brew-Federation header) on the links we dial
+# and the ones we accept, even with enabled = false. The newest registration
+# of an ISSI wins network-wide, so keep the servers' clocks on NTP.
 [federation]
 enabled = false
+loop_safe = false
 # WebSocket pings on every federation link -- the peers we dial below and
 # any peer that dials in to us (this applies even with enabled = false). A
 # link that has received nothing, not even a pong, for
