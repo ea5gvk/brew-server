@@ -1,5 +1,13 @@
 //! Federation routing helpers.
 //!
+//! Loop-safe federation is negotiated per peer link at connect time, only
+//! between servers that both enable `[federation] loop_safe`: the dialling
+//! side sends `X-Brew-Federation: 1` and its `X-Brew-Server-Id` on the
+//! WebSocket upgrade, and the accepting side answers with its own in the
+//! `101`. Anyone else -- an older brew-server, another Brew server, a
+//! Basestation -- ignores the headers and does not echo them, so its link
+//! stays a plain one. `FedState::links` holds the negotiated links.
+//!
 //! Call/SDS de-duplication: in any federation topology with more than one
 //! path between two servers (a ring, a mesh, two links between the same pair)
 //! the same GROUP_TX, private SETUP_REQUEST or SDS header can reach a server
@@ -10,8 +18,56 @@
 //! accepted.
 
 use crate::state::{ClientId, Inner};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Request (and `101` response) header offering (accepting) loop-safe
+/// federation; its value is the version, currently 1.
+pub const X_BREW_FEDERATION: &str = "X-Brew-Federation";
+/// This server's id, exactly 16 hex digits (see `FedState::self_id`).
+pub const X_BREW_SERVER_ID: &str = "X-Brew-Server-Id";
+
+/// Loop-safe federation state, in `Inner`.
+#[derive(Debug)]
+pub struct FedState {
+    /// This server's id: random, non-zero and new on every start. Never
+    /// persisted or configured -- a cloned VM or config file would duplicate
+    /// it, and each server would then silently reject the other's routes as
+    /// its own. A restart closes every link, so nothing keeps the old id.
+    pub self_id: u64,
+    /// Negotiated (loop-safe) peer links -> neighbour server id.
+    pub links: HashMap<ClientId, u64>,
+}
+
+impl Default for FedState {
+    fn default() -> Self {
+        let self_id = loop {
+            let id = Uuid::new_v4().as_u64_pair().0;
+            if id != 0 { break id; }
+        };
+        Self { self_id, links: HashMap::new() }
+    }
+}
+
+/// `X-Brew-Server-Id` value: 16 lowercase hex digits.
+pub fn format_server_id(id: u64) -> String {
+    format!("{id:016x}")
+}
+
+/// Parses an `X-Brew-Server-Id` value: exactly 16 hex digits.
+pub fn parse_server_id(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.len() != 16 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(value, 16).ok()
+}
+
+/// Whether an `X-Brew-Federation` value offers (accepts) a version we speak.
+pub fn federation_offered(value: Option<&str>) -> bool {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).is_some_and(|v| v >= 1)
+}
 
 /// How long a (call/SDS uuid, source ISSI) is remembered after it was
 /// accepted, changed talker or ended: a copy of it arriving over another peer
@@ -50,6 +106,20 @@ mod tests {
             kind: CallKind::Group, owner, source_issi: src, destination: 91, priority: 0,
             peers: HashSet::new(), started_at: Instant::now(), last_activity_ms: ActiveCall::new_activity(),
         }
+    }
+
+    #[test]
+    fn server_ids_are_random_non_zero_and_round_trip() {
+        let (a, b) = (FedState::default().self_id, FedState::default().self_id);
+        assert!(a != 0 && b != 0 && a != b);
+        assert_eq!(format_server_id(0x00a1_b2c3_d4e5_f607), "00a1b2c3d4e5f607");
+        assert_eq!(parse_server_id(&format_server_id(a)), Some(a));
+        assert_eq!(parse_server_id("00A1B2C3D4E5F607"), Some(0x00a1_b2c3_d4e5_f607));
+        for bad in ["", "a1b2c3d4e5f607", "00a1b2c3d4e5f6071", "00a1b2c3d4e5f60g", "+0a1b2c3d4e5f607"] {
+            assert_eq!(parse_server_id(bad), None, "{bad:?}");
+        }
+        assert!(federation_offered(Some("1")) && federation_offered(Some(" 2 ")));
+        assert!(!federation_offered(Some("0")) && !federation_offered(Some("yes")) && !federation_offered(None));
     }
 
     #[test]

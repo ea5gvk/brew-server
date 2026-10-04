@@ -1,4 +1,4 @@
-use crate::{router, state::{AppState, Client, ClientMode}};
+use crate::{fedroute, router, state::{AppState, Client, ClientMode}};
 use crate::protocol::ConnVersion;
 use anyhow::Context;
 use axum::{
@@ -121,6 +121,20 @@ fn upgrade_mode_version(headers: &HeaderMap, discovered: Option<(ClientMode, Con
     (mode, if announced.as_u8() > version.as_u8() { announced } else { version })
 }
 
+/// Loop-safe federation negotiation for one inbound connection: Ok(Some(neighbour_id))
+/// when both sides speak it, Ok(None) for a legacy peer, Basestation or Terminal,
+/// Err(()) when the peer claims our own server id (a link to ourselves).
+fn negotiate_federation(mode: ClientMode, headers: &HeaderMap, loop_safe: bool, own_id: u64) -> Result<Option<u64>, ()> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if mode != ClientMode::Peer || !loop_safe || !fedroute::federation_offered(header(fedroute::X_BREW_FEDERATION)) {
+        return Ok(None);
+    }
+    match header(fedroute::X_BREW_SERVER_ID).and_then(fedroute::parse_server_id) {
+        Some(id) if id == own_id => Err(()),
+        neighbour => Ok(neighbour),
+    }
+}
+
 async fn brew_discovery(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -221,12 +235,35 @@ async fn brew_session_endpoint(
 }
 
 async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) -> Response {
+    // Decided on the upgrade's own headers, which every brew-server that
+    // speaks it sends whether or not [auth] put a discovery GET in between.
+    let own_id = state.inner.read().await.fed.self_id;
+    let fed_neighbour = match negotiate_federation(mode, &parts.headers, state.config.federation.loop_safe, own_id) {
+        Ok(neighbour) => neighbour,
+        Err(()) => {
+            warn!(%remote_addr, "federation peer presented this server's own id (a link to ourselves); refusing");
+            return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain")], "Federation link to this server itself
+").into_response();
+        }
+    };
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), "WebSocket upgrade request");
+            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), loop_safe=fed_neighbour.is_some(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
-            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username)).into_response()
+            let mut response = ws.protocols([protocol])
+                .on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username, fed_neighbour))
+                .into_response();
+            if fed_neighbour.is_some() {
+                // Accepting: the dialling side only switches to loop-safe mode
+                // when it sees these in the 101.
+                let headers = response.headers_mut();
+                headers.insert(fedroute::X_BREW_FEDERATION, HeaderValue::from_static("1"));
+                if let Ok(id) = HeaderValue::from_str(&fedroute::format_server_id(own_id)) {
+                    headers.insert(fedroute::X_BREW_SERVER_ID, id);
+                }
+            }
+            response
         }
         Err(rejection) => rejection.into_response(),
     }
@@ -305,21 +342,20 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     Some(username.clone())
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
-    state.inner.write().await.clients.insert(id, Client { tx: tx.clone(), mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() });
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, username=username.as_deref().unwrap_or(""), "Basestation connected");
-    if mode == ClientMode::Peer {
-        // Inbound federation peer link: `federation::run`'s outbound dial
-        // side syncs its own state to us once connected, but that is only
-        // half the story -- we need to tell *this* peer what we know too, or
-        // an inbound-only link (or one that reconnects from the far end)
-        // never learns about registrations that predate it.
-        crate::federation::sync_peer(&state, &tx).await;
-    }
+    // An inbound federation peer link gets this server's full table too:
+    // `federation::run`'s outbound dial side syncs its own state to us once
+    // connected, but that is only half the story -- an inbound-only link (or
+    // one that reconnects from the far end) would otherwise never learn about
+    // registrations that predate it.
+    let client = Client { tx, mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() };
+    crate::federation::attach_client(&state, id, client, fed_neighbour).await;
+    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, username=username.as_deref().unwrap_or(""),
+        loop_safe_neighbour=fed_neighbour.map(fedroute::format_server_id).unwrap_or_default(), "Basestation connected");
 
     // A federation link is pinged and closed once silent (see
     // `federation::Keepalive`), the same as the links we dial out. Basestations
@@ -369,7 +405,7 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_brew_username, upgrade_mode_version, ClientMode, ConnVersion, HeaderMap};
+    use super::{is_valid_brew_username, negotiate_federation, upgrade_mode_version, ClientMode, ConnVersion, HeaderMap};
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -400,6 +436,83 @@ mod tests {
         assert_eq!(upgrade_mode_version(&upgrade, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
         let bogus = headers(&[("X-Brew-Version", "99")]);
         assert_eq!(upgrade_mode_version(&bogus, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
+    }
+
+    #[test]
+    fn negotiate_federation_only_between_loop_safe_peers() {
+        let offer = headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f607")]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, true, 7), Ok(Some(0x00a1_b2c3_d4e5_f607)));
+        // Not loop-safe here, not a peer, or no offer: a plain link.
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, false, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Basestation, &offer, true, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Terminal, &offer, true, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Peer, &headers(&[]), true, 7), Ok(None));
+    }
+
+    #[test]
+    fn negotiate_federation_needs_a_valid_offer() {
+        let id = ("X-Brew-Server-Id", "00a1b2c3d4e5f607");
+        for bad in [
+            headers(&[("X-Brew-Federation", "0"), id]),
+            headers(&[("X-Brew-Federation", "yes"), id]),
+            headers(&[id]),
+            headers(&[("X-Brew-Federation", "1")]),
+            headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "a1b2c3d4e5f607")]),
+            headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f60z")]),
+        ] {
+            assert_eq!(negotiate_federation(ClientMode::Peer, &bad, true, 7), Ok(None), "{bad:?}");
+        }
+        // A later version is still version 1 to us.
+        let newer = headers(&[("X-Brew-Federation", "2"), id]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &newer, true, 7), Ok(Some(0x00a1_b2c3_d4e5_f607)));
+    }
+
+    #[test]
+    fn negotiate_federation_refuses_our_own_id() {
+        let offer = headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f607")]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, true, 0x00a1_b2c3_d4e5_f607), Err(()));
+    }
+
+    #[tokio::test]
+    async fn negotiate_federation_on_a_real_upgrade() {
+        use super::{brew_discovery, get, AppState, Arc, SocketAddr};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.enabled = false;
+        cfg.sms_center.enabled = false;
+        cfg.federation.loop_safe = true;
+        let state = Arc::new(AppState::new(cfg, "test.toml".into()).0);
+        let own_id = state.inner.read().await.fed.self_id;
+        let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        let upgrade = |pairs: &[(&'static str, String)]| {
+            let mut request = format!("ws://{addr}/brew").into_client_request().unwrap();
+            request.headers_mut().insert("X-Brew-Mode", "Peer".parse().unwrap());
+            for (k, v) in pairs { request.headers_mut().insert(*k, v.parse().unwrap()); }
+            tokio_tungstenite::connect_async(request)
+        };
+
+        let (_link, resp) = upgrade(&[("X-Brew-Federation", "1".into()), ("X-Brew-Server-Id", "00000000000000aa".into())]).await.unwrap();
+        assert_eq!(resp.headers()["X-Brew-Federation"], "1");
+        assert_eq!(resp.headers()["X-Brew-Server-Id"], crate::fedroute::format_server_id(own_id).as_str());
+        let (_legacy, resp) = upgrade(&[]).await.unwrap();
+        assert!(!resp.headers().contains_key("X-Brew-Federation"), "an older peer is not answered with it");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while state.inner.read().await.clients.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let neighbours: Vec<u64> = state.inner.read().await.fed.links.values().copied().collect();
+        assert_eq!(neighbours, vec![0xaa], "only the negotiated link is loop-safe");
+
+        let ours = crate::fedroute::format_server_id(own_id);
+        let err = upgrade(&[("X-Brew-Federation", "1".into()), ("X-Brew-Server-Id", ours)]).await.unwrap_err();
+        assert!(err.to_string().contains("409"), "{err}");
     }
 
     #[test]

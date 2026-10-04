@@ -143,6 +143,8 @@ pub struct Inner {
     /// a copy of a call or SDS that reaches this server again over another
     /// peer link (see `fedroute::is_duplicate`).
     pub recent_calls: HashMap<(Uuid, u32), (ClientId, Instant)>,
+    /// Loop-safe federation: this server's id and its negotiated peer links.
+    pub fed: crate::fedroute::FedState,
 }
 
 impl Inner {
@@ -376,6 +378,7 @@ impl AppState {
     pub async fn cleanup_client(&self, id: ClientId) {
         let mut inner = self.inner.write().await;
         inner.clients.remove(&id);
+        inner.fed.links.remove(&id);
 
         let removed_issis: Vec<u32> = inner.subscribers.iter()
             .filter_map(|(issi, sub)| (sub.client_id == id).then_some(*issi)).collect();

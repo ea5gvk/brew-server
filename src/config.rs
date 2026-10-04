@@ -491,11 +491,16 @@ pub struct FederationConfig {
     /// pong -- for this long is closed: its registrations are withdrawn and an
     /// outbound link is redialled. Raised to at least twice the interval.
     pub keepalive_timeout_seconds: u64,
+    /// Loop-safe federation with peers that also enable it, negotiated per
+    /// link with the `X-Brew-Federation` / `X-Brew-Server-Id` headers, for the
+    /// links we dial and the ones we accept (even with `enabled = false`). A
+    /// link to a peer without it stays a plain Peer link. Default false.
+    pub loop_safe: bool,
 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
-        Self { enabled: false, peers: Vec::new(), keepalive_interval_seconds: 15, keepalive_timeout_seconds: 45 }
+        Self { enabled: false, peers: Vec::new(), keepalive_interval_seconds: 15, keepalive_timeout_seconds: 45, loop_safe: false }
     }
 }
 

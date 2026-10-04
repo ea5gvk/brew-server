@@ -12,8 +12,8 @@
 //! and forward raw bytes to whatever `ClientId` owns it, peer or not. The one
 //! piece that genuinely is federation-specific is registration propagation
 //! (see `router::handle_subscriber`'s relay-to-other-peers step) and the
-//! full-table sync a newly connected peer needs (`sync_peer` below), since a
-//! peer link only sees registration *events* going forward otherwise.
+//! full-table sync a newly connected peer needs (`attach_client` below), since
+//! a peer link only sees registration *events* going forward otherwise.
 //!
 //! This module owns the *outbound* half (dialing peers configured in
 //! `[[federation.peers]]`). The inbound half needs no special code: an
@@ -22,8 +22,9 @@
 //! `X-Brew-Mode: Peer` header it sends.
 
 use crate::config::{FederationConfig, FederationPeerConfig};
+use crate::fedroute::{self, X_BREW_FEDERATION, X_BREW_SERVER_ID};
 use crate::protocol::{self, ConnVersion};
-use crate::state::{AppState, Client, ClientMode};
+use crate::state::{AppState, Client, ClientId, ClientMode};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -38,12 +39,17 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 /// Spawns one reconnecting dial loop per enabled `[[federation.peers]]`
 /// entry. No-op when federation is disabled.
 pub async fn run(state: Arc<AppState>) {
+    if state.config.federation.loop_safe {
+        let id = state.inner.read().await.fed.self_id;
+        info!(server_id = %fedroute::format_server_id(id), "federation: loop-safe mode");
+    }
     if !state.config.federation.enabled {
         return;
     }
@@ -266,12 +272,14 @@ const USER_AGENT: &str = concat!("brew-server/", env!("CARGO_PKG_VERSION"));
 /// says, so without them this link used to be registered over there as a
 /// Basestation (no table sync, no relay) and federation only worked in one
 /// direction. Some Brew servers also refuse a discovery without a
-/// `User-Agent` (400).
+/// `User-Agent` (400). The `extra` headers (the loop-safe federation offer)
+/// go on every request too.
 async fn http_get(
     peer: &FederationPeerConfig,
     tls: Option<&TlsConnector>,
     path: &str,
     authorization: Option<&str>,
+    extra: &[(&str, String)],
 ) -> anyhow::Result<HttpResponse> {
     let mut stream = dial(peer, tls).await?;
     let remote_host = &peer.remote_host;
@@ -281,6 +289,9 @@ async fn http_get(
     );
     if let Some(a) = authorization {
         req.push_str(&format!("Authorization: {a}\r\n"));
+    }
+    for (name, value) in extra {
+        req.push_str(&format!("{name}: {value}\r\n"));
     }
     req.push_str("\r\n");
     stream.write_all(req.as_bytes()).await?;
@@ -318,8 +329,13 @@ fn parse_http_response(buf: &[u8]) -> anyhow::Result<HttpResponse> {
 /// dance a real Basestation performs, or a single request when the peer has
 /// `[auth]` disabled) and returns the path to actually upgrade the WebSocket
 /// at.
-async fn discover(peer: &FederationPeerConfig, tls: Option<&TlsConnector>, path: &str) -> anyhow::Result<String> {
-    let resp = http_get(peer, tls, path, None).await?;
+async fn discover(
+    peer: &FederationPeerConfig,
+    tls: Option<&TlsConnector>,
+    path: &str,
+    extra: &[(&str, String)],
+) -> anyhow::Result<String> {
+    let resp = http_get(peer, tls, path, None, extra).await?;
     match resp.status {
         200 => Ok(String::from_utf8(resp.body)?.trim().to_string()),
         401 => {
@@ -330,7 +346,7 @@ async fn discover(peer: &FederationPeerConfig, tls: Option<&TlsConnector>, path:
             let authz = crate::sip::auth::build_authorization(
                 &challenge, &peer.username, &peer.password, "GET", path, &cnonce, 1,
             );
-            let resp2 = http_get(peer, tls, path, Some(&authz)).await?;
+            let resp2 = http_get(peer, tls, path, Some(&authz), extra).await?;
             if resp2.status != 200 {
                 anyhow::bail!("digest auth rejected (HTTP {})", resp2.status);
             }
@@ -340,11 +356,33 @@ async fn discover(peer: &FederationPeerConfig, tls: Option<&TlsConnector>, path:
     }
 }
 
+/// Neighbour id from the 101 response when the peer accepted loop-safe mode;
+/// Err when it reports our own id.
+fn accepted_neighbour(resp: &HeaderMap, loop_safe: bool, own_id: u64) -> anyhow::Result<Option<u64>> {
+    let header = |name: &str| resp.get(name).and_then(|v| v.to_str().ok());
+    if !loop_safe || !fedroute::federation_offered(header(X_BREW_FEDERATION)) {
+        return Ok(None);
+    }
+    match header(X_BREW_SERVER_ID).and_then(fedroute::parse_server_id) {
+        Some(id) if id == own_id => anyhow::bail!("peer reports this server's own id: a link to ourselves"),
+        neighbour => Ok(neighbour),
+    }
+}
+
 async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> anyhow::Result<()> {
     let tls = if peer.tls { Some(tls_connector(peer)?) } else { None };
-    let (ws_stream, remote_addr) = tokio::time::timeout(DIAL_TIMEOUT, async {
+    // Loop-safe federation is offered on discovery and on the upgrade; the
+    // peer decides on the upgrade and accepts in its 101.
+    let loop_safe = state.config.federation.loop_safe;
+    let own_id = state.inner.read().await.fed.self_id;
+    let fed_headers: Vec<(&str, String)> = if loop_safe {
+        vec![(X_BREW_FEDERATION, "1".to_string()), (X_BREW_SERVER_ID, fedroute::format_server_id(own_id))]
+    } else {
+        Vec::new()
+    };
+    let (ws_stream, remote_addr, neighbour) = tokio::time::timeout(DIAL_TIMEOUT, async {
         let path = normalize_path(&peer.path);
-        let ws_path = discover(peer, tls.as_ref(), &path).await?;
+        let ws_path = discover(peer, tls.as_ref(), &path, &fed_headers).await?;
 
         let remote_addr = tokio::net::lookup_host(&peer.remote_host).await.ok()
             .and_then(|mut it| it.next());
@@ -358,16 +396,22 @@ async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> 
         request.headers_mut().insert("X-Brew-Mode", "Peer".parse()?);
         request.headers_mut().insert("X-Brew-Version", protocol::BREW_PROTOCOL_VERSION.to_string().parse()?);
         request.headers_mut().insert("Sec-WebSocket-Protocol", "brew".parse()?);
+        for (name, value) in &fed_headers {
+            request.headers_mut().insert(*name, value.parse()?);
+        }
 
         let stream = dial(peer, tls.as_ref()).await?;
-        let (ws_stream, _resp) = tokio_tungstenite::client_async(request, stream).await?;
-        anyhow::Ok((ws_stream, remote_addr))
+        let (ws_stream, resp) = tokio_tungstenite::client_async(request, stream).await?;
+        // On Err the stream is dropped here, closing the link to ourselves.
+        let neighbour = accepted_neighbour(resp.headers(), loop_safe, own_id)?;
+        anyhow::Ok((ws_stream, remote_addr, neighbour))
     })
     .await
     .map_err(|_| anyhow::anyhow!("timed out after {}s dialling peer", DIAL_TIMEOUT.as_secs()))??;
-    info!(peer = %peer.name, "federation: peer link established");
+    info!(peer = %peer.name, loop_safe_neighbour = neighbour.map(fedroute::format_server_id).unwrap_or_default(),
+        "federation: peer link established");
     let keepalive = Keepalive::from_config(&state.config.federation);
-    run_peer_session(state.clone(), peer.clone(), ws_stream, remote_addr, keepalive).await;
+    run_peer_session(state.clone(), peer.clone(), ws_stream, remote_addr, keepalive, neighbour).await;
     Ok(())
 }
 
@@ -378,9 +422,9 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// Runs one established peer session: registers the peer in `inner.clients`
-/// (mode `Peer`), sends it a full snapshot of everything this server
-/// currently knows (see `sync_peer`), then pumps inbound frames through the
-/// normal router and outbound frames from its `tx` queue -- the same shape
+/// (mode `Peer`, loop-safe when `neighbour` is set), sends it a full snapshot
+/// of everything this server currently knows (see `attach_client`), then
+/// pumps inbound frames through the normal router and outbound frames from its `tx` queue -- the same shape
 /// as `server::client_session`, just over a `tokio_tungstenite` client
 /// socket (plain or TLS) instead of axum's server-side one. With `keepalive`
 /// the link is pinged and closed once silent past its timeout (see
@@ -391,17 +435,16 @@ async fn run_peer_session(
     ws_stream: tokio_tungstenite::WebSocketStream<Box<dyn PeerIo>>,
     remote_addr: Option<SocketAddr>,
     keepalive: Option<Keepalive>,
+    neighbour: Option<u64>,
 ) {
     let id = uuid::Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
-    state.inner.write().await.clients.insert(id, Client {
-        tx: tx.clone(), mode: ClientMode::Peer, version: ConnVersion::V1, remote_addr, connected_at_ms, username: None,
-    });
+    attach_client(&state, id, Client {
+        tx, mode: ClientMode::Peer, version: ConnVersion::V1, remote_addr, connected_at_ms, username: None,
+    }, neighbour).await;
     info!(%id, peer = %peer.name, "federation: peer registered");
-
-    sync_peer(&state, &tx).await;
 
     let mut ping = keepalive.map(Keepalive::ping_timer);
     let writer = tokio::spawn(async move {
@@ -442,22 +485,34 @@ async fn run_peer_session(
     info!(%id, peer = %peer.name, "federation: peer link closed");
 }
 
-/// Sends a newly connected peer everything this server currently knows:
-/// every registered ISSI (`SUB_REGISTER`) and its group affiliations
-/// (`SUB_AFFILIATE`), regardless of whether this server learned them locally
-/// or from another peer (transit). Without this, a peer only ever learns
-/// about registrations that happen to change *after* it connects, so a
-/// freshly (re)started link would be blind to everything already in place.
-pub async fn sync_peer(state: &Arc<AppState>, tx: &mpsc::UnboundedSender<Vec<u8>>) {
-    let snapshot: Vec<(u32, Vec<u32>)> = {
-        let inner = state.inner.read().await;
-        inner.subscribers.iter().map(|(issi, s)| (*issi, s.groups.iter().copied().collect())).collect()
-    };
-    for (issi, groups) in snapshot {
-        let _ = tx.send(protocol::build_subscriber_message(protocol::SUB_REGISTER, issi, &[]));
-        if !groups.is_empty() {
-            let _ = tx.send(protocol::build_subscriber_message(protocol::SUB_AFFILIATE, issi, &groups));
+/// Registers a new connection and, for a peer link, queues its initial full sync in the
+/// same critical section, so a registration change racing the sync can never reach the
+/// peer before (and be overwritten by) the stale snapshot.
+///
+/// The sync is everything this server currently knows: every registered ISSI
+/// (`SUB_REGISTER`) and its group affiliations (`SUB_AFFILIATE`), regardless
+/// of whether this server learned them locally or from another peer
+/// (transit). Without it, a peer only ever learns about registrations that
+/// happen to change *after* it connects, so a freshly (re)started link would
+/// be blind to everything already in place. `neighbour` is the far server's
+/// id when the link negotiated loop-safe federation.
+pub async fn attach_client(state: &Arc<AppState>, id: ClientId, client: Client, neighbour: Option<u64>) {
+    let mut inner = state.inner.write().await;
+    if client.mode == ClientMode::Peer {
+        let mut issis: Vec<u32> = inner.subscribers.keys().copied().collect();
+        issis.sort_unstable();
+        for issi in issis {
+            let mut groups: Vec<u32> = inner.subscribers[&issi].groups.iter().copied().collect();
+            groups.sort_unstable();
+            let _ = client.tx.send(protocol::build_subscriber_message(protocol::SUB_REGISTER, issi, &[]));
+            if !groups.is_empty() {
+                let _ = client.tx.send(protocol::build_subscriber_message(protocol::SUB_AFFILIATE, issi, &groups));
+            }
         }
+    }
+    inner.clients.insert(id, client);
+    if let Some(neighbour) = neighbour {
+        inner.fed.links.insert(id, neighbour);
     }
 }
 
@@ -518,7 +573,7 @@ mod tests {
     async fn discovery_without_auth_identifies_as_peer() {
         let (addr, server) = http_stub(vec![OK], None).await;
         let peer = FederationPeerConfig { remote_host: addr, ..Default::default() };
-        assert_eq!(discover(&peer, None, "/brew").await.unwrap(), "/brew/");
+        assert_eq!(discover(&peer, None, "/brew", &[]).await.unwrap(), "/brew/");
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("GET /brew HTTP/1.1\r\n"));
         assert_identifies_as_peer(&requests[0]);
@@ -533,12 +588,48 @@ mod tests {
         let peer = FederationPeerConfig {
             remote_host: addr, username: "9000001".into(), password: "secret".into(), ..Default::default()
         };
-        assert_eq!(discover(&peer, None, "/brew").await.unwrap(), "/brew/");
+        assert_eq!(discover(&peer, None, "/brew", &[]).await.unwrap(), "/brew/");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
         for request in &requests { assert_identifies_as_peer(request); }
         assert!(!requests[0].contains("Authorization:"));
         assert!(requests[1].contains("Authorization: Digest username=\"9000001\""));
+    }
+
+    #[tokio::test]
+    async fn discovery_carries_the_loop_safe_offer() {
+        let challenge = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, server) = http_stub(vec![challenge, OK], None).await;
+        let peer = FederationPeerConfig { remote_host: addr, username: "9000001".into(), password: "x".into(), ..Default::default() };
+        let offer = [(X_BREW_FEDERATION, "1".to_string()), (X_BREW_SERVER_ID, "00a1b2c3d4e5f607".to_string())];
+        assert_eq!(discover(&peer, None, "/brew", &offer).await.unwrap(), "/brew/");
+        for request in server.await.unwrap() {
+            assert!(request.contains("X-Brew-Federation: 1\r\n"), "{request:?}");
+            assert!(request.contains("X-Brew-Server-Id: 00a1b2c3d4e5f607\r\n"), "{request:?}");
+        }
+    }
+
+    fn response_headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs { h.insert(*k, v.parse().unwrap()); }
+        h
+    }
+
+    #[test]
+    fn accepted_neighbour_from_the_101() {
+        let accepted = response_headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00000000000000bb")]);
+        assert_eq!(accepted_neighbour(&accepted, true, 7).unwrap(), Some(0xbb));
+        // An older peer answers without them: a plain link.
+        assert_eq!(accepted_neighbour(&response_headers(&[]), true, 7).unwrap(), None);
+        assert_eq!(accepted_neighbour(&response_headers(&[("X-Brew-Federation", "1")]), true, 7).unwrap(), None);
+        // Not offered (loop_safe off): never switched on by the far end alone.
+        assert_eq!(accepted_neighbour(&accepted, false, 7).unwrap(), None);
+    }
+
+    #[test]
+    fn accepted_neighbour_refuses_our_own_id() {
+        let ourselves = response_headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00000000000000bb")]);
+        assert!(accepted_neighbour(&ourselves, true, 0xbb).is_err());
     }
 
     #[test]
@@ -621,7 +712,7 @@ n4vmZr6Amcla0g/ZPFe5Ty9FYRBqSwsjpiv8kFaHOslcSTovuV0FqpDd
         peer.tls = true;
         let result = async {
             let connector = tls_connector(&peer)?;
-            discover(&peer, Some(&connector), "/brew").await
+            discover(&peer, Some(&connector), "/brew", &[]).await
         }.await;
         if result.is_ok() {
             let requests = server.await.unwrap();
@@ -725,10 +816,26 @@ n4vmZr6Amcla0g/ZPFe5Ty9FYRBqSwsjpiv8kFaHOslcSTovuV0FqpDd
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(5),
-            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST)),
+            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST), None),
         ).await.expect("a silent link must be closed by the keepalive");
         assert!(started.elapsed() >= FAST.timeout);
         assert!(state.inner.read().await.clients.is_empty(), "link deregistered");
+    }
+
+    #[tokio::test]
+    async fn negotiated_peer_session_is_a_loop_safe_link_until_it_closes() {
+        let state = AppState::for_test();
+        let (near, far) = ws_pair().await;
+        let session = tokio::spawn(run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, None, Some(0xbb)));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while state.inner.read().await.fed.links.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.inner.read().await.fed.links.values().copied().collect::<Vec<_>>(), vec![0xbb]);
+        drop(far);
+        tokio::time::timeout(Duration::from_secs(5), session).await.unwrap().unwrap();
+        let inner = state.inner.read().await;
+        assert!(inner.clients.is_empty() && inner.fed.links.is_empty());
     }
 
     #[tokio::test]
@@ -746,7 +853,7 @@ n4vmZr6Amcla0g/ZPFe5Ty9FYRBqSwsjpiv8kFaHOslcSTovuV0FqpDd
         });
         let session = tokio::time::timeout(
             Duration::from_millis(600),
-            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST)),
+            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST), None),
         ).await;
         assert!(session.is_err(), "a link that answers pings must stay up");
         assert!(pings.load(Ordering::SeqCst) >= 2, "pinged every interval");
