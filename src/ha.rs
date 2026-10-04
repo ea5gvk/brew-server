@@ -156,13 +156,20 @@ impl Election {
 
     /// Dashboard "Make Standby" on the Active node: hand over to the peer.
     pub fn request_standby(&mut self, peer: Option<&PeerView>, now_ms: u64) -> Result<(), &'static str> {
+        self.request_handover(peer, now_ms, true)
+    }
+
+    /// Hands over to a healthy Standby peer. `manual` gives the peer a hold;
+    /// without it (e.g. a restart to apply config) the usual weight and
+    /// persist rules decide who ends up Active afterwards.
+    pub fn request_handover(&mut self, peer: Option<&PeerView>, now_ms: u64, manual: bool) -> Result<(), &'static str> {
         if self.role != Role::Active {
             return Err("this node is not Active");
         }
         let Some(peer) = peer.filter(|p| matches!(p.role, Role::Standby | Role::Init)) else {
             return Err("no healthy Standby peer to hand over to");
         };
-        self.start_handover(&peer.node.clone(), true, now_ms);
+        self.start_handover(&peer.node.clone(), manual, now_ms);
         Ok(())
     }
 
@@ -475,6 +482,10 @@ pub enum HaCommand {
     MakeStandby(oneshot::Sender<Result<(), String>>),
     /// `None` clears the override (back to the config value).
     SetPersist(Option<bool>, oneshot::Sender<Result<(), String>>),
+    /// Restart to apply the saved config file. On the Active node with a
+    /// healthy Standby peer, hands over first; with `force`, restarts the
+    /// Active node even when no peer can take over (service drops).
+    Apply { force: bool, reply: oneshot::Sender<Result<String, String>> },
 }
 
 /// Shared between the HA task and the rest of the server.
@@ -504,6 +515,18 @@ impl HaHandle {
             transitions: VecDeque::new(),
         };
         Self { status: watch::channel(status).0, commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
+    }
+
+    /// Sends a dashboard command to the HA task and waits for its answer.
+    pub async fn command<T>(&self, make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> HaCommand) -> Result<T, String> {
+        let (tx, rx) = oneshot::channel();
+        if !self.status.borrow().enabled || self.commands.send(make(tx)).is_err() {
+            return Err("HA is not enabled".into());
+        }
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(r)) => r,
+            _ => Err("HA task did not answer".into()),
+        }
     }
 
     /// Resolves once this node is Active (immediately with HA disabled).
@@ -581,6 +604,8 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     let persist = ha_state.persist_override.unwrap_or(cfg.persist);
     state.ha.status.send_modify(|s| s.transitions = ha_state.transitions.clone());
     let mut was_active = false;
+    // Set by an Apply that hands over first: restart once the handover ends.
+    let mut apply_pending = false;
     let mut election = Election::new(&cfg.node_name, cfg.weight, persist, now_ms(), cfg.dead_after_ms);
     let mut guard = ReplayGuard::default();
     let mut last_peer: Option<LastPeer> = None;
@@ -658,9 +683,31 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
                         if r.is_ok() { reason = "manual: make standby".into(); }
                         let _ = reply.send(r);
                     }
+                    HaCommand::Apply { force, reply } => {
+                        if election.role == Role::Active {
+                            match election.request_handover(peer.as_ref(), now, false) {
+                                Ok(()) => {
+                                    apply_pending = true;
+                                    reason = "manual: apply config (handover)".into();
+                                    let _ = reply.send(Ok("handing over to the peer, then restarting".into()));
+                                }
+                                Err(e) if !force => { let _ = reply.send(Err(format!("{e}; confirm to restart anyway (service drops)"))); }
+                                Err(_) => {
+                                    let _ = reply.send(Ok("restarting without a peer to take over".into()));
+                                    restart_now(&vip, vip_held).await;
+                                }
+                            }
+                        } else {
+                            let _ = reply.send(Ok("restarting".into()));
+                            restart_now(&vip, vip_held).await;
+                        }
+                    }
                     HaCommand::SetPersist(value, reply) => {
                         ha_state.persist_override = value;
                         election.persist = value.unwrap_or(cfg.persist);
+                        // Setting the policy explicitly ends a manual hold, so
+                        // "off" / "config default" really resumes preemption.
+                        election.hold = false;
                         let r = ha_state.save(&cfg.state_path).map_err(|e| e.to_string());
                         let _ = reply.send(r);
                     }
@@ -771,14 +818,24 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         // handing over first keeps heartbeating until the peer has taken
         // over (or the handover timed out).
         was_active |= after == Role::Active && vip_held;
-        if was_active && after != Role::Active && election.handover_target().is_none() {
-            if vip_held {
-                if let Err(e) = vip.down().await { error!(error = %e, "cannot release the VIP"); }
+        if election.handover_target().is_none() {
+            if apply_pending {
+                // Handover done (or timed out): restart to load the new config.
+                restart_now(&vip, vip_held).await;
             }
-            warn!(role = ?after, "left Active: restarting into Standby");
-            crate::restart_process();
+            if was_active && after != Role::Active {
+                warn!(role = ?after, "left Active: restarting into Standby");
+                restart_now(&vip, vip_held).await;
+            }
         }
     }
+}
+
+async fn restart_now(vip: &Vip, vip_held: bool) {
+    if vip_held {
+        if let Err(e) = vip.down().await { error!(error = %e, "cannot release the VIP"); }
+    }
+    crate::restart_process();
 }
 
 fn alive_peer(last: &Option<LastPeer>, now_ms: u64, dead_after_ms: u64) -> Option<PeerView> {
