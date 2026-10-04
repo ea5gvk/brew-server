@@ -426,11 +426,20 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
             state.monitor.call_started(id, "private", source_issi, destination, 0).await;
             info!(%source, uuid=%id, source_issi, destination, dialled = %dialled, mnemonic=?mnemonic, "routed private SETUP_REQUEST to SIP");
         } else {
-            warn!(%source, uuid=%id, destination, dialled = %dialled, "private call destination not registered (no SIP route)");
+            warn!(%source, uuid=%id, destination, dialled = %dialled, "private call destination not registered (no SIP route); rejected");
+            reject_setup(state, source, id).await;
         }
         return;
     };
-    if target_client == source { return; }
+    if target_client == source {
+        // A Basestation only hands a private call to Brew when the called
+        // ISSI is not registered on it, so a destination registered on the
+        // caller's own connection is a stale entry or a federation loop.
+        drop(inner);
+        warn!(%source, uuid=%id, destination, "private call destination resolves back to its caller's own link; rejecting");
+        reject_setup(state, source, id).await;
+        return;
+    }
     let peers = HashSet::from([target_client]);
     inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now(), last_activity_ms: ActiveCall::new_activity() });
     let target = inner.clients.get(&target_client).map(|c| (c.tx.clone(), c.version));
@@ -438,6 +447,21 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     if let Some((tx, version)) = target { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
     state.monitor.call_started(id, "private", source_issi, destination, 0).await;
     info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST");
+}
+
+/// Answers a private SETUP_REQUEST this server cannot route with
+/// CALL_SETUP_REJECT, so the calling radio is released at once ("called party
+/// not reachable") instead of waiting out its own setup timer. Sent back on
+/// the connection the SETUP came in on -- a Basestation, or a peer link, whose
+/// server relays it to the caller exactly like a callee's own reject
+/// (route_private_control -> end_call). No call is recorded, so a
+/// CALL_RELEASE the caller's side may still send for it is ignored as one for
+/// an unknown call.
+async fn reject_setup(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid) {
+    let tx = state.inner.read().await.clients.get(&source).map(|c| c.tx.clone());
+    if let Some(tx) = tx {
+        let _ = tx.send(protocol::build_call_cause(CALL_SETUP_REJECT, &id, protocol::CAUSE_CALLED_PARTY_NOT_REACHABLE));
+    }
 }
 
 async fn route_private_control(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: Vec<u8>) {
@@ -854,5 +878,103 @@ mod forwarding_tests {
         let v1_setup = with_mnemonic(protocol::build_circular_call_setup(&to_v1, 5001, 6003, 0), b"CTRL");
         handle_packet(state.clone(), caller, v1_setup.clone()).await;
         assert_eq!(drain(&mut v1_rx), vec![v1_setup]);
+    }
+
+    fn setup_reject(id: &uuid::Uuid) -> Vec<u8> {
+        protocol::build_call_cause(CALL_SETUP_REJECT, id, protocol::CAUSE_CALLED_PARTY_NOT_REACHABLE)
+    }
+
+    #[tokio::test]
+    async fn unroutable_private_setup_is_rejected_to_the_caller() {
+        let state = AppState::for_test();
+        let (caller, mut caller_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut other_rx) = connect(&state, ConnVersion::V0).await;
+        let id = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), caller, protocol::build_circular_call_setup(&id, 5001, 7777, 0)).await;
+        assert_eq!(drain(&mut caller_rx), vec![setup_reject(&id)]);
+        assert!(drain(&mut other_rx).is_empty());
+        assert!(state.inner.read().await.calls.is_empty(), "a rejected setup leaves no call behind");
+        // The caller's side releasing it afterwards is harmless.
+        handle_packet(state.clone(), caller, protocol::build_call_cause(CALL_RELEASE, &id, 3)).await;
+        assert!(drain(&mut other_rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn private_setup_back_to_its_own_link_is_rejected() {
+        let state = AppState::for_test();
+        let (link, mut link_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), link, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        let id = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), link, protocol::build_circular_call_setup(&id, 5001, 6002, 0)).await;
+        assert_eq!(drain(&mut link_rx), vec![setup_reject(&id)]);
+        assert!(state.inner.read().await.calls.is_empty());
+    }
+
+    /// A GROUP_TX from `talker`; with no affiliations recorded, every other
+    /// connection hears it (`fallback_broadcast_when_no_affiliations`).
+    async fn group_call(state: &Arc<AppState>, talker: ClientId) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), talker, protocol::build_group_tx(&id, 1001, 91, 0)).await;
+        id
+    }
+
+    #[tokio::test]
+    async fn talker_dropping_ends_the_group_call_for_its_listeners() {
+        let state = AppState::for_test();
+        let (talker, _talker_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut a_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut b_rx) = connect(&state, ConnVersion::V0).await;
+        let id = group_call(&state, talker).await;
+        drain(&mut a_rx);
+        drain(&mut b_rx);
+
+        state.cleanup_client(talker).await;
+        let idle = protocol::build_call_cause(CALL_GROUP_IDLE, &id, protocol::CAUSE_SWMI_REQUESTED_DISCONNECTION);
+        assert_eq!(drain(&mut a_rx), vec![idle.clone()]);
+        assert_eq!(drain(&mut b_rx), vec![idle]);
+        let inner = state.inner.read().await;
+        assert!(inner.calls.is_empty() && inner.group_floor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn listener_dropping_keeps_the_group_call_for_the_others() {
+        let state = AppState::for_test();
+        let (talker, mut talker_rx) = connect(&state, ConnVersion::V0).await;
+        let (gone, _gone_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut stays_rx) = connect(&state, ConnVersion::V0).await;
+        let id = group_call(&state, talker).await;
+        drain(&mut stays_rx);
+
+        state.cleanup_client(gone).await;
+        assert!(drain(&mut talker_rx).is_empty(), "nobody is told about a departing listener");
+        assert!(drain(&mut stays_rx).is_empty());
+        let voice = protocol::build_traffic_frame(&id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES]);
+        handle_packet(state.clone(), talker, voice.clone()).await;
+        assert_eq!(drain(&mut stays_rx), vec![voice], "the remaining listener keeps hearing the talker");
+        assert_eq!(state.inner.read().await.group_floor.get(&91), Some(&id));
+    }
+
+    #[tokio::test]
+    async fn private_call_party_dropping_releases_the_other() {
+        let state = AppState::for_test();
+        let (caller, mut caller_rx) = connect(&state, ConnVersion::V0).await;
+        let (callee, mut callee_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), callee, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        handle_packet(state.clone(), caller, protocol::build_subscriber_message(SUB_REGISTER, 5001, &[])).await;
+        let to_callee = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), caller, protocol::build_circular_call_setup(&to_callee, 5001, 6002, 0)).await;
+        let to_caller = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), callee, protocol::build_circular_call_setup(&to_caller, 6002, 5001, 0)).await;
+        drain(&mut caller_rx);
+        drain(&mut callee_rx);
+
+        // Whichever side placed the call, the party left behind is released.
+        state.cleanup_client(callee).await;
+        let mut got = drain(&mut caller_rx);
+        got.sort();
+        let mut want = [to_callee, to_caller].map(|id| protocol::build_call_cause(CALL_RELEASE, &id, protocol::CAUSE_SWMI_REQUESTED_DISCONNECTION)).to_vec();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(state.inner.read().await.calls.is_empty());
     }
 }

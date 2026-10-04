@@ -26,6 +26,15 @@ Unreleased adds:
   closed after `keepalive_timeout_seconds` (default `45`) without any frame,
   so a half-open link no longer keeps routes pointing at it; `0` disables.
   Dialling a peer now gives up after 30 s instead of possibly hanging.
+- **Unroutable private calls are rejected.** A private `SETUP_REQUEST` whose
+  destination is not registered anywhere (and has no SIP route) is answered
+  with `CALL_SETUP_REJECT`, cause 3 ("called party not reachable"), so the
+  calling radio is released at once instead of waiting out its own timer.
+- **Calls end cleanly when a connection drops.** When a Basestation or peer
+  link disconnects, the other participants of its calls get the
+  `CALL_GROUP_IDLE` / `CALL_RELEASE` a normal hangup would send (cause 14,
+  "SwMI requested disconnection"). A group listener dropping no longer ends
+  the call for everybody else.
 - **Talker names only to v1 connections.** `GROUP_TX` and `SETUP_REQUEST`
   forwarded to a connection that negotiated Brew v0 lose the v1
   `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client

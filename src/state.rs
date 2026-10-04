@@ -379,14 +379,36 @@ impl AppState {
         for clients in inner.group_clients.values_mut() { clients.remove(&id); }
         inner.group_clients.retain(|_, clients| !clients.is_empty());
 
-        let removed_calls: Vec<Uuid> = inner.calls.iter()
+        // Calls this client took part in, ended the way router::end_call ends
+        // them: a private call ends for both parties; a group call ends only
+        // if its owner (the talker's side) is the one that vanished -- a
+        // departing listener is just dropped from the recipients, so everyone
+        // else keeps hearing it. The remaining participants get the
+        // CALL_RELEASE / CALL_GROUP_IDLE a hangup would have relayed, so their
+        // radios drop the call now instead of waiting for their own timers.
+        // Removal happens under this write lock, so a call already ended
+        // (end_call, the timeout sweep, the SIP bridge) is never ended twice.
+        let involved: Vec<Uuid> = inner.calls.iter()
             .filter_map(|(uuid, call)| (call.owner == id || call.peers.contains(&id)).then_some(*uuid)).collect();
-        for uuid in &removed_calls {
-            if let Some(call) = inner.calls.remove(uuid) {
-                if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(uuid) {
-                    inner.group_floor.remove(&call.destination);
-                }
+        let mut removed_calls = Vec::new();
+        let mut end_notices: Vec<(mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)> = Vec::new();
+        for uuid in involved {
+            let Some(call) = inner.calls.get_mut(&uuid) else { continue };
+            if call.kind == CallKind::Group && call.owner != id {
+                call.peers.remove(&id);
+                continue;
             }
+            let Some(call) = inner.calls.remove(&uuid) else { continue };
+            if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(&uuid) {
+                inner.group_floor.remove(&call.destination);
+            }
+            let end_state = if call.kind == CallKind::Group { crate::protocol::CALL_GROUP_IDLE } else { crate::protocol::CALL_RELEASE };
+            let msg = crate::protocol::build_call_cause(end_state, &uuid, crate::protocol::CAUSE_SWMI_REQUESTED_DISCONNECTION);
+            let mut recipients = call.peers.clone();
+            if call.kind == CallKind::Private { recipients.insert(call.owner); }
+            recipients.remove(&id);
+            end_notices.extend(recipients.iter().filter_map(|c| inner.clients.get(c)).map(|c| (c.tx.clone(), msg.clone())));
+            removed_calls.push(uuid);
         }
         inner.sds_routes.retain(|_, route| route.source_client != id && !route.targets.contains(&id));
 
@@ -402,14 +424,16 @@ impl AppState {
                 .collect()
         };
         drop(inner);
+        for (tx, msg) in end_notices { let _ = tx.send(msg); }
         for issi in removed_issis {
             let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
             for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
         }
 
-        // The calls this client took part in are gone: end them on the
-        // dashboard too, and hang up any SIP leg bridged to one, otherwise
-        // both UIs keep showing a call that no longer exists.
+        // The calls ended above are gone: end them on the dashboard too, and
+        // hang up any SIP leg bridged to one, otherwise both UIs keep showing
+        // a call that no longer exists. A group call that only lost a
+        // listener is still running and stays.
         let bridge = match self.sip.read().await.as_ref() {
             Some(h) => h.transport.bridge.read().await.clone(),
             None => None,

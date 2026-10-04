@@ -31,6 +31,15 @@ pub const CALL_SHORT_TRANSFER: u8 = 11;
 pub const CALL_SIMPLEX_GRANTED: u8 = 12;
 pub const CALL_SIMPLEX_IDLE: u8 = 13;
 
+/// Disconnect causes (ETSI EN 300 392-2 clause 14.8.18) for the cause byte of
+/// call-control messages this server originates itself.
+/// "Called party not reachable": a private call's destination is not
+/// registered anywhere this server can route to.
+pub const CAUSE_CALLED_PARTY_NOT_REACHABLE: u8 = 3;
+/// "SwMI requested disconnection": the network ended the call, here because
+/// a participant's connection dropped.
+pub const CAUSE_SWMI_REQUESTED_DISCONNECTION: u8 = 14;
+
 pub const FRAME_TRAFFIC_CHANNEL: u8 = 0;
 pub const FRAME_SDS_TRANSFER: u8 = 1;
 pub const FRAME_SDS_REPORT: u8 = 2;
