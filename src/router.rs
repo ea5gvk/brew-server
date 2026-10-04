@@ -129,6 +129,13 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     // the call it duplicates.
     if is_peer(&inner, source) && crate::fedroute::is_duplicate(&inner, id, gt.source, source, now) {
         debug!(%source, uuid=%id, src_issi=gt.source, gssi=gt.destination, "duplicate GROUP_TX from a second peer link dropped");
+        // A loop-safe peer is asked to stop sending this turn's voice our
+        // way too (an older peer would not understand it).
+        if inner.fed.links.contains_key(&source) {
+            if let Some(client) = inner.clients.get(&source) {
+                let _ = client.tx.send(crate::fedroute::build_prune(&id, gt.source));
+            }
+        }
         return;
     }
     let mut preempted = None;
@@ -1167,6 +1174,37 @@ mod forwarding_tests {
         handle_packet(state.clone(), link, protocol::build_circular_call_setup(&id, 5001, 6002, 0)).await;
         assert!(drain(&mut link_rx).is_empty(), "a transient loop gets no reject");
         assert!(state.inner.read().await.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_group_tx_over_a_loop_safe_link_is_pruned() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, mut second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (legacy, mut legacy_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (_, mut site_rx) = connect(&state, ConnVersion::V0).await;
+        state.inner.write().await.fed.links.extend([(first, 1), (second, 2)]);
+        let id = uuid::Uuid::new_v4();
+        let group_tx = protocol::build_group_tx(&id, 1001, 91, 0);
+        handle_packet(state.clone(), first, group_tx.clone()).await;
+        drain(&mut second_rx);
+        drain(&mut legacy_rx);
+        drain(&mut site_rx);
+
+        handle_packet(state.clone(), second, group_tx.clone()).await;
+        assert_eq!(drain(&mut second_rx), vec![crate::fedroute::build_prune(&id, 1001)]);
+        handle_packet(state.clone(), legacy, group_tx).await;
+        assert!(drain(&mut legacy_rx).is_empty(), "an older peer is never sent one");
+
+        // A prune from a recipient takes it off this turn's stream only.
+        let peers = || async { state.inner.read().await.calls[&id].peers.clone() };
+        handle_packet(state.clone(), second, crate::fedroute::build_prune(&id, 1002)).await;
+        assert!(peers().await.contains(&second), "another talker's turn: ignored");
+        handle_packet(state.clone(), second, crate::fedroute::build_prune(&id, 1001)).await;
+        assert!(!peers().await.contains(&second));
+        handle_packet(state.clone(), first, voice(&id)).await;
+        assert!(drain(&mut second_rx).is_empty());
+        assert_eq!(drain(&mut site_rx), vec![voice(&id)]);
     }
 
     #[tokio::test]

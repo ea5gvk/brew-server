@@ -47,6 +47,9 @@ Unreleased adds:
   over and being forwarded again; a late copy within 5 s of the call ending
   no longer brings it back. A talker change inside a group call (same uuid,
   another ISSI) is still accepted. Basestation traffic is never checked.
+  Between loop-safe servers (`loop_safe`) the duplicate's sender is told to
+  stop (`FED_PRUNE`), so a redundant link does not carry a second copy of
+  the voice stream.
 - **Registration fixes.** A `DEREGISTER` from a connection that does not own
   the ISSI is no longer relayed to peers; an ISSI re-registering on another
   connection no longer drops the old connection from groups its other ISSIs

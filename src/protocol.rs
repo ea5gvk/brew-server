@@ -22,6 +22,7 @@ pub const CLASS_FEDERATION: u8 = 0xfe;
 /// `CLASS_FEDERATION` types.
 pub const FED_WITHDRAW: u8 = 0;
 pub const FED_ROUTE: u8 = 1;
+pub const FED_PRUNE: u8 = 2;
 
 pub const SUB_DEREGISTER: u8 = 0;
 pub const SUB_REGISTER: u8 = 1;

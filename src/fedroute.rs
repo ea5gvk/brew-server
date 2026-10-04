@@ -37,10 +37,12 @@
 //! would take the call over (new owner, forwarded again) and could circulate
 //! forever. Each copy is keyed by (uuid, source ISSI): a talker change inside
 //! a group call reuses the uuid with another source ISSI and must still be
-//! accepted.
+//! accepted. A server that drops a duplicate GROUP_TX from a loop-safe link
+//! answers `FED_PRUNE`, and the sender stops feeding that link the call's
+//! voice: one stream per server, not one per redundant link.
 
-use crate::protocol::{self, CLASS_FEDERATION, FED_ROUTE, FED_WITHDRAW};
-use crate::state::{AppState, ClientId, ClientMode, Inner, Subscriber};
+use crate::protocol::{self, CLASS_FEDERATION, FED_PRUNE, FED_ROUTE, FED_WITHDRAW};
+use crate::state::{AppState, CallKind, ClientId, ClientMode, Inner, Subscriber};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -153,10 +155,13 @@ pub fn federation_offered(value: Option<&str>) -> bool {
 /// - `FED_ROUTE`: `0xfe 0x01 issi:u32 reg:u64 n:u8 path:u64[n] groups:u32[..]`
 ///   -- `issi` is reachable via the sender, `path[0]` being the sender and
 ///   `path[n-1]` the origin, `1 <= n <= MAX_PATH`; the groups run to the end.
+/// - `FED_PRUNE`: `0xfe 0x02 uuid[16] source_issi:u32` -- the sender already
+///   gets this turn of group call `uuid` over another link: stop sending it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FedMessage {
     Withdraw { issi: u32 },
     Route { issi: u32, advert: Advert },
+    Prune { id: Uuid, source_issi: u32 },
     /// A type this version does not know (from a newer peer): ignored.
     Unknown(u8),
 }
@@ -164,6 +169,13 @@ pub enum FedMessage {
 pub fn build_withdraw(issi: u32) -> Vec<u8> {
     let mut out = vec![CLASS_FEDERATION, FED_WITHDRAW];
     out.extend_from_slice(&issi.to_le_bytes());
+    out
+}
+
+pub fn build_prune(id: &Uuid, source_issi: u32) -> Vec<u8> {
+    let mut out = vec![CLASS_FEDERATION, FED_PRUNE];
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&source_issi.to_le_bytes());
     out
 }
 
@@ -187,6 +199,11 @@ pub fn parse(raw: &[u8], nbr_id: u64) -> Result<FedMessage, &'static str> {
         None => Err("too short"),
         Some(FED_WITHDRAW) if raw.len() == 6 => Ok(FedMessage::Withdraw { issi: u32_at(2) }),
         Some(FED_WITHDRAW) => Err("FED_WITHDRAW of wrong length"),
+        Some(FED_PRUNE) if raw.len() == 22 => Ok(FedMessage::Prune {
+            id: Uuid::from_bytes(raw[2..18].try_into().expect("checked length")),
+            source_issi: u32_at(18),
+        }),
+        Some(FED_PRUNE) => Err("FED_PRUNE of wrong length"),
         Some(FED_ROUTE) => {
             if raw.len() < 15 {
                 return Err("FED_ROUTE too short");
@@ -465,6 +482,16 @@ pub async fn handle(state: &Arc<AppState>, source: ClientId, raw: &[u8]) {
                 let changed = withdraw_offer(&mut inner, issi, source) && reroute(&mut inner, issi);
                 (changed && publish(&inner, issi, old.as_ref())).then_some(issi)
             }
+            FedMessage::Prune { id, source_issi } => {
+                // Only for the turn it was meant for: after a talker change
+                // the link may need the call again, and gets it.
+                if let Some(call) = inner.calls.get_mut(&id).filter(|c| c.kind == CallKind::Group && c.source_issi == source_issi) {
+                    if call.peers.remove(&source) {
+                        debug!(%source, uuid = %id, source_issi, "group call pruned off a redundant peer link");
+                    }
+                }
+                None
+            }
             FedMessage::Unknown(t) => {
                 debug!(%source, msg_type = t, "unknown federation message type ignored");
                 None
@@ -542,6 +569,11 @@ mod tests {
         assert!(matches!(parse(&build_route(1001, 1, &[7], &[]), 7), Ok(FedMessage::Route { .. })));
         assert_eq!(build_withdraw(1001), vec![0xfe, 0x00, 0xe9, 0x03, 0x00, 0x00]);
         assert_eq!(parse(&build_withdraw(1001), 7), Ok(FedMessage::Withdraw { issi: 1001 }));
+        let id = Uuid::new_v4();
+        let prune = build_prune(&id, 1001);
+        assert_eq!(prune.len(), 22);
+        assert_eq!(parse(&prune, 7), Ok(FedMessage::Prune { id, source_issi: 1001 }));
+        assert!(parse(&prune[..21], 7).is_err() && parse(&[prune.as_slice(), &[0]].concat(), 7).is_err());
         assert_eq!(parse(&[0xfe, 0x7f, 1, 2, 3], 7), Ok(FedMessage::Unknown(0x7f)));
     }
 
