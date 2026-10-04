@@ -20,7 +20,7 @@ use crate::state::AppState;
 use anyhow::{Context, Result};
 use aws_lc_rs::hmac;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -74,6 +74,11 @@ pub struct Heartbeat {
     /// and SMS queue (always true when there is nothing to replicate).
     #[serde(default = "yes")]
     pub synced: bool,
+    /// Per-setting fingerprints (`config_sections`), sent only while the
+    /// peer's `config_hash` differs from ours, so the dashboard can say what
+    /// differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sections: Option<BTreeMap<String, u32>>,
 }
 
 fn yes() -> bool {
@@ -516,12 +521,16 @@ pub struct HaHandle {
     pub status: watch::Sender<HaStatus>,
     /// Replication progress (see `ha_repl`).
     pub repl: crate::ha_repl::ReplStatus,
+    /// This node's running `config_sections` (without `[ha]`).
+    pub config_sections: BTreeMap<String, u32>,
+    /// The peer's, as last received (while the configs differ).
+    pub peer_config_sections: std::sync::Mutex<Option<BTreeMap<String, u32>>>,
     pub commands: mpsc::UnboundedSender<HaCommand>,
     commands_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<HaCommand>>>,
 }
 
 impl HaHandle {
-    pub fn new(cfg: &HaConfig, config_hash: u64) -> Self {
+    pub fn new(cfg: &HaConfig, config_hash: u64, config_sections: BTreeMap<String, u32>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let status = HaStatus {
             enabled: cfg.enabled,
@@ -540,7 +549,12 @@ impl HaHandle {
             transitions: VecDeque::new(),
             replication: None,
         };
-        Self { status: watch::channel(status).0, repl: Default::default(), commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
+        Self {
+            status: watch::channel(status).0,
+            repl: Default::default(),
+            config_sections,
+            peer_config_sections: Default::default(),
+            commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
     }
 
     /// Sends a dashboard command to the HA task and waits for its answer.
@@ -589,16 +603,14 @@ pub async fn wait_ports_free(state: &AppState) {
     warn!("service ports still in use after 10s; starting anyway");
 }
 
-/// Fingerprint of the settings both HA nodes are expected to share, so the
-/// dashboard can flag a mismatch with the peer or unapplied changes on disk.
-///
-/// Hashes the parsed config (so comments, spacing and key order don't
-/// count) without the settings that legitimately differ per node: all of
-/// `[ha]`, and file locations -- every `*_path` (TLS certificate/key, CA
-/// bundle, pinned peer certificate, ...) plus the `[storage]` and
-/// `[sms_center]` file paths. `websocket_path` and a federation peer's URL
-/// `path` are kept: those are protocol settings, not files.
-pub fn config_hash(cfg: &crate::config::Config) -> u64 {
+/// The config as canonical JSON, without file locations: every `*_path`
+/// (TLS certificate/key, CA bundle, pinned peer certificate, ...) and the
+/// `[storage]` / `[sms_center]` file paths, which legitimately differ per
+/// node. `websocket_path` and a federation peer's URL `path` are kept: those
+/// are protocol settings, not files. With `keep_ha` false, `[ha]` (per node
+/// by design) is left out too. serde_json maps are sorted by key, so the
+/// result does not depend on comments, spacing or key order in the file.
+fn canonical(cfg: &crate::config::Config, keep_ha: bool) -> serde_json::Value {
     fn strip(v: &mut serde_json::Value) {
         match v {
             serde_json::Value::Object(map) => {
@@ -611,7 +623,9 @@ pub fn config_hash(cfg: &crate::config::Config) -> u64 {
     }
     let mut v = serde_json::to_value(cfg).unwrap_or_default();
     if let Some(map) = v.as_object_mut() {
-        map.remove("ha");
+        if !keep_ha {
+            map.remove("ha");
+        }
         for section in ["storage", "sms_center"] {
             if let Some(s) = map.get_mut(section).and_then(|s| s.as_object_mut()) {
                 s.remove("path");
@@ -619,10 +633,49 @@ pub fn config_hash(cfg: &crate::config::Config) -> u64 {
         }
     }
     strip(&mut v);
-    // serde_json maps are sorted by key, so this text is canonical.
-    let text = v.to_string();
-    // FNV-1a: stable across builds, unlike `DefaultHasher`, so both nodes agree.
+    v
+}
+
+/// FNV-1a: stable across builds, unlike `DefaultHasher`, so both nodes agree.
+fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Fingerprint of the settings both HA nodes are expected to share, so the
+/// dashboard can flag a mismatch with the peer or unapplied changes on disk.
+pub fn config_hash(cfg: &crate::config::Config) -> u64 {
+    fnv(&canonical(cfg, false).to_string())
+}
+
+/// Per-setting fingerprints (`"sip.trunks"`, `"listen"`, ...), two levels
+/// deep, for naming what differs without revealing values (which may be
+/// passwords). See `config_diff`.
+pub fn config_sections(cfg: &crate::config::Config, keep_ha: bool) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    if let serde_json::Value::Object(top) = canonical(cfg, keep_ha) {
+        for (k, v) in top {
+            match v {
+                serde_json::Value::Object(inner) if !inner.is_empty() => {
+                    for (k2, v2) in inner {
+                        out.insert(format!("{k}.{k2}"), fnv(&v2.to_string()) as u32);
+                    }
+                }
+                other => {
+                    out.insert(k, fnv(&other.to_string()) as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Names of the settings that differ between two fingerprints (present in
+/// only one counts as different).
+pub fn config_diff(a: &BTreeMap<String, u32>, b: &BTreeMap<String, u32>) -> Vec<String> {
+    let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter().filter(|k| a.get(*k) != b.get(*k)).cloned().collect()
 }
 
 fn now_ms() -> u64 {
@@ -704,7 +757,7 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
 
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.heartbeat_interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut buf = vec![0u8; 2048];
+    let mut buf = vec![0u8; 65536];
     let mut sigterm = signal_stream()?;
 
     loop {
@@ -720,6 +773,11 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
                                 continue;
                             }
                             Some(hb) if guard.accept(&hb, now_ms()) => {
+                                if hb.config_hash == config_hash {
+                                    *state.ha.peer_config_sections.lock().unwrap() = None;
+                                } else if let Some(sections) = &hb.config_sections {
+                                    *state.ha.peer_config_sections.lock().unwrap() = Some(sections.clone());
+                                }
                                 last_peer = Some(LastPeer { hb, at_ms: now_ms() });
                             }
                             Some(_) => continue,
@@ -836,6 +894,9 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
             takeover_request: election.takeover_requested(now),
             config_hash,
             synced: crate::ha_repl::synced(&state),
+            config_sections: (seq % 4 == 0
+                && last_peer.as_ref().is_some_and(|lp| lp.hb.config_hash != config_hash))
+                .then(|| state.ha.config_sections.clone()),
         };
         if let Err(e) = sock.send_to(&encode(&key, &hb), peer_addr).await {
             // Expected while the peer host is down (ICMP unreachable).
@@ -1123,7 +1184,7 @@ mod tests {
         let hb = Heartbeat {
             node: "a".into(), boot_id: 1, seq: 1, ts_ms: 1000, role: Role::Active, weight: 200,
             persist: false, hold: false, handover_to: None, handover_manual: false,
-            takeover_request: false, config_hash: 7, synced: true,
+            takeover_request: false, config_hash: 7, synced: true, config_sections: None,
         };
         let mut wire = encode(&key, &hb);
         assert_eq!(decode(&key, &wire), Some(hb));
@@ -1139,7 +1200,7 @@ mod tests {
         let mut hb = Heartbeat {
             node: "a".into(), boot_id: 1, seq: 5, ts_ms: 100_000, role: Role::Active, weight: 1,
             persist: false, hold: false, handover_to: None, handover_manual: false,
-            takeover_request: false, config_hash: 0, synced: true,
+            takeover_request: false, config_hash: 0, synced: true, config_sections: None,
         };
         assert!(g.accept(&hb, 100_000));
         assert!(!g.accept(&hb, 100_000), "same seq");
@@ -1170,6 +1231,15 @@ mod tests {
         let mut ws = base.clone();
         ws.websocket_path = "/other".into();
         assert_ne!(config_hash(&base), config_hash(&ws), "websocket_path is a protocol setting");
+        let diff = config_diff(&config_sections(&base, false), &config_sections(&routed, false));
+        assert_eq!(diff, vec!["route_without_affiliations".to_string()]);
+        let mut sip = base.clone();
+        sip.sip.realm = "other".into();
+        assert_eq!(config_diff(&config_sections(&base, false), &config_sections(&sip, false)), vec!["sip.realm".to_string()]);
+        let mut ha = base.clone();
+        ha.ha.weight = 7;
+        assert!(config_diff(&config_sections(&base, false), &config_sections(&ha, false)).is_empty());
+        assert_eq!(config_diff(&config_sections(&base, true), &config_sections(&ha, true)), vec!["ha.weight".to_string()]);
         let text = base.to_toml_pretty().unwrap();
         let reparsed = Config::parse(&format!("# a comment\n{text}")).unwrap();
         assert_eq!(config_hash(&base), config_hash(&reparsed), "comments don't count");

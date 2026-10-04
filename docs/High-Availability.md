@@ -146,7 +146,10 @@ everything that is meant to differ per node -- the whole `[ha]` section and
 file locations (TLS certificate/key and CA paths, pinned certificates, the
 `[storage]` and `[sms_center]` files) -- as well as comments and formatting,
 so it only fires for a real setting mismatch (routing, SIP, federation,
-users, ...). Every page
+users, ...). Both warnings name the settings involved (for example
+`sip.trunks`, `route_without_affiliations`; for unapplied changes `[ha]`
+settings are listed too), but never their values, since the page is
+visible to non-admin users and settings include passwords. Every page
 header shows this node's role.
 
 Admins (see `[dashboard] admins`) also get **Make Active**, **Make

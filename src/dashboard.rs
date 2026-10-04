@@ -1151,13 +1151,30 @@ fetch('/api/whoami').then(r=>r.json()).then(w=>{if(!w.admin)$('settings-link').s
 pub async fn ha_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let status = state.ha.status.borrow().clone();
     // A file that no longer loads also counts as pending (Apply refuses it).
-    let on_disk = config::Config::load(&state.config_path).ok().map(|c| crate::ha::config_hash(&c));
+    let on_disk = config::Config::load(&state.config_path);
     let mut v = serde_json::to_value(&status).unwrap_or_default();
-    let ha_changed = config::Config::load(&state.config_path).is_ok_and(|c| {
-        serde_json::to_value(&c.ha).ok() != serde_json::to_value(&state.config.ha).ok()
-    });
-    v["pending_changes"] = (ha_changed || on_disk != Some(status.config_hash)).into();
-    v["peer_config_differs"] = status.peer.as_ref().is_some_and(|p| p.config_hash != status.config_hash).into();
+    match &on_disk {
+        Ok(saved) => {
+            // Setting names only, never values (this endpoint is not
+            // admin-only and settings include passwords). Includes [ha].
+            let diff = crate::ha::config_diff(
+                &crate::ha::config_sections(&state.config, true),
+                &crate::ha::config_sections(saved, true),
+            );
+            v["pending_changes"] = (!diff.is_empty()).into();
+            v["pending_diff"] = diff.into();
+        }
+        Err(_) => {
+            v["pending_changes"] = true.into();
+            v["pending_diff"] = vec!["(the saved file does not load)"].into();
+        }
+    }
+    let peer_differs = status.peer.as_ref().is_some_and(|p| p.config_hash != status.config_hash);
+    v["peer_config_differs"] = peer_differs.into();
+    v["peer_config_diff"] = match (peer_differs, state.ha.peer_config_sections.lock().unwrap().as_ref()) {
+        (true, Some(peer)) => crate::ha::config_diff(&state.ha.config_sections, peer).into(),
+        _ => serde_json::Value::Array(vec![]),
+    };
     Json(v)
 }
 
@@ -1287,10 +1304,11 @@ async function load(){
     $('ha-off').style.display=d.enabled?'none':'block';
     $('ha-actions').style.display=admin&&d.enabled?'block':'none';
     const b=[];
-    if(d.pending_changes)b.push('The config file has saved changes that are not applied yet.');
-    if(d.peer_config_differs)b.push('The peer runs a different config file.');
+    const list=a=>a&&a.length?': '+a.map(x=>`<code>${esc(x)}</code>`).join(', '):'';
+    if(d.pending_changes)b.push('The config file has saved changes that are not applied yet'+list(d.pending_diff));
+    if(d.peer_config_differs)b.push('The peer runs a different config'+(d.peer_config_diff&&d.peer_config_diff.length?list(d.peer_config_diff):' (details arrive within a few seconds)'));
     if(d.enabled&&!d.gateway_ok)b.push('Gateway check failing: this node cannot become Active.');
-    $('ha-banner').style.display=b.length?'block':'none';$('ha-banner').innerHTML=b.map(esc).join('<br>');
+    $('ha-banner').style.display=b.length?'block':'none';$('ha-banner').innerHTML=b.join('<br>');
     if(d.enabled){
       const p=d.peer;
       $('ha-nodes').innerHTML=node(`This node: ${esc(d.node)} ${roleBadge(d.role)}`,[
