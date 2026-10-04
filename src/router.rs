@@ -307,7 +307,22 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
             // (its header was dropped), expected in a ring or mesh.
             Some(_) if from_peer => { debug!(%source, uuid=%id, "SDS_TRANSFER from non-originating peer link"); return; }
             Some(_) => { warn!(%source, uuid=%id, "SDS_TRANSFER from non-originating client"); return; }
-            None => { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)"); (0u32, Vec::new(), None) }
+            None => {
+                // The same, once the route is gone -- removed by the
+                // destination's SDS_REPORT or a dropped connection before the
+                // slower copy got here, or not stored yet while its header is
+                // still being routed. Taken for an orphan it would be reported
+                // as ISSI 0 (map, APRS).
+                let now = Instant::now();
+                if from_peer && inner.recent_calls.iter().any(|((call, _), (link, at))|
+                    *call == id && *link != source && now.duration_since(*at) < crate::fedroute::CALL_DEDUP_WINDOW)
+                {
+                    debug!(%source, uuid=%id, "SDS_TRANSFER of an SDS accepted over another peer link");
+                    return;
+                }
+                warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)");
+                (0u32, Vec::new(), None)
+            }
         }
     };
     for tx in &txs { let _ = tx.send(raw.clone()); }
@@ -1246,5 +1261,36 @@ mod forwarding_tests {
         }
         assert_eq!(drain(&mut dest_rx), vec![header, payload], "delivered once");
         assert!(drain(&mut second_rx).is_empty());
+    }
+
+    /// The destination's SDS_REPORT ends a unicast route before the copy over
+    /// the slower link arrives: its payload must not be taken for an orphan
+    /// SDS and its position reported as ISSI 0.
+    #[tokio::test]
+    async fn duplicate_sds_payload_after_the_report_is_dropped() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, _second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (dest, mut dest_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), dest, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        let id = uuid::Uuid::new_v4();
+        let header = protocol::build_short_transfer(&id, 5001, 6002);
+        // The live LIP short location report verified in `position::decode_lip`.
+        let lip = [0x0a, 0x01, 0x0e, 0x62, 0x39, 0xb0, 0x43, 0x9a, 0xff, 0xe0, 0x20];
+        let payload = protocol::build_sds_transfer_frame(&id, 88, &lip);
+        handle_packet(state.clone(), first, header.clone()).await;
+        handle_packet(state.clone(), first, payload.clone()).await;
+        let mut report = vec![protocol::CLASS_FRAME, FRAME_SDS_REPORT];
+        report.extend_from_slice(id.as_bytes());
+        report.extend_from_slice(&8u16.to_le_bytes());
+        report.push(0);
+        handle_packet(state.clone(), dest, report).await;
+        assert!(!state.inner.read().await.sds_routes.contains_key(&id));
+
+        handle_packet(state.clone(), second, header.clone()).await;
+        handle_packet(state.clone(), second, payload.clone()).await;
+        assert_eq!(drain(&mut dest_rx), vec![header, payload], "delivered once");
+        let positions = state.telemetry.read().await.sds_positions.keys().copied().collect::<Vec<_>>();
+        assert_eq!(positions, vec![5001]);
     }
 }
