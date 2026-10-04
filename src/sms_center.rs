@@ -689,7 +689,7 @@ mod tests {
         {
             let mut inner = state.inner.write().await;
             for (id, tx) in [(a, a_tx), (b, b_tx)] {
-                inner.clients.insert(id, Client { tx, mode: ClientMode::Basestation, version: ConnVersion::V1, remote_addr: None, connected_at_ms: 0, username: None });
+                inner.clients.insert(id, Client { tx, mode: ClientMode::Basestation, version: ConnVersion::V1, version_announced: false, remote_addr: None, connected_at_ms: 0, username: None });
             }
         }
         let pkt = |st: &Arc<AppState>, from: Uuid, raw: Vec<u8>| crate::router::handle_packet(st.clone(), from, raw);

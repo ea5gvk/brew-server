@@ -181,13 +181,32 @@ enabled = true
 # SDS and subscriber/group registrations can reach a remote site's stations.
 # Registrations propagate peer to peer automatically (each server relays
 # what it learns to its *other* peers) -- no per-ISSI/GSSI config needed
-# here, only which servers to link to. Safe for a chain or star (any
-# loop-free topology); a topology with a cycle (full mesh) is not supported.
+# here, only which servers to link to. Without loop_safe this is safe for a
+# chain or star (any loop-free topology) only. With loop_safe = true on every
+# server, rings, full meshes and redundant links are safe too; a server
+# without it (older version or loop_safe = false) must still be linked by a
+# single link. Enable it on all servers first, then add the redundant links.
+# It is negotiated per link (X-Brew-Federation header) on the links we dial
+# and the ones we accept, even with enabled = false. The newest registration
+# of an ISSI wins network-wide, so keep the servers' clocks on NTP.
 [federation]
 enabled = false
+loop_safe = false
+# WebSocket pings on every federation link -- the peers we dial below and
+# any peer that dials in to us (this applies even with enabled = false). A
+# link that has received nothing, not even a pong, for
+# keepalive_timeout_seconds is closed: its registrations are withdrawn and
+# an outbound one is redialled, instead of a half-open link silently
+# swallowing calls. Any WebSocket peer answers pings, older brew-server
+# versions included. The timeout is raised to at least twice the interval;
+# keepalive_interval_seconds = 0 turns both off.
+keepalive_interval_seconds = 15
+keepalive_timeout_seconds = 45
 
 # We dial out to this peer; it needs no matching config for us; an inbound
-# connection just authenticates like a Basestation would (with Peer mode).
+# connection just authenticates like a Basestation would (with Peer mode),
+# so if the peer has [auth] enabled, our username/password below must be in
+# its [auth.users].
 [[federation.peers]]
 name = "site-b"
 remote_host = "10.0.0.20:9000"
@@ -197,6 +216,19 @@ path = "/brew"
 username = "9000001"
 password = "change-me-federation"
 reconnect_interval_seconds = 15
+# Set tls = true when the peer has [tls] enabled (as this file does):
+# discovery then goes over https:// and the link over wss://. The peer's
+# certificate must chain to a CA in tls_ca_path (default: the
+# Debian/Ubuntu/Alpine system bundle; RHEL: /etc/pki/tls/certs/ca-bundle.crt)
+# and be valid for tls_server_name (empty = the host part of remote_host).
+# For a self-signed peer, point tls_pinned_cert_path at a copy of its
+# certificate (the PEM in the peer's [tls] cert_path) instead: exactly that
+# certificate is then trusted, whatever its issuer, name or expiry, and
+# tls_ca_path/tls_server_name are ignored.
+tls = true
+tls_ca_path = "/etc/ssl/certs/ca-certificates.crt"
+tls_server_name = ""
+tls_pinned_cert_path = ""
 enabled = true
 
 # APRS: forwards decoded mobile-station LIP positions (the same fixes plotted

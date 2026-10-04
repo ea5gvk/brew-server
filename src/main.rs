@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod dashboard;
 mod federation;
+mod fedroute;
 mod fsnet;
 mod monitor;
 mod position;

@@ -471,10 +471,9 @@ impl Default for VoiceRouteConfig {
 /// transparently hop to hop the same way they already route to any other
 /// connected client: call/SDS routing has no federation-specific code at all,
 /// it Just Works once a remote ISSI/GSSI's registration has propagated to
-/// this server. This is correct for a loop-free topology (a chain or a star,
-/// i.e. any tree of peer links); a topology with a cycle (e.g. a full mesh)
-/// is not safe with split-horizon alone and needs additional loop prevention
-/// (hop count / path vector) not implemented here.
+/// this server. Split-horizon alone is only correct for a loop-free topology
+/// (a chain or a star, i.e. any tree of peer links); with `loop_safe` on
+/// every server any topology is, rings and full meshes included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FederationConfig {
@@ -483,11 +482,32 @@ pub struct FederationConfig {
     /// server dialling in to us) needs no entry here: it just authenticates
     /// like a Basestation would, with `X-Brew-Mode: Peer`.
     pub peers: Vec<FederationPeerConfig>,
+    /// WebSocket ping interval on every federation link: the peers dialled from
+    /// `peers` and any `X-Brew-Mode: Peer` connection accepted from another
+    /// server (even with `enabled = false`). 0 disables pings and the timeout.
+    pub keepalive_interval_seconds: u64,
+    /// A federation link that has received nothing -- no frame, not even a
+    /// pong -- for this long is closed: its registrations are withdrawn and an
+    /// outbound link is redialled. Raised to at least twice the interval.
+    pub keepalive_timeout_seconds: u64,
+    /// Loop-safe federation with peers that also enable it (negotiated per
+    /// link with the `X-Brew-Federation` header, on the links we dial and the
+    /// ones we accept, even with `enabled = false`). Registrations then travel
+    /// as path-vector route adverts (origin server, registration clock,
+    /// servers crossed) instead of relayed SUB messages, so any topology --
+    /// ring, full mesh, redundant links -- is safe: the newest registration
+    /// wins network-wide, it is reached by the shortest loop-free path, and
+    /// routing fails over when a link drops. Links to peers without it (older
+    /// servers, or `loop_safe = false`) keep the split-horizon relay, so such
+    /// a peer must hang off the mesh by a single link -- no cycle may pass
+    /// through it. Default false: split-horizon only, safe for a chain or
+    /// star.
+    pub loop_safe: bool,
 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
-        Self { enabled: false, peers: Vec::new() }
+        Self { enabled: false, peers: Vec::new(), keepalive_interval_seconds: 15, keepalive_timeout_seconds: 45, loop_safe: false }
     }
 }
 
@@ -511,6 +531,21 @@ pub struct FederationPeerConfig {
     /// Seconds between reconnect attempts after a dropped/failed link.
     pub reconnect_interval_seconds: u64,
     pub enabled: bool,
+    /// Dial this peer over TLS: `https://` discovery and a `wss://` link, for a
+    /// peer whose Brew listener has `[tls] enabled = true`. Plain `ws://` when
+    /// false (default).
+    pub tls: bool,
+    /// PEM bundle of CA certificates the peer's certificate must chain to.
+    /// Default: the Debian/Ubuntu/Alpine system bundle.
+    pub tls_ca_path: PathBuf,
+    /// Name the peer's certificate must be valid for, also sent as SNI. Empty:
+    /// the host part of `remote_host`.
+    pub tls_server_name: String,
+    /// For a self-signed peer: a copy of the peer's own certificate (PEM, first
+    /// certificate in the file). When set, exactly that certificate is trusted,
+    /// whatever its issuer, name or expiry, and `tls_ca_path`/`tls_server_name`
+    /// are ignored. Empty: off.
+    pub tls_pinned_cert_path: PathBuf,
 }
 
 impl Default for FederationPeerConfig {
@@ -523,6 +558,10 @@ impl Default for FederationPeerConfig {
             password: String::new(),
             reconnect_interval_seconds: 15,
             enabled: true,
+            tls: false,
+            tls_ca_path: "/etc/ssl/certs/ca-certificates.crt".into(),
+            tls_server_name: String::new(),
+            tls_pinned_cert_path: PathBuf::new(),
         }
     }
 }
