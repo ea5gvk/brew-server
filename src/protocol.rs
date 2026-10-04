@@ -11,6 +11,17 @@ pub const CLASS_CALL_CONTROL: u8 = 0xf1;
 pub const CLASS_FRAME: u8 = 0xf2;
 pub const CLASS_ERROR: u8 = 0xf3;
 pub const CLASS_SERVICE: u8 = 0xf4;
+/// Not part of the Brew spec: only exchanged between brew-servers that
+/// negotiated loop-safe federation (`X-Brew-Federation`); never sent to anyone
+/// else. Route adverts cannot ride on `CLASS_SUBSCRIBER`: its group list runs
+/// to the end of the message, so an older peer would read any added field as
+/// groups. Kept clear of 0xf5 upwards, left for the spec. Layout in
+/// `fedroute::FedMessage`.
+pub const CLASS_FEDERATION: u8 = 0xfe;
+
+/// `CLASS_FEDERATION` types.
+pub const FED_WITHDRAW: u8 = 0;
+pub const FED_ROUTE: u8 = 1;
 
 pub const SUB_DEREGISTER: u8 = 0;
 pub const SUB_REGISTER: u8 = 1;

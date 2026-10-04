@@ -11,15 +11,18 @@
 //! already resolve a destination via `inner.subscribers`/`inner.group_clients`
 //! and forward raw bytes to whatever `ClientId` owns it, peer or not. The one
 //! piece that genuinely is federation-specific is registration propagation
-//! (see `router::handle_subscriber`'s relay-to-other-peers step) and the
-//! full-table sync a newly connected peer needs (`attach_client` below), since
-//! a peer link only sees registration *events* going forward otherwise.
+//! (`fedroute::publish`, called wherever the table changes -- path-vector
+//! route adverts on a loop-safe link, relayed SUB messages on a plain one)
+//! and the full-table sync a newly connected peer needs (`attach_client`
+//! below), since a peer link only sees registration *events* going forward
+//! otherwise.
 //!
 //! This module owns the *outbound* half (dialing peers configured in
 //! `[[federation.peers]]`). The inbound half needs no special code: an
 //! incoming peer connection is just another `server::client_session`
 //! WebSocket upgrade, same as a Basestation, differing only in the
-//! `X-Brew-Mode: Peer` header it sends.
+//! `X-Brew-Mode: Peer` header it sends (and, for loop-safe mode, the
+//! `X-Brew-Federation` offer -- see `fedroute`).
 
 use crate::config::{FederationConfig, FederationPeerConfig};
 use crate::fedroute::{self, X_BREW_FEDERATION, X_BREW_SERVER_ID};
@@ -489,30 +492,26 @@ async fn run_peer_session(
 /// same critical section, so a registration change racing the sync can never reach the
 /// peer before (and be overwritten by) the stale snapshot.
 ///
-/// The sync is everything this server currently knows: every registered ISSI
-/// (`SUB_REGISTER`) and its group affiliations (`SUB_AFFILIATE`), regardless
-/// of whether this server learned them locally or from another peer
-/// (transit). Without it, a peer only ever learns about registrations that
-/// happen to change *after* it connects, so a freshly (re)started link would
-/// be blind to everything already in place. `neighbour` is the far server's
-/// id when the link negotiated loop-safe federation.
+/// The sync is everything this server currently knows, regardless of whether
+/// it learned it locally or from another peer (transit): every effective
+/// route as a `FED_ROUTE` on a loop-safe link (`neighbour` is the far
+/// server's id), or every registered ISSI (`SUB_REGISTER`) and its group
+/// affiliations (`SUB_AFFILIATE`) on a plain one. Without it, a peer only
+/// ever learns about registrations that happen to change *after* it
+/// connects, so a freshly (re)started link would be blind to everything
+/// already in place.
 pub async fn attach_client(state: &Arc<AppState>, id: ClientId, client: Client, neighbour: Option<u64>) {
     let mut inner = state.inner.write().await;
-    if client.mode == ClientMode::Peer {
-        let mut issis: Vec<u32> = inner.subscribers.keys().copied().collect();
-        issis.sort_unstable();
-        for issi in issis {
-            let mut groups: Vec<u32> = inner.subscribers[&issi].groups.iter().copied().collect();
-            groups.sort_unstable();
-            let _ = client.tx.send(protocol::build_subscriber_message(protocol::SUB_REGISTER, issi, &[]));
-            if !groups.is_empty() {
-                let _ = client.tx.send(protocol::build_subscriber_message(protocol::SUB_AFFILIATE, issi, &groups));
-            }
-        }
-    }
+    let tx = client.tx.clone();
+    let peer = client.mode == ClientMode::Peer;
     inner.clients.insert(id, client);
     if let Some(neighbour) = neighbour {
         inner.fed.links.insert(id, neighbour);
+    }
+    if peer {
+        for msg in fedroute::sync_messages(&inner, id) {
+            let _ = tx.send(msg);
+        }
     }
 }
 

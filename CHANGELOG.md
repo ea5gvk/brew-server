@@ -47,6 +47,11 @@ Unreleased adds:
   over and being forwarded again; a late copy within 5 s of the call ending
   no longer brings it back. A talker change inside a group call (same uuid,
   another ISSI) is still accepted. Basestation traffic is never checked.
+- **Registration fixes.** A `DEREGISTER` from a connection that does not own
+  the ISSI is no longer relayed to peers; an ISSI re-registering on another
+  connection no longer drops the old connection from groups its other ISSIs
+  are still in (all the ISSIs behind a peer link, typically). A registration
+  relayed to a peer is now followed by its group affiliations.
 
 Version 1.12.0 adds:
 

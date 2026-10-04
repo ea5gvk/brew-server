@@ -491,10 +491,18 @@ pub struct FederationConfig {
     /// pong -- for this long is closed: its registrations are withdrawn and an
     /// outbound link is redialled. Raised to at least twice the interval.
     pub keepalive_timeout_seconds: u64,
-    /// Loop-safe federation with peers that also enable it, negotiated per
-    /// link with the `X-Brew-Federation` / `X-Brew-Server-Id` headers, for the
-    /// links we dial and the ones we accept (even with `enabled = false`). A
-    /// link to a peer without it stays a plain Peer link. Default false.
+    /// Loop-safe federation with peers that also enable it (negotiated per
+    /// link with the `X-Brew-Federation` header, on the links we dial and the
+    /// ones we accept, even with `enabled = false`). Registrations then travel
+    /// as path-vector route adverts (origin server, registration clock,
+    /// servers crossed) instead of relayed SUB messages, so any topology --
+    /// ring, full mesh, redundant links -- is safe: the newest registration
+    /// wins network-wide, it is reached by the shortest loop-free path, and
+    /// routing fails over when a link drops. Links to peers without it (older
+    /// servers, or `loop_safe = false`) keep the split-horizon relay, so such
+    /// a peer must hang off the mesh by a single link -- no cycle may pass
+    /// through it. Default false: split-horizon only, safe for a chain or
+    /// star.
     pub loop_safe: bool,
 }
 

@@ -81,6 +81,11 @@ pub struct Subscriber {
     /// subscriber's behalf is not itself an MS. Dashboard MS-registration
     /// counts should filter on this.
     pub mode: ClientMode,
+    /// Registration clock and server path of this entry (see `fedroute`):
+    /// an empty path for an ISSI registered here, by a Basestation, Terminal
+    /// or legacy peer link; otherwise the route learnt over a loop-safe peer
+    /// link, whose first server is that link's.
+    pub route: crate::fedroute::Route,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +176,7 @@ mod ms_registration_tests {
     use super::*;
 
     fn subscriber(mode: ClientMode) -> Subscriber {
-        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode }
+        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode, route: crate::fedroute::Route::default() }
     }
 
     #[test]
@@ -378,14 +383,37 @@ impl AppState {
     pub async fn cleanup_client(&self, id: ClientId) {
         let mut inner = self.inner.write().await;
         inner.clients.remove(&id);
-        inner.fed.links.remove(&id);
+        let negotiated = inner.fed.links.remove(&id).is_some();
 
-        let removed_issis: Vec<u32> = inner.subscribers.iter()
+        // Registrations: every ISSI routed over this connection, and for a
+        // loop-safe link every one it offered, gets a new effective route --
+        // another link's offer (failover), or none -- and every remaining
+        // peer link hears about the change (a legacy one a SUB_DEREGISTER,
+        // as before). The connection's own entries and group memberships go
+        // in bulk first, so each ISSI is re-routed against the final state.
+        let mut affected: Vec<u32> = inner.subscribers.iter()
             .filter_map(|(issi, sub)| (sub.client_id == id).then_some(*issi)).collect();
-        for issi in &removed_issis { inner.subscribers.remove(issi); }
+        if negotiated {
+            affected.extend(inner.fed.rib_in.iter().filter_map(|(issi, offers)| offers.contains_key(&id).then_some(*issi)));
+        }
+        affected.sort_unstable();
+        affected.dedup();
+        let previous: Vec<(u32, Option<Subscriber>)> = affected.iter().map(|issi| (*issi, inner.subscribers.get(issi).cloned())).collect();
+        for (issi, old) in &previous {
+            if let Some(offers) = inner.fed.rib_in.get_mut(issi) {
+                offers.remove(&id);
+                if offers.is_empty() { inner.fed.rib_in.remove(issi); }
+            }
+            if old.as_ref().is_some_and(|o| o.client_id == id) { inner.subscribers.remove(issi); }
+        }
 
         for clients in inner.group_clients.values_mut() { clients.remove(&id); }
         inner.group_clients.retain(|_, clients| !clients.is_empty());
+
+        for (issi, old) in &previous {
+            crate::fedroute::reroute(&mut inner, *issi);
+            crate::fedroute::publish(&inner, *issi, old.as_ref());
+        }
 
         // Calls this client took part in, ended the way router::end_call ends
         // them: a private call ends for both parties; a group call ends only
@@ -422,24 +450,8 @@ impl AppState {
         // A call or SDS accepted over this link may now arrive over another
         // one (rerouted): that copy is no longer a duplicate.
         inner.recent_calls.retain(|_, (link, _)| *link != id);
-
-        // Federation: the disconnected client's registrations just vanished
-        // above; tell every remaining peer so they don't keep routing to a
-        // now-dead ISSI (mirrors the relay in router::handle_subscriber, but
-        // there is no live source client left to split-horizon against here
-        // -- the one that just disconnected can't receive it anyway).
-        let peer_txs: Vec<_> = if removed_issis.is_empty() { Vec::new() } else {
-            inner.clients.values()
-                .filter(|c| c.mode == ClientMode::Peer)
-                .map(|c| c.tx.clone())
-                .collect()
-        };
         drop(inner);
         for (tx, msg) in end_notices { let _ = tx.send(msg); }
-        for issi in removed_issis {
-            let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
-            for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
-        }
 
         // The calls ended above are gone: end them on the dashboard too, and
         // hang up any SIP leg bridged to one, otherwise both UIs keep showing

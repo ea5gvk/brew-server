@@ -21,6 +21,10 @@ struct RssiReport {
 
 pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>) {
     state.purge_ephemeral().await;
+    // Route adverts between loop-safe brew-servers: not Brew, see `fedroute`.
+    if raw.first() == Some(&protocol::CLASS_FEDERATION) {
+        return crate::fedroute::handle(&state, source, &raw).await;
+    }
     // TEMPORARY (position debugging): log inbound Brew packets, but skip the
     // high-volume voice traffic frames (class 0xf2 / type 0x00) unless they
     // actually contain the LIP protocol id (0x0A). This keeps a PTT from burying
@@ -181,6 +185,13 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
             connected_clients = inner.clients.len(),
             "no Brew affiliations recorded for GSSI; falling back to all connected Basestations"
         );
+    }
+    // The talker's own GROUP_TX again (a new over of the same call), over the
+    // link that delivered it: peer links that already carry the call keep
+    // it, even if the route that put them there has changed since, so a
+    // re-route half way through a call does not cut off a server hearing it.
+    if let Some(existing) = inner.calls.get(&id).filter(|c| c.owner == source && c.source_issi == gt.source) {
+        targets.extend(existing.peers.iter().copied().filter(|p| is_peer(&inner, *p)));
     }
     targets.remove(&source);
     inner.group_floor.insert(gt.destination, id);
@@ -422,7 +433,8 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     // A copy of a setup already accepted over another peer link: dropped
     // silently -- never rejected, never offered to SIP a second time.
     let now = Instant::now();
-    if is_peer(&inner, source) && crate::fedroute::is_duplicate(&inner, id, source_issi, source, now) {
+    let from_peer = is_peer(&inner, source);
+    if from_peer && crate::fedroute::is_duplicate(&inner, id, source_issi, source, now) {
         debug!(%source, uuid=%id, source_issi, destination, "duplicate private SETUP_REQUEST from a second peer link dropped");
         return;
     }
@@ -466,10 +478,17 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
         return;
     };
     if target_client == source {
+        drop(inner);
+        if from_peer {
+            // Routes still converging can briefly point back the way a setup
+            // came (the far server routes it to us and we to it). Dropped
+            // like any looped copy: a reject is never sent for one.
+            debug!(%source, uuid=%id, destination, "private SETUP route points back to its source link (transient loop)");
+            return;
+        }
         // A Basestation only hands a private call to Brew when the called
         // ISSI is not registered on it, so a destination registered on the
-        // caller's own connection is a stale entry or a federation loop.
-        drop(inner);
+        // caller's own connection is a stale entry.
         warn!(%source, uuid=%id, destination, "private call destination resolves back to its caller's own link; rejecting");
         reject_setup(state, source, id).await;
         return;
@@ -647,6 +666,11 @@ fn is_peer(inner: &Inner, client: ClientId) -> bool {
 
 async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: SubscriberMessage) {
     let mut inner = state.inner.write().await;
+    if inner.fed.links.contains_key(&source) {
+        // A loop-safe link carries registrations as route adverts only.
+        warn!(%source, issi=msg.issi, msg_type=msg.msg_type, "SUB message on a loop-safe peer link ignored");
+        return;
+    }
     // The connecting client's advertised mode (Terminal/Basestation), used to
     // tag the subscriber registration so MS-registration counts can exclude
     // Basestation (Basestation gateway) registrations, which are not an MS.
@@ -656,94 +680,81 @@ async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: Subscri
     // released (mirrors how position decoding logs via `state.telemetry`
     // outside of the `inner` lock elsewhere in this module).
     let mut ms_reg_event: Option<&'static str> = None;
-    // Set when an ISSI (re)registers, to flush its SMS Center queue.
-    let mut registered_issi: Option<u32> = None;
-    // Captured before the match below (which may consume `msg.groups`), for
-    // the federation relay after it.
-    let relay_groups = msg.groups.clone();
-    match msg.msg_type {
+    // Whatever registers here -- a Basestation, a Terminal or a legacy peer
+    // link, for everything behind it -- is a local registration, stamped with
+    // this server's registration clock (see `fedroute`).
+    let old = inner.subscribers.get(&msg.issi).cloned();
+    let local = |inner: &mut Inner, groups| Subscriber {
+        client_id: source, groups, mode: source_mode,
+        route: crate::fedroute::Route { reg: inner.fed.tick(), path: Vec::new() },
+    };
+    let new = match msg.msg_type {
         SUB_REGISTER | SUB_REREGISTER => {
-            let previous = inner.subscribers.get(&msg.issi).map(|s| (s.client_id, s.groups.clone()));
-            let old_groups = previous.as_ref().map(|(_, groups)| groups.clone()).unwrap_or_default();
-            if let Some((old_client, groups)) = previous {
-                if old_client != source {
-                    for gssi in &groups {
-                        if let Some(clients) = inner.group_clients.get_mut(gssi) { clients.remove(&old_client); clients.insert(source); }
-                    }
-                }
-            }
-            inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: old_groups, mode: source_mode });
             info!(%source, issi=msg.issi, mode=source_mode.as_str(), "subscriber registered");
-            registered_issi = Some(msg.issi);
-            if source_mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("register"); }
+            if source_mode == ClientMode::Terminal { ms_reg_event = Some("register"); }
+            Some(local(&mut inner, old.as_ref().map(|o| o.groups.clone()).unwrap_or_default()))
         }
         SUB_DEREGISTER => {
-            if let Some(sub) = inner.subscribers.remove(&msg.issi) {
-                if sub.client_id == source {
-                    for gssi in sub.groups {
-                        let still_present = inner.subscribers.values().any(|other| other.client_id == source && other.groups.contains(&gssi));
-                        if !still_present { if let Some(clients) = inner.group_clients.get_mut(&gssi) { clients.remove(&source); } }
-                    }
-                    info!(%source, issi=msg.issi, mode=sub.mode.as_str(), "subscriber deregistered");
-                    if sub.mode == crate::state::ClientMode::Terminal { ms_reg_event = Some("deregister"); }
-                } else { inner.subscribers.insert(msg.issi, sub); }
-            }
+            // Only the connection the ISSI is registered on can deregister it
+            // (and nobody else's DEREGISTER is passed on to peers).
+            let Some(sub) = old.as_ref().filter(|o| o.client_id == source) else { return };
+            info!(%source, issi=msg.issi, mode=sub.mode.as_str(), "subscriber deregistered");
+            if sub.mode == ClientMode::Terminal { ms_reg_event = Some("deregister"); }
+            None
         }
         SUB_AFFILIATE => {
-            let owner = inner.subscribers.get(&msg.issi).map(|s| s.client_id);
-            if let Some(owner) = owner { if owner != source { warn!(%source, issi=msg.issi, "affiliation from non-owner"); return; } }
-            else { inner.subscribers.insert(msg.issi, Subscriber { client_id: source, groups: HashSet::new(), mode: source_mode }); }
-            for gssi in msg.groups {
-                if let Some(sub) = inner.subscribers.get_mut(&msg.issi) { sub.groups.insert(gssi); }
-                inner.group_clients.entry(gssi).or_default().insert(source);
+            let mut sub = match old.clone() {
+                Some(o) if o.client_id != source => { warn!(%source, issi=msg.issi, "affiliation from non-owner"); return; }
+                Some(o) => o,
+                None => local(&mut inner, HashSet::new()),
+            };
+            for gssi in &msg.groups {
+                sub.groups.insert(*gssi);
                 info!(%source, issi=msg.issi, gssi, "subscriber affiliated");
             }
+            Some(sub)
         }
         SUB_DEAFFILIATE => {
-            if inner.subscribers.get(&msg.issi).map(|s| s.client_id) != Some(source) { return; }
-            for gssi in msg.groups {
-                if let Some(sub) = inner.subscribers.get_mut(&msg.issi) { sub.groups.remove(&gssi); }
-                let still_present = inner.subscribers.values().any(|other| other.client_id == source && other.groups.contains(&gssi));
-                if !still_present { if let Some(clients) = inner.group_clients.get_mut(&gssi) { clients.remove(&source); } }
+            let Some(mut sub) = old.clone().filter(|o| o.client_id == source) else { return };
+            for gssi in &msg.groups {
+                sub.groups.remove(gssi);
                 info!(%source, issi=msg.issi, gssi, "subscriber deaffiliated");
             }
+            Some(sub)
         }
-        _ => debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"),
-    }
-    // Federation: relay this registration/affiliation event to every *other*
-    // connected peer (split-horizon -- never echo it back out the peer link
-    // it arrived on). Works for a message that originated locally (source is
-    // a real client) and for one already relayed in from another peer (this
-    // server is then a transit hop, propagating it further out); either way
-    // this is what makes a remote ISSI/GSSI's registration reachable from
-    // this server, and from here on call/SDS routing needs no federation-
-    // specific code at all -- it already resolves via `inner.subscribers`/
-    // `inner.group_clients`, which now includes this entry.
-    let relay_targets: Vec<_> = if matches!(msg.msg_type, SUB_REGISTER | SUB_REREGISTER | SUB_DEREGISTER | SUB_AFFILIATE | SUB_DEAFFILIATE) {
-        inner.clients.iter()
-            .filter(|(cid, c)| c.mode == crate::state::ClientMode::Peer && **cid != source)
-            .map(|(_, c)| c.tx.clone())
-            .collect()
-    } else {
-        Vec::new()
+        _ => { debug!(%source, msg_type=msg.msg_type, "unknown subscriber message"); return; }
     };
-    drop(inner);
-    if !relay_targets.is_empty() {
-        let relay = protocol::build_subscriber_message(msg.msg_type, msg.issi, &relay_groups);
-        for tx in relay_targets { let _ = tx.send(relay.clone()); }
+    // From here on call/SDS routing needs no federation-specific code at all:
+    // it resolves via `inner.subscribers`/`inner.group_clients`. Every peer
+    // link is told of the change (`fedroute::publish`): a loop-safe one with a
+    // route advert, a legacy one with the SUB messages it lacks -- never
+    // echoing anything back to the link it came from.
+    let deregistered = new.is_none();
+    crate::fedroute::set_effective(&mut inner, msg.issi, new);
+    if deregistered {
+        // Still reachable elsewhere, if a loop-safe peer offers it.
+        crate::fedroute::reroute(&mut inner, msg.issi);
     }
+    let registered = crate::fedroute::publish(&inner, msg.issi, old.as_ref());
+    drop(inner);
     // Log Terminal-mode (actual MS) registration lifecycle events to the same
     // dashboard registration log Basestation telemetry registrations use, so
     // an MS registering directly over the Brew protocol is visible there too.
     if let Some(kind) = ms_reg_event {
         state.telemetry.write().await.record_brew_registration(msg.issi, kind);
     }
-    if let Some(issi) = registered_issi {
-        state.sms_center.note_known(issi);
-        if state.sms_center.has_pending_for(issi) {
-            info!(issi, "SMS Center: subscriber back online, delivering stored SDS");
-            tokio::spawn(crate::sms_center::deliver_pending(state.clone(), issi, true));
-        }
+    if registered {
+        subscriber_registered(state, msg.issi);
+    }
+}
+
+/// An ISSI (re)registered somewhere on the Brew network -- here or at a peer
+/// server: the SMS Center delivers whatever it holds for it.
+pub(crate) fn subscriber_registered(state: &Arc<AppState>, issi: u32) {
+    state.sms_center.note_known(issi);
+    if state.sms_center.has_pending_for(issi) {
+        info!(issi, "SMS Center: subscriber back online, delivering stored SDS");
+        tokio::spawn(crate::sms_center::deliver_pending(state.clone(), issi, true));
     }
 }
 
@@ -1118,6 +1129,44 @@ mod forwarding_tests {
         assert!(drain(&mut callee_rx).is_empty());
         assert!(drain(&mut second_rx).is_empty(), "a duplicate is never answered with a reject");
         assert_eq!(state.inner.read().await.calls[&id].owner, first);
+    }
+
+    #[tokio::test]
+    async fn deregister_from_a_non_owner_is_not_relayed() {
+        let state = AppState::for_test();
+        let (owner, _owner_rx) = connect(&state, ConnVersion::V0).await;
+        let (other, _other_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut peer_rx) = connect_as(&state, ClientMode::Peer).await;
+        handle_packet(state.clone(), owner, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        assert_eq!(drain(&mut peer_rx), vec![protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])]);
+        handle_packet(state.clone(), other, protocol::build_subscriber_message(protocol::SUB_DEREGISTER, 6001, &[])).await;
+        assert!(drain(&mut peer_rx).is_empty());
+        assert_eq!(state.inner.read().await.subscribers[&6001].client_id, owner);
+    }
+
+    #[tokio::test]
+    async fn moving_one_issi_keeps_its_old_link_in_groups_others_use() {
+        let state = AppState::for_test();
+        let (link, _link_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (site, _site_rx) = connect(&state, ConnVersion::V0).await;
+        for issi in [6001, 6002] {
+            handle_packet(state.clone(), link, protocol::build_subscriber_message(SUB_REGISTER, issi, &[])).await;
+            handle_packet(state.clone(), link, protocol::build_subscriber_message(protocol::SUB_AFFILIATE, issi, &[91])).await;
+        }
+        // 6001 roams to a local site; 6002 is still behind the link, in 91.
+        handle_packet(state.clone(), site, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        assert_eq!(state.inner.read().await.group_clients[&91], HashSet::from([link, site]));
+    }
+
+    #[tokio::test]
+    async fn private_setup_bounced_back_over_a_peer_link_is_dropped_not_rejected() {
+        let state = AppState::for_test();
+        let (link, mut link_rx) = connect_as(&state, ClientMode::Peer).await;
+        handle_packet(state.clone(), link, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        let id = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), link, protocol::build_circular_call_setup(&id, 5001, 6002, 0)).await;
+        assert!(drain(&mut link_rx).is_empty(), "a transient loop gets no reject");
+        assert!(state.inner.read().await.calls.is_empty());
     }
 
     #[tokio::test]
