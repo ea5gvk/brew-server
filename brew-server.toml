@@ -187,7 +187,9 @@ enabled = true
 enabled = false
 
 # We dial out to this peer; it needs no matching config for us; an inbound
-# connection just authenticates like a Basestation would (with Peer mode).
+# connection just authenticates like a Basestation would (with Peer mode),
+# so if the peer has [auth] enabled, our username/password below must be in
+# its [auth.users].
 [[federation.peers]]
 name = "site-b"
 remote_host = "10.0.0.20:9000"
@@ -197,6 +199,19 @@ path = "/brew"
 username = "9000001"
 password = "change-me-federation"
 reconnect_interval_seconds = 15
+# Set tls = true when the peer has [tls] enabled (as this file does):
+# discovery then goes over https:// and the link over wss://. The peer's
+# certificate must chain to a CA in tls_ca_path (default: the
+# Debian/Ubuntu/Alpine system bundle; RHEL: /etc/pki/tls/certs/ca-bundle.crt)
+# and be valid for tls_server_name (empty = the host part of remote_host).
+# For a self-signed peer, point tls_pinned_cert_path at a copy of its
+# certificate (the PEM in the peer's [tls] cert_path) instead: exactly that
+# certificate is then trusted, whatever its issuer, name or expiry, and
+# tls_ca_path/tls_server_name are ignored.
+tls = true
+tls_ca_path = "/etc/ssl/certs/ca-certificates.crt"
+tls_server_name = ""
+tls_pinned_cert_path = ""
 enabled = true
 
 # APRS: forwards decoded mobile-station LIP positions (the same fixes plotted

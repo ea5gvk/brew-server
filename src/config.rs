@@ -511,6 +511,21 @@ pub struct FederationPeerConfig {
     /// Seconds between reconnect attempts after a dropped/failed link.
     pub reconnect_interval_seconds: u64,
     pub enabled: bool,
+    /// Dial this peer over TLS: `https://` discovery and a `wss://` link, for a
+    /// peer whose Brew listener has `[tls] enabled = true`. Plain `ws://` when
+    /// false (default).
+    pub tls: bool,
+    /// PEM bundle of CA certificates the peer's certificate must chain to.
+    /// Default: the Debian/Ubuntu/Alpine system bundle.
+    pub tls_ca_path: PathBuf,
+    /// Name the peer's certificate must be valid for, also sent as SNI. Empty:
+    /// the host part of `remote_host`.
+    pub tls_server_name: String,
+    /// For a self-signed peer: a copy of the peer's own certificate (PEM, first
+    /// certificate in the file). When set, exactly that certificate is trusted,
+    /// whatever its issuer, name or expiry, and `tls_ca_path`/`tls_server_name`
+    /// are ignored. Empty: off.
+    pub tls_pinned_cert_path: PathBuf,
 }
 
 impl Default for FederationPeerConfig {
@@ -523,6 +538,10 @@ impl Default for FederationPeerConfig {
             password: String::new(),
             reconnect_interval_seconds: 15,
             enabled: true,
+            tls: false,
+            tls_ca_path: "/etc/ssl/certs/ca-certificates.crt".into(),
+            tls_server_name: String::new(),
+            tls_pinned_cert_path: PathBuf::new(),
         }
     }
 }

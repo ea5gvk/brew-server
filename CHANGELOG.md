@@ -13,6 +13,14 @@ Unreleased adds:
   User-Agent on discovery no longer refuse the link. Inbound, a peer that
   announces its mode and version only on the WebSocket upgrade (brew-server
   1.12 and older) is now recognised too.
+- **TLS federation links.** New per-peer `tls` (default `false`): discovery
+  over `https://` and the link over `wss://`, for a peer whose `[tls]` is
+  enabled -- two servers configured like the example `brew-server.toml`
+  could not be linked at all before. The peer certificate is checked against
+  `tls_ca_path` (default `/etc/ssl/certs/ca-certificates.crt`) for
+  `tls_server_name` (default: the host of `remote_host`), or, for a
+  self-signed peer, pinned with `tls_pinned_cert_path`. The Docker image now
+  ships `ca-certificates`.
 
 Version 1.12.0 adds:
 

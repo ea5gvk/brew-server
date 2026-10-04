@@ -24,14 +24,19 @@
 use crate::config::FederationPeerConfig;
 use crate::protocol::{self, ConnVersion};
 use crate::state::{AppState, Client, ClientMode};
+use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -62,6 +67,119 @@ async fn peer_loop(state: Arc<AppState>, peer: FederationPeerConfig) {
     }
 }
 
+/// Plain TCP or TLS stream to a peer, so discovery and the WebSocket upgrade
+/// share one dial path.
+pub trait PeerIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PeerIo for T {}
+
+/// Opens a connection to `peer.remote_host`, wrapped in TLS when `tls` is
+/// given (`peer.tls`).
+async fn dial(peer: &FederationPeerConfig, tls: Option<&TlsConnector>) -> anyhow::Result<Box<dyn PeerIo>> {
+    let tcp = TcpStream::connect(&peer.remote_host).await?;
+    match tls {
+        None => Ok(Box::new(tcp)),
+        Some(c) => {
+            let name = tls_server_name(peer);
+            let server_name = ServerName::try_from(name.to_string())
+                .with_context(|| format!("invalid TLS server name {name:?}"))?;
+            let stream = c.connect(server_name, tcp).await
+                .with_context(|| format!("TLS handshake with {}", peer.remote_host))?;
+            Ok(Box::new(stream))
+        }
+    }
+}
+
+/// Name the peer's certificate is checked against and sent as SNI:
+/// `tls_server_name`, or else the host part of `remote_host` (`host:port`,
+/// `[v6]:port` or a bare host). An IP address becomes an IP `ServerName`,
+/// which webpki matches against an IP subjectAltName.
+fn tls_server_name(peer: &FederationPeerConfig) -> &str {
+    if !peer.tls_server_name.is_empty() {
+        return &peer.tls_server_name;
+    }
+    let host = peer.remote_host.as_str();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(h, _)| h);
+    }
+    host.rsplit_once(':').map_or(host, |(h, _)| h)
+}
+
+/// TLS client settings for one peer, built on every dial attempt so a
+/// renewed CA bundle or pinned certificate is picked up on the next reconnect
+/// without a restart. TLS 1.3 only: rustls is built without `tls12`, the
+/// same as this server's own listener.
+fn tls_connector(peer: &FederationPeerConfig) -> anyhow::Result<TlsConnector> {
+    let builder = rustls::ClientConfig::builder();
+    let config = if !peer.tls_pinned_cert_path.as_os_str().is_empty() {
+        let cert = CertificateDer::from_pem_file(&peer.tls_pinned_cert_path)
+            .with_context(|| format!("reading tls_pinned_cert_path {}", peer.tls_pinned_cert_path.display()))?;
+        let algs = builder.crypto_provider().signature_verification_algorithms;
+        builder.dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCert { cert, algs }))
+            .with_no_client_auth()
+    } else {
+        let certs = CertificateDer::pem_file_iter(&peer.tls_ca_path)
+            .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+            .with_context(|| format!("reading tls_ca_path {}", peer.tls_ca_path.display()))?;
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _ignored) = roots.add_parsable_certificates(certs);
+        if added == 0 {
+            anyhow::bail!("no usable CA certificate in {}", peer.tls_ca_path.display());
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Trusts exactly one certificate (`tls_pinned_cert_path`): the usual way to
+/// link to a peer with a self-signed certificate, which webpki would reject
+/// (no CA, often no SAN, often CA:TRUE). The handshake signature is still
+/// verified against that certificate's key, so only its holder can pass.
+#[derive(Debug)]
+struct PinnedCert {
+    cert: CertificateDer<'static>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.cert.as_ref() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
 /// Minimal parsed HTTP/1.1 response: just enough to drive the Brew discovery
 /// digest dance (status, headers, body), not a general-purpose HTTP client.
 struct HttpResponse {
@@ -73,9 +191,10 @@ struct HttpResponse {
 /// `User-Agent` this server identifies itself with when dialling a peer.
 const USER_AGENT: &str = concat!("brew-server/", env!("CARGO_PKG_VERSION"));
 
-/// Sends one plain (non-upgrade) `GET`, closes the connection after reading
-/// the response. Used only for the discovery/digest pre-flight -- the actual
-/// WebSocket upgrade is a separate connection via `tokio_tungstenite`.
+/// Sends one plain (non-upgrade) `GET` (over TLS when `tls` is given), closes
+/// the connection after reading the response. Used only for the
+/// discovery/digest pre-flight -- the actual WebSocket upgrade is a separate
+/// connection via `tokio_tungstenite`.
 ///
 /// Every request -- the unauthenticated first one and the digest retry alike
 /// -- announces `X-Brew-Mode: Peer` and `X-Brew-Version`, the way a
@@ -86,8 +205,14 @@ const USER_AGENT: &str = concat!("brew-server/", env!("CARGO_PKG_VERSION"));
 /// Basestation (no table sync, no relay) and federation only worked in one
 /// direction. Some Brew servers also refuse a discovery without a
 /// `User-Agent` (400).
-async fn http_get(remote_host: &str, path: &str, authorization: Option<&str>) -> anyhow::Result<HttpResponse> {
-    let mut stream = TcpStream::connect(remote_host).await?;
+async fn http_get(
+    peer: &FederationPeerConfig,
+    tls: Option<&TlsConnector>,
+    path: &str,
+    authorization: Option<&str>,
+) -> anyhow::Result<HttpResponse> {
+    let mut stream = dial(peer, tls).await?;
+    let remote_host = &peer.remote_host;
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {remote_host}\r\nUser-Agent: {USER_AGENT}\r\nX-Brew-Mode: Peer\r\nX-Brew-Version: {}\r\nConnection: close\r\n",
         protocol::BREW_PROTOCOL_VERSION,
@@ -97,8 +222,14 @@ async fn http_get(remote_host: &str, path: &str, authorization: Option<&str>) ->
     }
     req.push_str("\r\n");
     stream.write_all(req.as_bytes()).await?;
+    stream.flush().await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    match stream.read_to_end(&mut buf).await {
+        Ok(_) => {}
+        // A TLS server may close without close_notify; the response is complete.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !buf.is_empty() => {}
+        Err(e) => return Err(e.into()),
+    }
     parse_http_response(&buf)
 }
 
@@ -125,8 +256,8 @@ fn parse_http_response(buf: &[u8]) -> anyhow::Result<HttpResponse> {
 /// dance a real Basestation performs, or a single request when the peer has
 /// `[auth]` disabled) and returns the path to actually upgrade the WebSocket
 /// at.
-async fn discover(peer: &FederationPeerConfig, path: &str) -> anyhow::Result<String> {
-    let resp = http_get(&peer.remote_host, path, None).await?;
+async fn discover(peer: &FederationPeerConfig, tls: Option<&TlsConnector>, path: &str) -> anyhow::Result<String> {
+    let resp = http_get(peer, tls, path, None).await?;
     match resp.status {
         200 => Ok(String::from_utf8(resp.body)?.trim().to_string()),
         401 => {
@@ -137,7 +268,7 @@ async fn discover(peer: &FederationPeerConfig, path: &str) -> anyhow::Result<Str
             let authz = crate::sip::auth::build_authorization(
                 &challenge, &peer.username, &peer.password, "GET", path, &cnonce, 1,
             );
-            let resp2 = http_get(&peer.remote_host, path, Some(&authz)).await?;
+            let resp2 = http_get(peer, tls, path, Some(&authz)).await?;
             if resp2.status != 200 {
                 anyhow::bail!("digest auth rejected (HTTP {})", resp2.status);
             }
@@ -148,13 +279,15 @@ async fn discover(peer: &FederationPeerConfig, path: &str) -> anyhow::Result<Str
 }
 
 async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> anyhow::Result<()> {
+    let tls = if peer.tls { Some(tls_connector(peer)?) } else { None };
     let path = normalize_path(&peer.path);
-    let ws_path = discover(peer, &path).await?;
+    let ws_path = discover(peer, tls.as_ref(), &path).await?;
 
     let remote_addr = tokio::net::lookup_host(&peer.remote_host).await.ok()
         .and_then(|mut it| it.next());
 
-    let ws_url = format!("ws://{}{}", peer.remote_host, normalize_path(&ws_path));
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    let ws_url = format!("{scheme}://{}{}", peer.remote_host, normalize_path(&ws_path));
     let mut request = ws_url.into_client_request()?;
     request.headers_mut().insert("User-Agent", USER_AGENT.parse()?);
     // Also on the upgrade, not just discovery: a peer with `[auth]` disabled
@@ -163,7 +296,8 @@ async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> 
     request.headers_mut().insert("X-Brew-Version", protocol::BREW_PROTOCOL_VERSION.to_string().parse()?);
     request.headers_mut().insert("Sec-WebSocket-Protocol", "brew".parse()?);
 
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async(request).await?;
+    let stream = dial(peer, tls.as_ref()).await?;
+    let (ws_stream, _resp) = tokio_tungstenite::client_async(request, stream).await?;
     info!(peer = %peer.name, "federation: peer link established");
     run_peer_session(state.clone(), peer.clone(), ws_stream, remote_addr).await;
     Ok(())
@@ -180,11 +314,11 @@ fn normalize_path(path: &str) -> String {
 /// currently knows (see `sync_peer`), then pumps inbound frames through the
 /// normal router and outbound frames from its `tx` queue -- the same shape
 /// as `server::client_session`, just over a `tokio_tungstenite` client
-/// socket instead of axum's server-side one.
+/// socket (plain or TLS) instead of axum's server-side one.
 async fn run_peer_session(
     state: Arc<AppState>,
     peer: FederationPeerConfig,
-    ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    ws_stream: tokio_tungstenite::WebSocketStream<Box<dyn PeerIo>>,
     remote_addr: Option<SocketAddr>,
 ) {
     let id = uuid::Uuid::new_v4();
@@ -243,15 +377,27 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    /// Loopback HTTP server: answers one connection per entry of `responses`,
-    /// in order, and returns the request head each connection sent.
-    async fn http_stub(responses: Vec<&'static str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    /// Loopback HTTP(S) server: answers one connection per entry of
+    /// `responses`, in order, and returns the request head each connection
+    /// sent. With `tls`, connections are TLS; one whose handshake fails (the
+    /// client rejected the certificate) is skipped.
+    async fn http_stub(
+        responses: Vec<&'static str>,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut sock, _) = listener.accept().await.unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut sock: Box<dyn PeerIo> = match &tls {
+                    None => Box::new(tcp),
+                    Some(acceptor) => match acceptor.accept(tcp).await {
+                        Ok(s) => Box::new(s),
+                        Err(_) => continue,
+                    },
+                };
                 let mut buf = Vec::new();
                 while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
                     let mut chunk = [0u8; 1024];
@@ -261,6 +407,8 @@ mod tests {
                 }
                 requests.push(String::from_utf8(buf).unwrap());
                 sock.write_all(response.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                // Dropped without a TLS close_notify, like some servers do.
             }
             requests
         });
@@ -279,9 +427,9 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_without_auth_identifies_as_peer() {
-        let (addr, server) = http_stub(vec![OK]).await;
+        let (addr, server) = http_stub(vec![OK], None).await;
         let peer = FederationPeerConfig { remote_host: addr, ..Default::default() };
-        assert_eq!(discover(&peer, "/brew").await.unwrap(), "/brew/");
+        assert_eq!(discover(&peer, None, "/brew").await.unwrap(), "/brew/");
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("GET /brew HTTP/1.1\r\n"));
         assert_identifies_as_peer(&requests[0]);
@@ -292,15 +440,163 @@ mod tests {
         // The far end keeps the mode of the *authorized* request, so the
         // retry must carry the headers as well as the first attempt.
         let challenge = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let (addr, server) = http_stub(vec![challenge, OK]).await;
+        let (addr, server) = http_stub(vec![challenge, OK], None).await;
         let peer = FederationPeerConfig {
             remote_host: addr, username: "9000001".into(), password: "secret".into(), ..Default::default()
         };
-        assert_eq!(discover(&peer, "/brew").await.unwrap(), "/brew/");
+        assert_eq!(discover(&peer, None, "/brew").await.unwrap(), "/brew/");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
         for request in &requests { assert_identifies_as_peer(request); }
         assert!(!requests[0].contains("Authorization:"));
         assert!(requests[1].contains("Authorization: Digest username=\"9000001\""));
+    }
+
+    #[test]
+    fn tls_server_name_defaults_to_host_of_remote_host() {
+        let name = |remote_host: &str, tls_server_name: &str| {
+            let peer = FederationPeerConfig {
+                remote_host: remote_host.into(), tls_server_name: tls_server_name.into(), ..Default::default()
+            };
+            super::tls_server_name(&peer).to_string()
+        };
+        assert_eq!(name("brew.example.org:9000", ""), "brew.example.org");
+        assert_eq!(name("brew.example.org", ""), "brew.example.org");
+        assert_eq!(name("10.0.0.20:9000", ""), "10.0.0.20");
+        assert_eq!(name("[2001:db8::1]:9000", ""), "2001:db8::1");
+        assert_eq!(name("10.0.0.20:9000", "brew.example.org"), "brew.example.org");
+        // An address is matched against an IP subjectAltName, not as a DNS name.
+        assert!(matches!(ServerName::try_from("10.0.0.20".to_string()), Ok(ServerName::IpAddress(_))));
+        assert!(matches!(ServerName::try_from("2001:db8::1".to_string()), Ok(ServerName::IpAddress(_))));
+    }
+
+    // Test PKI, valid until 2126: a CA, and a leaf it signed for
+    // IP:127.0.0.1 and DNS:localhost (EC P-256).
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBojCCAUmgAwIBAgIUOF0/Y5MVE68sF6dcBT/RxpWf4mowCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTYnJldy1zZXJ2ZXIgdGVzdCBDQTAgFw0yNjEwMDQxMjQ4MTZa
+GA8yMTI2MDkxMDEyNDgxNlowHjEcMBoGA1UEAwwTYnJldy1zZXJ2ZXIgdGVzdCBD
+QTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBI2fmjuq+VyAsnyz6wWcEWjDWzl
+SQ8TMBwiFFKo7zVfT/ZHCSGWy3l/Y4fliB2EcvRU3V/jNa1jOHX9H11lA6KjYzBh
+MB0GA1UdDgQWBBTV3iXCb8IrinrDgfunvH67nJx6NzAfBgNVHSMEGDAWgBTV3iXC
+b8IrinrDgfunvH67nJx6NzAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB
+BjAKBggqhkjOPQQDAgNHADBEAiALb199VdAFm3GvaibB5wNxNtscTTi9gotaE7h2
+KWlSAwIgE0Qu3ybEbHd3nF+8y+rtnqC9EJuFr1HNMTdXxhNgvPE=
+-----END CERTIFICATE-----
+";
+    const TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----
+MIIByTCCAW+gAwIBAgIUEPG2bjIadT79+9j+w+V8KDEPZ4QwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTYnJldy1zZXJ2ZXIgdGVzdCBDQTAgFw0yNjEwMDQxMjQ4MTZa
+GA8yMTI2MDkxMDEyNDgxNlowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEC5wSiKDnNd00MxZ4cyvy7S6Awiu5a5+L5ma+gJnJ
+WtIP2TxXuU8vRWEQaksLI6Yr/JBWhzrJXEk6L7ldBaqQ3aOBkjCBjzAMBgNVHRMB
+Af8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAaBgNV
+HREEEzARhwR/AAABgglsb2NhbGhvc3QwHQYDVR0OBBYEFCRLs9xYKQMy0v1uGwHm
++Vhz6HmXMB8GA1UdIwQYMBaAFNXeJcJvwiuKesOB+6e8frucnHo3MAoGCCqGSM49
+BAMCA0gAMEUCIQD31yo5uFLTzL9Hw14lJTkPJaKyoXglEDMKBDn3htpXigIgZEhy
+1ARCi/WOvH3qBXwq7s5g2zMidxIBpuW8mBWG96w=
+-----END CERTIFICATE-----
+";
+    const TEST_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwxf2huLXLEPlWF+O
+4weJY9ew0+yUhdLhVMlCIkz+/muhRANCAAQLnBKIoOc13TQzFnhzK/LtLoDCK7lr
+n4vmZr6Amcla0g/ZPFe5Ty9FYRBqSwsjpiv8kFaHOslcSTovuV0FqpDd
+-----END PRIVATE KEY-----
+";
+
+    /// TLS acceptor presenting `TEST_LEAF` (without the CA in the chain).
+    fn test_acceptor() -> tokio_rustls::TlsAcceptor {
+        let cert = CertificateDer::from_pem_slice(TEST_LEAF.as_bytes()).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(TEST_LEAF_KEY.as_bytes()).unwrap();
+        let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key).unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Writes `pem` to a fresh temporary file, removed when dropped.
+    struct TempPem(std::path::PathBuf);
+    impl TempPem {
+        fn new(pem: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("brew-federation-test-{}.pem", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&path, pem).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempPem {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+
+    /// Runs one TLS discovery against a stub presenting `TEST_LEAF`.
+    async fn tls_discover(mut peer: FederationPeerConfig) -> anyhow::Result<String> {
+        let (addr, server) = http_stub(vec![OK], Some(test_acceptor())).await;
+        peer.remote_host = addr;
+        peer.tls = true;
+        let result = async {
+            let connector = tls_connector(&peer)?;
+            discover(&peer, Some(&connector), "/brew").await
+        }.await;
+        if result.is_ok() {
+            let requests = server.await.unwrap();
+            assert_identifies_as_peer(&requests[0]);
+        } else {
+            server.abort();
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn tls_discovery_verifies_against_ca_bundle() {
+        let ca = TempPem::new(TEST_CA);
+        // remote_host is 127.0.0.1:port, so the leaf's IP SAN is what matches.
+        let peer = FederationPeerConfig { tls_ca_path: ca.0.clone(), ..Default::default() };
+        assert_eq!(tls_discover(peer).await.unwrap(), "/brew/");
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_certificate_for_another_name() {
+        let ca = TempPem::new(TEST_CA);
+        let peer = FederationPeerConfig {
+            tls_ca_path: ca.0.clone(), tls_server_name: "brew.example.org".into(), ..Default::default()
+        };
+        let err = format!("{:#}", tls_discover(peer).await.unwrap_err());
+        assert!(err.contains("not valid for name"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tls_rejects_certificate_from_unknown_ca() {
+        // A bundle holding only the leaf itself: not a trust anchor for it.
+        let not_the_ca = TempPem::new(TEST_LEAF);
+        let peer = FederationPeerConfig { tls_ca_path: not_the_ca.0.clone(), ..Default::default() };
+        let err = format!("{:#}", tls_discover(peer).await.unwrap_err());
+        assert!(err.contains("UnknownIssuer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tls_pinned_certificate_ignores_issuer_and_name() {
+        let pin = TempPem::new(TEST_LEAF);
+        let peer = FederationPeerConfig {
+            tls_pinned_cert_path: pin.0.clone(),
+            tls_ca_path: "/nonexistent/ca.pem".into(),
+            tls_server_name: "brew.example.org".into(),
+            ..Default::default()
+        };
+        assert_eq!(tls_discover(peer).await.unwrap(), "/brew/");
+    }
+
+    #[tokio::test]
+    async fn tls_pin_of_another_certificate_is_rejected() {
+        let pin = TempPem::new(TEST_CA);
+        let peer = FederationPeerConfig { tls_pinned_cert_path: pin.0.clone(), ..Default::default() };
+        let err = format!("{:#}", tls_discover(peer).await.unwrap_err());
+        assert!(err.contains("ApplicationVerificationFailure"), "{err}");
+    }
+
+    #[test]
+    fn tls_connector_needs_a_usable_ca() {
+        let empty = TempPem::new("not a certificate\n");
+        let peer = FederationPeerConfig { tls: true, tls_ca_path: empty.0.clone(), ..Default::default() };
+        let err = tls_connector(&peer).err().expect("empty bundle must fail").to_string();
+        assert!(err.contains("no usable CA certificate"), "{err}");
+        let missing = FederationPeerConfig { tls: true, tls_ca_path: "/nonexistent/ca.pem".into(), ..Default::default() };
+        assert!(tls_connector(&missing).is_err());
     }
 }
