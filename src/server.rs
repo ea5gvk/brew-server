@@ -312,13 +312,37 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
         crate::federation::sync_peer(&state, &tx).await;
     }
 
+    // A federation link is pinged and closed once silent (see
+    // `federation::Keepalive`), the same as the links we dial out. Basestations
+    // and Terminals are left alone: real Basestations run their own heartbeat
+    // and reconnect, and a Terminal may be a phone app whose socket the OS
+    // suspends in the background.
+    let keepalive = if mode == ClientMode::Peer {
+        crate::federation::Keepalive::from_config(&state.config.federation)
+    } else {
+        None
+    };
+    let mut ping = keepalive.map(crate::federation::Keepalive::ping_timer);
     let writer = tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+        loop {
+            tokio::select! {
+                packet = rx.recv() => {
+                    let Some(packet) = packet else { break };
+                    if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+                }
+                _ = crate::federation::ping_due(&mut ping) => {
+                    if ws_tx.send(Message::Ping(Default::default())).await.is_err() { break; }
+                }
+            }
         }
     });
 
-    while let Some(item) = ws_rx.next().await {
+    loop {
+        let item = match crate::federation::next_frame(&mut ws_rx, keepalive).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => { warn!(%id, %remote_addr, "peer link silent past keepalive timeout; closing"); break; }
+        };
         match item {
             Ok(Message::Binary(data)) => router::handle_packet(state.clone(), id, data.to_vec()).await,
             Ok(Message::Ping(_)) => debug!(%id, "ping received"),
@@ -389,5 +413,47 @@ mod tests {
         assert!(!is_valid_brew_username("bs1"));
         assert!(!is_valid_brew_username(" 123456"));
         assert!(!is_valid_brew_username("123-456"));
+    }
+
+    #[tokio::test]
+    async fn silent_inbound_peer_is_dropped_but_basestation_is_not() {
+        use super::{brew_discovery, get, AppState, Arc, SocketAddr};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.enabled = false;
+        cfg.sms_center.enabled = false;
+        cfg.federation.keepalive_interval_seconds = 1;
+        cfg.federation.keepalive_timeout_seconds = 2;
+        let state = Arc::new(AppState::new(cfg, "test.toml".into()).0);
+        let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+
+        // Neither client is ever read from, so neither answers a ping.
+        let mut peer_request = format!("ws://{addr}/brew").into_client_request().unwrap();
+        peer_request.headers_mut().insert("X-Brew-Mode", "Peer".parse().unwrap());
+        let (_peer, _) = tokio_tungstenite::connect_async(peer_request).await.unwrap();
+        let (_basestation, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/brew")).await.unwrap();
+
+        let modes = || async {
+            state.inner.read().await.clients.values().map(|c| c.mode).collect::<Vec<_>>()
+        };
+        let wait_for = |n: usize, within: Duration| async move {
+            let deadline = tokio::time::Instant::now() + within;
+            while modes().await.len() != n && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        wait_for(2, Duration::from_secs(2)).await;
+        assert_eq!(modes().await.len(), 2, "both connections registered");
+        wait_for(1, Duration::from_secs(6)).await;
+        // Margin: had the Basestation been pinged too, it would go at the same time.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(modes().await, vec![ClientMode::Basestation]);
     }
 }

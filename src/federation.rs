@@ -21,7 +21,7 @@
 //! WebSocket upgrade, same as a Basestation, differing only in the
 //! `X-Brew-Mode: Peer` header it sends.
 
-use crate::config::FederationPeerConfig;
+use crate::config::{FederationConfig, FederationPeerConfig};
 use crate::protocol::{self, ConnVersion};
 use crate::state::{AppState, Client, ClientMode};
 use anyhow::Context;
@@ -53,6 +53,68 @@ pub async fn run(state: Arc<AppState>) {
         }
         let state = state.clone();
         tokio::spawn(async move { peer_loop(state, peer).await });
+    }
+}
+
+/// Upper bound on one dial attempt, discovery through the WebSocket
+/// handshake. Without it a peer that accepts the TCP connection but never
+/// answers would hang the attempt -- and with it this peer's reconnect loop
+/// -- forever.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keepalive of one federation link (either direction), from `[federation]`.
+///
+/// Nothing else notices a half-open link -- a peer that lost power, a NAT
+/// entry that expired, a route that went away: TCP only gives up after many
+/// minutes of unacknowledged data, and an idle link sends none. Until then
+/// its registrations keep pointing calls and SDS into the void. Plain
+/// WebSocket pings are answered by any RFC 6455 peer (tungstenite and axum
+/// reply on their own while the socket is read), older brew-server versions
+/// included, so this needs nothing from the far end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keepalive {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Keepalive {
+    /// `None` when `keepalive_interval_seconds` is 0 (off).
+    pub fn from_config(cfg: &FederationConfig) -> Option<Self> {
+        if cfg.keepalive_interval_seconds == 0 {
+            return None;
+        }
+        let interval = Duration::from_secs(cfg.keepalive_interval_seconds);
+        // Below two intervals a single late pong would already close the link.
+        let timeout = Duration::from_secs(cfg.keepalive_timeout_seconds).max(interval * 2);
+        Some(Self { interval, timeout })
+    }
+
+    /// First tick one interval from now (no ping right after connecting).
+    pub fn ping_timer(self) -> tokio::time::Interval {
+        let mut i = tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        i
+    }
+}
+
+/// Resolves when the next ping is due; never when keepalive is off.
+pub async fn ping_due(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(t) => { t.tick().await; }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Next item from a link's read half, or `Err` once it has been silent for
+/// the keepalive timeout (any frame, data or control, counts as life).
+/// `StreamExt::next` is cancel-safe, so a timeout never loses a frame.
+pub async fn next_frame<S: futures_util::Stream + Unpin>(
+    rx: &mut S,
+    keepalive: Option<Keepalive>,
+) -> Result<Option<S::Item>, tokio::time::error::Elapsed> {
+    match keepalive {
+        Some(k) => tokio::time::timeout(k.timeout, rx.next()).await,
+        None => Ok(rx.next().await),
     }
 }
 
@@ -280,26 +342,32 @@ async fn discover(peer: &FederationPeerConfig, tls: Option<&TlsConnector>, path:
 
 async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> anyhow::Result<()> {
     let tls = if peer.tls { Some(tls_connector(peer)?) } else { None };
-    let path = normalize_path(&peer.path);
-    let ws_path = discover(peer, tls.as_ref(), &path).await?;
+    let (ws_stream, remote_addr) = tokio::time::timeout(DIAL_TIMEOUT, async {
+        let path = normalize_path(&peer.path);
+        let ws_path = discover(peer, tls.as_ref(), &path).await?;
 
-    let remote_addr = tokio::net::lookup_host(&peer.remote_host).await.ok()
-        .and_then(|mut it| it.next());
+        let remote_addr = tokio::net::lookup_host(&peer.remote_host).await.ok()
+            .and_then(|mut it| it.next());
 
-    let scheme = if tls.is_some() { "wss" } else { "ws" };
-    let ws_url = format!("{scheme}://{}{}", peer.remote_host, normalize_path(&ws_path));
-    let mut request = ws_url.into_client_request()?;
-    request.headers_mut().insert("User-Agent", USER_AGENT.parse()?);
-    // Also on the upgrade, not just discovery: a peer with `[auth]` disabled
-    // takes the mode straight from the upgrade request.
-    request.headers_mut().insert("X-Brew-Mode", "Peer".parse()?);
-    request.headers_mut().insert("X-Brew-Version", protocol::BREW_PROTOCOL_VERSION.to_string().parse()?);
-    request.headers_mut().insert("Sec-WebSocket-Protocol", "brew".parse()?);
+        let scheme = if tls.is_some() { "wss" } else { "ws" };
+        let ws_url = format!("{scheme}://{}{}", peer.remote_host, normalize_path(&ws_path));
+        let mut request = ws_url.into_client_request()?;
+        request.headers_mut().insert("User-Agent", USER_AGENT.parse()?);
+        // Also on the upgrade, not just discovery: a peer with `[auth]` disabled
+        // takes the mode straight from the upgrade request.
+        request.headers_mut().insert("X-Brew-Mode", "Peer".parse()?);
+        request.headers_mut().insert("X-Brew-Version", protocol::BREW_PROTOCOL_VERSION.to_string().parse()?);
+        request.headers_mut().insert("Sec-WebSocket-Protocol", "brew".parse()?);
 
-    let stream = dial(peer, tls.as_ref()).await?;
-    let (ws_stream, _resp) = tokio_tungstenite::client_async(request, stream).await?;
+        let stream = dial(peer, tls.as_ref()).await?;
+        let (ws_stream, _resp) = tokio_tungstenite::client_async(request, stream).await?;
+        anyhow::Ok((ws_stream, remote_addr))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out after {}s dialling peer", DIAL_TIMEOUT.as_secs()))??;
     info!(peer = %peer.name, "federation: peer link established");
-    run_peer_session(state.clone(), peer.clone(), ws_stream, remote_addr).await;
+    let keepalive = Keepalive::from_config(&state.config.federation);
+    run_peer_session(state.clone(), peer.clone(), ws_stream, remote_addr, keepalive).await;
     Ok(())
 }
 
@@ -314,12 +382,15 @@ fn normalize_path(path: &str) -> String {
 /// currently knows (see `sync_peer`), then pumps inbound frames through the
 /// normal router and outbound frames from its `tx` queue -- the same shape
 /// as `server::client_session`, just over a `tokio_tungstenite` client
-/// socket (plain or TLS) instead of axum's server-side one.
+/// socket (plain or TLS) instead of axum's server-side one. With `keepalive`
+/// the link is pinged and closed once silent past its timeout (see
+/// `Keepalive`); `peer_loop` then redials it.
 async fn run_peer_session(
     state: Arc<AppState>,
     peer: FederationPeerConfig,
     ws_stream: tokio_tungstenite::WebSocketStream<Box<dyn PeerIo>>,
     remote_addr: Option<SocketAddr>,
+    keepalive: Option<Keepalive>,
 ) {
     let id = uuid::Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -332,13 +403,31 @@ async fn run_peer_session(
 
     sync_peer(&state, &tx).await;
 
+    let mut ping = keepalive.map(Keepalive::ping_timer);
     let writer = tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+        loop {
+            tokio::select! {
+                packet = rx.recv() => {
+                    let Some(packet) = packet else { break };
+                    if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+                }
+                _ = ping_due(&mut ping) => {
+                    if ws_tx.send(Message::Ping(Default::default())).await.is_err() { break; }
+                }
+            }
         }
     });
 
-    while let Some(item) = ws_rx.next().await {
+    loop {
+        let item = match next_frame(&mut ws_rx, keepalive).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(%id, peer = %peer.name, timeout_s = keepalive.map_or(0, |k| k.timeout.as_secs()),
+                    "federation: peer link silent past keepalive timeout; closing");
+                break;
+            }
+        };
         match item {
             Ok(Message::Binary(data)) => crate::router::handle_packet(state.clone(), id, data.to_vec()).await,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
@@ -598,5 +687,69 @@ n4vmZr6Amcla0g/ZPFe5Ty9FYRBqSwsjpiv8kFaHOslcSTovuV0FqpDd
         assert!(err.contains("no usable CA certificate"), "{err}");
         let missing = FederationPeerConfig { tls: true, tls_ca_path: "/nonexistent/ca.pem".into(), ..Default::default() };
         assert!(tls_connector(&missing).is_err());
+    }
+
+    #[test]
+    fn keepalive_from_config() {
+        let mut cfg = FederationConfig::default();
+        assert_eq!(Keepalive::from_config(&cfg), Some(Keepalive {
+            interval: Duration::from_secs(15), timeout: Duration::from_secs(45),
+        }));
+        cfg.keepalive_interval_seconds = 30;
+        cfg.keepalive_timeout_seconds = 10;
+        assert_eq!(Keepalive::from_config(&cfg).unwrap().timeout, Duration::from_secs(60), "raised to 2x interval");
+        cfg.keepalive_interval_seconds = 0;
+        assert_eq!(Keepalive::from_config(&cfg), None);
+    }
+
+    /// Both ends of an in-memory WebSocket link: ours (the dialling side, as
+    /// `run_peer_session` gets it) and the far server's.
+    async fn ws_pair() -> (
+        tokio_tungstenite::WebSocketStream<Box<dyn PeerIo>>,
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (near, far) = tokio::io::duplex(65536);
+        let near = tokio_tungstenite::WebSocketStream::from_raw_socket(Box::new(near) as Box<dyn PeerIo>, Role::Client, None).await;
+        let far = tokio_tungstenite::WebSocketStream::from_raw_socket(far, Role::Server, None).await;
+        (near, far)
+    }
+
+    const FAST: Keepalive = Keepalive { interval: Duration::from_millis(50), timeout: Duration::from_millis(200) };
+
+    #[tokio::test]
+    async fn silent_peer_link_closes_after_keepalive_timeout() {
+        let state = AppState::for_test();
+        // The far end stays open but is never polled: a half-open link.
+        let (near, _far) = ws_pair().await;
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST)),
+        ).await.expect("a silent link must be closed by the keepalive");
+        assert!(started.elapsed() >= FAST.timeout);
+        assert!(state.inner.read().await.clients.is_empty(), "link deregistered");
+    }
+
+    #[tokio::test]
+    async fn answering_peer_link_stays_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = AppState::for_test();
+        let (near, mut far) = ws_pair().await;
+        let pings = Arc::new(AtomicUsize::new(0));
+        let counter = pings.clone();
+        tokio::spawn(async move {
+            // Just reading is enough: tungstenite answers each Ping itself.
+            while let Some(Ok(msg)) = far.next().await {
+                if msg.is_ping() { counter.fetch_add(1, Ordering::SeqCst); }
+            }
+        });
+        let session = tokio::time::timeout(
+            Duration::from_millis(600),
+            run_peer_session(state.clone(), FederationPeerConfig::default(), near, None, Some(FAST)),
+        ).await;
+        assert!(session.is_err(), "a link that answers pings must stay up");
+        assert!(pings.load(Ordering::SeqCst) >= 2, "pinged every interval");
+        assert_eq!(state.inner.read().await.clients.len(), 1);
     }
 }

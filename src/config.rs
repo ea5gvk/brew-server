@@ -483,11 +483,19 @@ pub struct FederationConfig {
     /// server dialling in to us) needs no entry here: it just authenticates
     /// like a Basestation would, with `X-Brew-Mode: Peer`.
     pub peers: Vec<FederationPeerConfig>,
+    /// WebSocket ping interval on every federation link: the peers dialled from
+    /// `peers` and any `X-Brew-Mode: Peer` connection accepted from another
+    /// server (even with `enabled = false`). 0 disables pings and the timeout.
+    pub keepalive_interval_seconds: u64,
+    /// A federation link that has received nothing -- no frame, not even a
+    /// pong -- for this long is closed: its registrations are withdrawn and an
+    /// outbound link is redialled. Raised to at least twice the interval.
+    pub keepalive_timeout_seconds: u64,
 }
 
 impl Default for FederationConfig {
     fn default() -> Self {
-        Self { enabled: false, peers: Vec::new() }
+        Self { enabled: false, peers: Vec::new(), keepalive_interval_seconds: 15, keepalive_timeout_seconds: 45 }
     }
 }
 

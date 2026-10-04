@@ -185,6 +185,16 @@ enabled = true
 # loop-free topology); a topology with a cycle (full mesh) is not supported.
 [federation]
 enabled = false
+# WebSocket pings on every federation link -- the peers we dial below and
+# any peer that dials in to us (this applies even with enabled = false). A
+# link that has received nothing, not even a pong, for
+# keepalive_timeout_seconds is closed: its registrations are withdrawn and
+# an outbound one is redialled, instead of a half-open link silently
+# swallowing calls. Any WebSocket peer answers pings, older brew-server
+# versions included. The timeout is raised to at least twice the interval;
+# keepalive_interval_seconds = 0 turns both off.
+keepalive_interval_seconds = 15
+keepalive_timeout_seconds = 45
 
 # We dial out to this peer; it needs no matching config for us; an inbound
 # connection just authenticates like a Basestation would (with Peer mode),

@@ -247,6 +247,17 @@ pub struct AppState {
     pub sms_center: crate::sms_center::SmsCenter,
 }
 
+#[cfg(test)]
+impl AppState {
+    /// In-memory state for tests: no history store, no SMS Center file.
+    pub fn for_test() -> Arc<Self> {
+        let mut c = Config::default();
+        c.storage.enabled = false;
+        c.sms_center.enabled = false;
+        Arc::new(Self::new(c, "test.toml".into()).0)
+    }
+}
+
 /// Runtime handles for the SIP subsystem, shared with the dashboard.
 #[derive(Clone)]
 pub struct SipHandles {

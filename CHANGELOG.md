@@ -21,6 +21,11 @@ Unreleased adds:
   `tls_server_name` (default: the host of `remote_host`), or, for a
   self-signed peer, pinned with `tls_pinned_cert_path`. The Docker image now
   ships `ca-certificates`.
+- **Federation keepalive.** Every federation link, dialled or accepted, is
+  pinged every `[federation] keepalive_interval_seconds` (default `15`) and
+  closed after `keepalive_timeout_seconds` (default `45`) without any frame,
+  so a half-open link no longer keeps routes pointing at it; `0` disables.
+  Dialling a peer now gives up after 30 s instead of possibly hanging.
 
 Version 1.12.0 adds:
 
