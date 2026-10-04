@@ -286,10 +286,11 @@ fn sorted(groups: impl IntoIterator<Item = u32>) -> Vec<u32> {
     v
 }
 
-/// Replaces the effective route of `issi` (`None`: unreachable). The one
-/// writer of `inner.subscribers` and of the subscriber part of
-/// `inner.group_clients` (the SIP bridge adds its own virtual members), which
-/// it keeps consistent: a connection is in a group's set exactly while one of
+/// Replaces the effective route of `issi` (`None`: unreachable). The writer
+/// of `inner.subscribers` and of the subscriber part of `inner.group_clients`
+/// (the SIP bridge adds its own virtual members; `state::cleanup_client`
+/// drops a departed connection's entries and memberships wholesale), which it
+/// keeps consistent: a connection is in a group's set exactly while one of
 /// the ISSIs routed over it is in that group. So an ISSI moving off a peer
 /// link leaves the link in every group another ISSI behind it still uses.
 pub fn set_effective(inner: &mut Inner, issi: u32, new: Option<Subscriber>) {

@@ -242,8 +242,7 @@ async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::reques
         Ok(neighbour) => neighbour,
         Err(()) => {
             warn!(%remote_addr, "federation peer presented this server's own id (a link to ourselves); refusing");
-            return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain")], "Federation link to this server itself
-").into_response();
+            return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain")], "Federation link to this server itself\n").into_response();
         }
     };
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
