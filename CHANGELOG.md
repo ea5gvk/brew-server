@@ -2,6 +2,74 @@
 
 All notable changes to brew-server, newest first.
 
+Unreleased adds:
+
+- **Federation discovery identifies the peer.** The discovery `GET` of an
+  outbound peer link now carries `User-Agent: brew-server/<version>`,
+  `X-Brew-Mode: Peer` and `X-Brew-Version`. With `[auth]` enabled the far
+  end takes the mode from that request, so between two brew-servers the link
+  used to be registered there as a Basestation (no table sync, no relay) and
+  federation only worked in one direction; servers that require a
+  User-Agent on discovery no longer refuse the link. Inbound, a peer that
+  announces its mode and version only on the WebSocket upgrade (brew-server
+  1.12 and older) is now recognised too.
+- **TLS federation links.** New per-peer `tls` (default `false`): discovery
+  over `https://` and the link over `wss://`, for a peer whose `[tls]` is
+  enabled -- two servers configured like the example `brew-server.toml`
+  could not be linked at all before. The peer certificate is checked against
+  `tls_ca_path` (default `/etc/ssl/certs/ca-certificates.crt`) for
+  `tls_server_name` (default: the host of `remote_host`), or, for a
+  self-signed peer, pinned with `tls_pinned_cert_path`. The Docker image now
+  ships `ca-certificates`.
+- **Federation keepalive.** Every federation link, dialled or accepted, is
+  pinged every `[federation] keepalive_interval_seconds` (default `15`) and
+  closed after `keepalive_timeout_seconds` (default `45`) without any frame,
+  so a half-open link no longer keeps routes pointing at it; `0` disables.
+  Dialling a peer now gives up after 30 s instead of possibly hanging.
+- **Unroutable private calls are rejected.** A private `SETUP_REQUEST` whose
+  destination is not registered anywhere (and has no SIP route) is answered
+  with `CALL_SETUP_REJECT`, cause 3 ("called party not reachable"), so the
+  calling radio is released at once instead of waiting out its own timer.
+- **Calls end cleanly when a connection drops.** When a Basestation or peer
+  link disconnects, the other participants of its calls get the
+  `CALL_GROUP_IDLE` / `CALL_RELEASE` a normal hangup would send (cause 14,
+  "SwMI requested disconnection"). A group listener dropping no longer ends
+  the call for everybody else.
+- **No talker names to v0 connections.** `GROUP_TX` and `SETUP_REQUEST`
+  forwarded to a connection that announced Brew v0 (`X-Brew-Version: 0`)
+  lose the v1 `mnemonic[34]` tail. A connection that announced no version
+  still gets them as sent: FlowStation without digest credentials upgrades
+  with no `X-Brew-*` header at all, yet shows the talker name. With `[auth]`
+  disabled, the mode and version a client announces on its discovery `GET`
+  now also apply to its WebSocket upgrade from the same address with the
+  same `User-Agent` (FlowStation sends one on both), so other clients behind
+  the same NAT are unaffected; the `Peer` mode is never carried over, a peer
+  announces it on the upgrade itself.
+- **Loop-safe federation (opt-in).** With `[federation] loop_safe = true` on
+  both ends, peers negotiate it at connect time (`X-Brew-Federation` /
+  `X-Brew-Server-Id`) and exchange path-vector route adverts instead of
+  relayed SUB messages, so rings, full meshes and redundant links are safe:
+  the newest registration wins network-wide, reached by the shortest
+  loop-free path, with failover when a link drops. Older peers keep working
+  as tree leaves: a server without it must hang off the mesh by a single
+  link. Enable it everywhere before adding redundant links, and keep the
+  servers' clocks on NTP.
+- **Duplicate calls and SDS across peer links are dropped.** A `GROUP_TX`,
+  private `SETUP_REQUEST` or SDS reaching a server a second time over another
+  peer link (a ring, a mesh, two links between the same servers) is
+  recognised by (uuid, source ISSI) and dropped, instead of taking the call
+  over and being forwarded again; a late copy within 5 s of the call ending
+  no longer brings it back. A talker change inside a group call (same uuid,
+  another ISSI) is still accepted. Basestation traffic is never checked.
+  Between loop-safe servers (`loop_safe`) the duplicate's sender is told to
+  stop (`FED_PRUNE`), so a redundant link does not carry a second copy of
+  the voice stream.
+- **Registration fixes.** A `DEREGISTER` from a connection that does not own
+  the ISSI is no longer relayed to peers; an ISSI re-registering on another
+  connection no longer drops the old connection from groups its other ISSIs
+  are still in (all the ISSIs behind a peer link, typically). A registration
+  relayed to a peer is now followed by its group affiliations.
+
 Version 1.12.0 adds:
 
 - **Basestation version.** Each Basestation card shows the software version

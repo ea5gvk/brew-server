@@ -1,4 +1,4 @@
-use crate::{router, state::{AppState, Client, ClientMode}};
+use crate::{fedroute, router, state::{AppState, Client, ClientMode}};
 use crate::protocol::ConnVersion;
 use anyhow::Context;
 use axum::{
@@ -69,6 +69,12 @@ fn brew_mode(headers: &HeaderMap) -> ClientMode {
     ClientMode::from_header(headers.get(X_BREW_MODE).and_then(|v| v.to_str().ok()))
 }
 
+/// The request's `User-Agent`, if it sent a non-empty one: what ties an
+/// upgrade to its own discovery GET when `[auth]` is disabled.
+fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::trim).filter(|ua| !ua.is_empty())
+}
+
 /// Validates the client's advertised `X-Brew-Version` header against the version
 /// this server implements and returns the connection's seed version. A missing
 /// header is accepted for backward compatibility and seeds `V0` (the version is
@@ -103,6 +109,40 @@ fn check_brew_version(headers: &HeaderMap) -> Result<ConnVersion, Response> {
     }
 }
 
+/// Mode and seed version a WebSocket upgrade runs with. Brew clients announce
+/// both on the discovery GET (`discovered`); FlowStation sends neither on the
+/// upgrade itself, while brew-server peers up to 1.12 sent them only on the
+/// upgrade. An X-Brew-Mode on the upgrade wins; the version is the higher of
+/// the two, so neither request can demote the other, and `None` when neither
+/// announced one (see `Client::version_announced`).
+fn upgrade_mode_version(headers: &HeaderMap, discovered: Option<(ClientMode, Option<ConnVersion>)>) -> (ClientMode, Option<ConnVersion>) {
+    let (mode, version) = discovered.unwrap_or_default();
+    let mode = if headers.contains_key(X_BREW_MODE) { brew_mode(headers) } else { mode };
+    // Only consulted when present, so a plain upgrade does not log the
+    // "seeding V0" fallback for a version discovery already settled; a value
+    // we cannot use announces nothing.
+    let announced = if headers.contains_key(X_BREW_VERSION) { check_brew_version(headers).ok() } else { None };
+    let version = match (version, announced) {
+        (Some(v), Some(a)) if a.as_u8() > v.as_u8() => Some(a),
+        (v, a) => v.or(a),
+    };
+    (mode, version)
+}
+
+/// Loop-safe federation negotiation for one inbound connection: Ok(Some(neighbour_id))
+/// when both sides speak it, Ok(None) for a legacy peer, Basestation or Terminal,
+/// Err(()) when the peer claims our own server id (a link to ourselves).
+fn negotiate_federation(mode: ClientMode, headers: &HeaderMap, loop_safe: bool, own_id: u64) -> Result<Option<u64>, ()> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if mode != ClientMode::Peer || !loop_safe || !fedroute::federation_offered(header(fedroute::X_BREW_FEDERATION)) {
+        return Ok(None);
+    }
+    match header(fedroute::X_BREW_SERVER_ID).and_then(fedroute::parse_server_id) {
+        Some(id) if id == own_id => Err(()),
+        neighbour => Ok(neighbour),
+    }
+}
+
 async fn brew_discovery(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -112,8 +152,9 @@ async fn brew_discovery(
     let (mut parts, _body) = request.into_parts();
     let request_uri = parts.uri.path().to_string();
 
+    // `None` when the request announced no version at all.
     let seed_version = match check_brew_version(&parts.headers) {
-        Ok(v) => v,
+        Ok(v) => parts.headers.contains_key(X_BREW_VERSION).then_some(v),
         Err(resp) => return resp,
     };
 
@@ -122,8 +163,21 @@ async fn brew_discovery(
     let is_upgrade = parts.headers.get(header::UPGRADE).and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("websocket")).unwrap_or(false);
 
-    // Direct WS mode remains available only when Digest is disabled.
+    // Direct WS mode remains available only when Digest is disabled. A
+    // Basestation announces its mode and version on the discovery GET and
+    // upgrades without them, so pick up what the same address announced
+    // there (see `discovery_hints`) -- only when the upgrade comes with the
+    // same User-Agent, as FlowStation's does, so another client behind the
+    // same NAT never inherits it. With no hint this is the upgrade's own
+    // headers, as before.
     if is_upgrade && !state.config.auth.enabled {
+        let hint = {
+            let mut inner = state.inner.write().await;
+            let agent = user_agent(&parts.headers);
+            let ours = inner.discovery_hints.get(&remote_addr.ip()).is_some_and(|(_, hinted, _, _)| Some(hinted.as_str()) == agent);
+            if ours { inner.discovery_hints.remove(&remote_addr.ip()).map(|(_, _, m, v)| (m, v)) } else { None }
+        };
+        let (mode, seed_version) = upgrade_mode_version(&parts.headers, hint);
         return upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, None).await;
     }
 
@@ -144,6 +198,16 @@ async fn brew_discovery(
         ).into_response();
     }
 
+    // Never for a peer: every brew-server announces Peer on the upgrade itself,
+    // and an address alone must not make some other client a peer (full table
+    // sync, relayed registrations).
+    let announced = parts.headers.contains_key(X_BREW_MODE) || parts.headers.contains_key(X_BREW_VERSION);
+    if announced && mode != ClientMode::Peer {
+        if let Some(agent) = user_agent(&parts.headers) {
+            let hint = (Instant::now(), agent.to_string(), mode, seed_version);
+            state.inner.write().await.discovery_hints.insert(remote_addr.ip(), hint);
+        }
+    }
     (
         StatusCode::OK,
         [
@@ -181,21 +245,47 @@ async fn brew_session_endpoint(
 
     // Session URLs are single-use. The established WebSocket is the authenticated
     // session. Recover the mode, seed version and authenticated username
-    // captured during the discovery GET; the WebSocket handshake itself
-    // carries neither the X-Brew-Mode/X-Brew-Version headers nor Authorization.
-    let (mode, seed_version, username) = state.inner.write().await.auth_sessions.remove(&token)
+    // captured during the discovery GET; a Basestation's WebSocket handshake
+    // carries neither the X-Brew-Mode/X-Brew-Version headers nor
+    // Authorization. Older brew-server peers announce mode and version only
+    // on the handshake, so those still count when present (see
+    // `upgrade_mode_version`).
+    let (stored_mode, stored_version, username) = state.inner.write().await.auth_sessions.remove(&token)
         .map(|(_, mode, ver, user)| (mode, ver, user))
         .unwrap_or_default();
+    let (mode, seed_version) = upgrade_mode_version(&parts.headers, Some((stored_mode, stored_version)));
     upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, username).await
 }
 
-async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) -> Response {
+async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>) -> Response {
+    // Decided on the upgrade's own headers, which every brew-server that
+    // speaks it sends whether or not [auth] put a discovery GET in between.
+    let own_id = state.inner.read().await.fed.self_id;
+    let fed_neighbour = match negotiate_federation(mode, &parts.headers, state.config.federation.loop_safe, own_id) {
+        Ok(neighbour) => neighbour,
+        Err(()) => {
+            warn!(%remote_addr, "federation peer presented this server's own id (a link to ourselves); refusing");
+            return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain")], "Federation link to this server itself\n").into_response();
+        }
+    };
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), "WebSocket upgrade request");
+            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=?seed_version.map(ConnVersion::as_u8), loop_safe=fed_neighbour.is_some(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
-            ws.protocols([protocol]).on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username)).into_response()
+            let mut response = ws.protocols([protocol])
+                .on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username, fed_neighbour))
+                .into_response();
+            if fed_neighbour.is_some() {
+                // Accepting: the dialling side only switches to loop-safe mode
+                // when it sees these in the 101.
+                let headers = response.headers_mut();
+                headers.insert(fedroute::X_BREW_FEDERATION, HeaderValue::from_static("1"));
+                if let Ok(id) = HeaderValue::from_str(&fedroute::format_server_id(own_id)) {
+                    headers.insert(fedroute::X_BREW_SERVER_ID, id);
+                }
+            }
+            response
         }
         Err(rejection) => rejection.into_response(),
     }
@@ -274,29 +364,53 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     Some(username.clone())
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
-    state.inner.write().await.clients.insert(id, Client { tx: tx.clone(), mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() });
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, username=username.as_deref().unwrap_or(""), "Basestation connected");
-    if mode == ClientMode::Peer {
-        // Inbound federation peer link: `federation::run`'s outbound dial
-        // side syncs its own state to us once connected, but that is only
-        // half the story -- we need to tell *this* peer what we know too, or
-        // an inbound-only link (or one that reconnects from the far end)
-        // never learns about registrations that predate it.
-        crate::federation::sync_peer(&state, &tx).await;
-    }
+    // An inbound federation peer link gets this server's full table too:
+    // `federation::run`'s outbound dial side syncs its own state to us once
+    // connected, but that is only half the story -- an inbound-only link (or
+    // one that reconnects from the far end) would otherwise never learn about
+    // registrations that predate it.
+    let version = seed_version.unwrap_or_default();
+    let client = Client { tx, mode, version, version_announced: seed_version.is_some(), remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() };
+    crate::federation::attach_client(&state, id, client, fed_neighbour).await;
+    info!(%id, mode=mode.as_str(), version=version.as_u8(), version_announced=seed_version.is_some(), %remote_addr, username=username.as_deref().unwrap_or(""),
+        loop_safe_neighbour=fed_neighbour.map(fedroute::format_server_id).unwrap_or_default(), "Basestation connected");
 
+    // A federation link is pinged and closed once silent (see
+    // `federation::Keepalive`), the same as the links we dial out. Basestations
+    // and Terminals are left alone: real Basestations run their own heartbeat
+    // and reconnect, and a Terminal may be a phone app whose socket the OS
+    // suspends in the background.
+    let keepalive = if mode == ClientMode::Peer {
+        crate::federation::Keepalive::from_config(&state.config.federation)
+    } else {
+        None
+    };
+    let mut ping = keepalive.map(crate::federation::Keepalive::ping_timer);
     let writer = tokio::spawn(async move {
-        while let Some(packet) = rx.recv().await {
-            if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+        loop {
+            tokio::select! {
+                packet = rx.recv() => {
+                    let Some(packet) = packet else { break };
+                    if ws_tx.send(Message::Binary(packet.into())).await.is_err() { break; }
+                }
+                _ = crate::federation::ping_due(&mut ping) => {
+                    if ws_tx.send(Message::Ping(Default::default())).await.is_err() { break; }
+                }
+            }
         }
     });
 
-    while let Some(item) = ws_rx.next().await {
+    loop {
+        let item = match crate::federation::next_frame(&mut ws_rx, keepalive).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => { warn!(%id, %remote_addr, "peer link silent past keepalive timeout; closing"); break; }
+        };
         match item {
             Ok(Message::Binary(data)) => router::handle_packet(state.clone(), id, data.to_vec()).await,
             Ok(Message::Ping(_)) => debug!(%id, "ping received"),
@@ -314,7 +428,126 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_brew_username;
+    use super::{is_valid_brew_username, negotiate_federation, upgrade_mode_version, ClientMode, ConnVersion, HeaderMap};
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs { h.insert(*k, v.parse().unwrap()); }
+        h
+    }
+
+    #[test]
+    fn plain_upgrade_keeps_what_discovery_announced() {
+        // FlowStation: mode/version on the discovery GET only.
+        let discovered = Some((ClientMode::Terminal, Some(ConnVersion::V1)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), discovered), (ClientMode::Terminal, Some(ConnVersion::V1)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), None), (ClientMode::Basestation, None));
+    }
+
+    #[test]
+    fn only_an_x_brew_version_announces_a_version() {
+        // FlowStation without digest credentials: no discovery GET, a bare upgrade.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Mode", "Basestation")]), None), (ClientMode::Basestation, None));
+        // An explicit v0, on either request.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Version", "0")]), None), (ClientMode::Basestation, Some(ConnVersion::V0)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), Some((ClientMode::Basestation, Some(ConnVersion::V0)))), (ClientMode::Basestation, Some(ConnVersion::V0)));
+        // A value we cannot use is no announcement.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Version", "99")]), None), (ClientMode::Basestation, None));
+    }
+
+    #[test]
+    fn old_peer_announcing_on_upgrade_only_is_recognised() {
+        // brew-server <= 1.12 dialling a server with [auth]: the discovery GET
+        // carried nothing, so the session token holds the defaults.
+        let upgrade = headers(&[("X-Brew-Mode", "Peer"), ("X-Brew-Version", "1")]);
+        let discovered = Some((ClientMode::Basestation, None));
+        assert_eq!(upgrade_mode_version(&upgrade, discovered), (ClientMode::Peer, Some(ConnVersion::V1)));
+    }
+
+    #[test]
+    fn upgrade_never_demotes_the_discovered_version() {
+        let upgrade = headers(&[("X-Brew-Version", "0")]);
+        assert_eq!(upgrade_mode_version(&upgrade, Some((ClientMode::Peer, Some(ConnVersion::V1)))), (ClientMode::Peer, Some(ConnVersion::V1)));
+        let bogus = headers(&[("X-Brew-Version", "99")]);
+        assert_eq!(upgrade_mode_version(&bogus, Some((ClientMode::Peer, Some(ConnVersion::V1)))), (ClientMode::Peer, Some(ConnVersion::V1)));
+    }
+
+    #[test]
+    fn negotiate_federation_only_between_loop_safe_peers() {
+        let offer = headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f607")]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, true, 7), Ok(Some(0x00a1_b2c3_d4e5_f607)));
+        // Not loop-safe here, not a peer, or no offer: a plain link.
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, false, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Basestation, &offer, true, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Terminal, &offer, true, 7), Ok(None));
+        assert_eq!(negotiate_federation(ClientMode::Peer, &headers(&[]), true, 7), Ok(None));
+    }
+
+    #[test]
+    fn negotiate_federation_needs_a_valid_offer() {
+        let id = ("X-Brew-Server-Id", "00a1b2c3d4e5f607");
+        for bad in [
+            headers(&[("X-Brew-Federation", "0"), id]),
+            headers(&[("X-Brew-Federation", "yes"), id]),
+            headers(&[id]),
+            headers(&[("X-Brew-Federation", "1")]),
+            headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "a1b2c3d4e5f607")]),
+            headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f60z")]),
+        ] {
+            assert_eq!(negotiate_federation(ClientMode::Peer, &bad, true, 7), Ok(None), "{bad:?}");
+        }
+        // A later version is still version 1 to us.
+        let newer = headers(&[("X-Brew-Federation", "2"), id]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &newer, true, 7), Ok(Some(0x00a1_b2c3_d4e5_f607)));
+    }
+
+    #[test]
+    fn negotiate_federation_refuses_our_own_id() {
+        let offer = headers(&[("X-Brew-Federation", "1"), ("X-Brew-Server-Id", "00a1b2c3d4e5f607")]);
+        assert_eq!(negotiate_federation(ClientMode::Peer, &offer, true, 0x00a1_b2c3_d4e5_f607), Err(()));
+    }
+
+    #[tokio::test]
+    async fn negotiate_federation_on_a_real_upgrade() {
+        use super::{brew_discovery, get, AppState, Arc, SocketAddr};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.enabled = false;
+        cfg.sms_center.enabled = false;
+        cfg.federation.loop_safe = true;
+        let state = Arc::new(AppState::new(cfg, "test.toml".into()).0);
+        let own_id = state.inner.read().await.fed.self_id;
+        let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        let upgrade = |pairs: &[(&'static str, String)]| {
+            let mut request = format!("ws://{addr}/brew").into_client_request().unwrap();
+            request.headers_mut().insert("X-Brew-Mode", "Peer".parse().unwrap());
+            for (k, v) in pairs { request.headers_mut().insert(*k, v.parse().unwrap()); }
+            tokio_tungstenite::connect_async(request)
+        };
+
+        let (_link, resp) = upgrade(&[("X-Brew-Federation", "1".into()), ("X-Brew-Server-Id", "00000000000000aa".into())]).await.unwrap();
+        assert_eq!(resp.headers()["X-Brew-Federation"], "1");
+        assert_eq!(resp.headers()["X-Brew-Server-Id"], crate::fedroute::format_server_id(own_id).as_str());
+        let (_legacy, resp) = upgrade(&[]).await.unwrap();
+        assert!(!resp.headers().contains_key("X-Brew-Federation"), "an older peer is not answered with it");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while state.inner.read().await.clients.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let neighbours: Vec<u64> = state.inner.read().await.fed.links.values().copied().collect();
+        assert_eq!(neighbours, vec![0xaa], "only the negotiated link is loop-safe");
+
+        let ours = crate::fedroute::format_server_id(own_id);
+        let err = upgrade(&[("X-Brew-Federation", "1".into()), ("X-Brew-Server-Id", ours)]).await.unwrap_err();
+        assert!(err.to_string().contains("409"), "{err}");
+    }
 
     #[test]
     fn accepts_1_to_7_digits() {
@@ -336,5 +569,110 @@ mod tests {
         assert!(!is_valid_brew_username("bs1"));
         assert!(!is_valid_brew_username(" 123456"));
         assert!(!is_valid_brew_username("123-456"));
+    }
+
+    #[tokio::test]
+    async fn silent_inbound_peer_is_dropped_but_basestation_is_not() {
+        use super::{brew_discovery, get, AppState, Arc, SocketAddr};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut cfg = crate::config::Config::default();
+        cfg.storage.enabled = false;
+        cfg.sms_center.enabled = false;
+        cfg.federation.keepalive_interval_seconds = 1;
+        cfg.federation.keepalive_timeout_seconds = 2;
+        let state = Arc::new(AppState::new(cfg, "test.toml".into()).0);
+        let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+
+        // Neither client is ever read from, so neither answers a ping.
+        let mut peer_request = format!("ws://{addr}/brew").into_client_request().unwrap();
+        peer_request.headers_mut().insert("X-Brew-Mode", "Peer".parse().unwrap());
+        let (_peer, _) = tokio_tungstenite::connect_async(peer_request).await.unwrap();
+        let (_basestation, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/brew")).await.unwrap();
+
+        let modes = || async {
+            state.inner.read().await.clients.values().map(|c| c.mode).collect::<Vec<_>>()
+        };
+        let wait_for = |n: usize, within: Duration| async move {
+            let deadline = tokio::time::Instant::now() + within;
+            while modes().await.len() != n && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        wait_for(2, Duration::from_secs(2)).await;
+        assert_eq!(modes().await.len(), 2, "both connections registered");
+        wait_for(1, Duration::from_secs(6)).await;
+        // Margin: had the Basestation been pinged too, it would go at the same time.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(modes().await, vec![ClientMode::Basestation]);
+    }
+
+    #[tokio::test]
+    async fn without_auth_the_upgrade_takes_what_discovery_announced() {
+        use super::{brew_discovery, get, AppState, SocketAddr};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let state = AppState::for_test();
+        let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        });
+        let discover = |announce: &'static str| async move {
+            let mut http = tokio::net::TcpStream::connect(addr).await.unwrap();
+            http.write_all(format!("GET /brew HTTP/1.1\r\nHost: x\r\n{announce}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            http.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        };
+        // A bare upgrade, with the given User-Agent: the mode and version it
+        // was registered with (and whether the version was announced), once
+        // it has gone again.
+        let connect = |agent: Option<&'static str>| {
+            let state = state.clone();
+            async move {
+                let mut request = format!("ws://{addr}/brew").into_client_request().unwrap();
+                if let Some(agent) = agent { request.headers_mut().insert("User-Agent", agent.parse().unwrap()); }
+                let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let registered = loop {
+                    let clients: Vec<_> = state.inner.read().await.clients.values().map(|c| (c.mode, c.version, c.version_announced)).collect();
+                    if !clients.is_empty() || tokio::time::Instant::now() >= deadline { break clients; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                drop(ws);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !state.inner.read().await.clients.is_empty() { tokio::time::sleep(Duration::from_millis(20)).await; }
+                }).await.expect("closed connection cleaned up");
+                registered
+            }
+        };
+        let defaults = vec![(ClientMode::Basestation, ConnVersion::V0, false)];
+
+        // FlowStation: mode and version on the discovery GET, a bare upgrade
+        // with the same User-Agent.
+        discover("User-Agent: FlowStation/1\r\nX-Brew-Mode: Terminal\r\nX-Brew-Version: 1\r\n").await;
+        // Another client behind the same address does not take it...
+        assert_eq!(connect(Some("BlueStation/1")).await, defaults);
+        assert_eq!(connect(None).await, defaults);
+        // ...the one that announced it does, once.
+        assert_eq!(connect(Some("FlowStation/1")).await, vec![(ClientMode::Terminal, ConnVersion::V1, true)]);
+        assert_eq!(connect(Some("FlowStation/1")).await, defaults);
+
+        // Nothing is kept for a client that does not name itself...
+        discover("X-Brew-Mode: Terminal\r\nX-Brew-Version: 1\r\n").await;
+        assert_eq!(connect(None).await, defaults);
+        // ...nor for a peer, which announces Peer on its own upgrade.
+        discover("User-Agent: brew-server/1\r\nX-Brew-Mode: Peer\r\nX-Brew-Version: 1\r\n").await;
+        assert_eq!(connect(Some("brew-server/1")).await, defaults);
     }
 }

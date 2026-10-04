@@ -57,6 +57,10 @@ pub struct Client {
     /// discovery `X-Brew-Version` header (if any) and promoted lazily as v1
     /// message layouts are observed on the wire.
     pub version: ConnVersion,
+    /// Whether the client announced `version` (an `X-Brew-Version` on its
+    /// discovery GET or upgrade) rather than it being the v0 default; see
+    /// `forward_version`.
+    pub version_announced: bool,
     /// Remote address of the WebSocket connection, when known. `None` for the
     /// virtual clients the SIP bridge registers (see `sip::bridge`), which
     /// have no real socket.
@@ -71,6 +75,19 @@ pub struct Client {
     pub username: Option<String>,
 }
 
+impl Client {
+    /// The layout CALL_GROUP_TX and CALL_SETUP_REQUEST are forwarded to this
+    /// connection in (see `protocol::adapt_to_version`). Only a connection
+    /// that announced v0 has the v1 mnemonic stripped; one that announced no
+    /// version gets them as sent, as it always did -- FlowStation without
+    /// digest credentials upgrades with no X-Brew headers and never sends a
+    /// mnemonic itself, so it stays v0 here, yet parses and shows the talker
+    /// name.
+    pub fn forward_version(&self) -> ConnVersion {
+        if self.version_announced { self.version } else { ConnVersion::V1 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Subscriber {
     pub client_id: ClientId,
@@ -81,6 +98,11 @@ pub struct Subscriber {
     /// subscriber's behalf is not itself an MS. Dashboard MS-registration
     /// counts should filter on this.
     pub mode: ClientMode,
+    /// Registration clock and server path of this entry (see `fedroute`):
+    /// an empty path for an ISSI registered here, by a Basestation, Terminal
+    /// or legacy peer link; otherwise the route learnt over a loop-safe peer
+    /// link, whose first server is that link's.
+    pub route: crate::fedroute::Route,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +155,22 @@ pub struct Inner {
     pub group_floor: HashMap<u32, Uuid>,
     pub sds_routes: HashMap<Uuid, SdsRoute>,
     pub digest_nonces: HashMap<String, Instant>,
-    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion, Option<String>)>,
+    /// Session token -> what the discovery GET announced: mode, version (`None`
+    /// when it sent no `X-Brew-Version`) and the digest username.
+    pub auth_sessions: HashMap<String, (Instant, ClientMode, Option<ConnVersion>, Option<String>)>,
+    /// With `[auth]` disabled, what a client's discovery GET announced
+    /// (`X-Brew-Mode` / `X-Brew-Version`) and the `User-Agent` it sent, for its
+    /// WebSocket upgrade from the same address: a Basestation announces both
+    /// on discovery only, and without a session token there is nothing else to
+    /// carry them over. One per address; only an upgrade with the same
+    /// `User-Agent` takes it, so another client behind the same NAT does not.
+    pub discovery_hints: HashMap<std::net::IpAddr, (Instant, String, ClientMode, Option<ConnVersion>)>,
+    /// (call/SDS uuid, source ISSI) -> (link it was accepted from, when): drops
+    /// a copy of a call or SDS that reaches this server again over another
+    /// peer link (see `fedroute::is_duplicate`).
+    pub recent_calls: HashMap<(Uuid, u32), (ClientId, Instant)>,
+    /// Loop-safe federation: this server's id and its negotiated peer links.
+    pub fed: crate::fedroute::FedState,
 }
 
 impl Inner {
@@ -160,7 +197,7 @@ mod ms_registration_tests {
     use super::*;
 
     fn subscriber(mode: ClientMode) -> Subscriber {
-        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode }
+        Subscriber { client_id: Uuid::new_v4(), groups: HashSet::new(), mode, route: crate::fedroute::Route::default() }
     }
 
     #[test]
@@ -193,7 +230,7 @@ mod basestation_count_tests {
 
     fn client(mode: ClientMode) -> Client {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0, username: None }
+        Client { tx, mode, version: ConnVersion::default(), version_announced: false, remote_addr: None, connected_at_ms: 0, username: None }
     }
 
     #[test]
@@ -245,6 +282,17 @@ pub struct AppState {
     pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
     /// Store-and-forward queue for SDS to offline subscribers.
     pub sms_center: crate::sms_center::SmsCenter,
+}
+
+#[cfg(test)]
+impl AppState {
+    /// In-memory state for tests: no history store, no SMS Center file.
+    pub fn for_test() -> Arc<Self> {
+        let mut c = Config::default();
+        c.storage.enabled = false;
+        c.sms_center.enabled = false;
+        Arc::new(Self::new(c, "test.toml".into()).0)
+    }
 }
 
 /// Runtime handles for the SIP subsystem, shared with the dashboard.
@@ -348,51 +396,88 @@ impl AppState {
         let mut inner = self.inner.write().await;
         inner.digest_nonces.retain(|_, at| now.duration_since(*at) < Duration::from_secs(120));
         inner.auth_sessions.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
+        inner.discovery_hints.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
+        inner.recent_calls.retain(|_, (_, at)| now.duration_since(*at) < crate::fedroute::CALL_DEDUP_WINDOW);
     }
 
     pub async fn cleanup_client(&self, id: ClientId) {
         let mut inner = self.inner.write().await;
         inner.clients.remove(&id);
+        let negotiated = inner.fed.links.remove(&id).is_some();
 
-        let removed_issis: Vec<u32> = inner.subscribers.iter()
+        // Registrations: every ISSI routed over this connection, and for a
+        // loop-safe link every one it offered, gets a new effective route --
+        // another link's offer (failover), or none -- and every remaining
+        // peer link hears about the change (a legacy one a SUB_DEREGISTER,
+        // as before). The connection's own entries and group memberships go
+        // in bulk first, so each ISSI is re-routed against the final state.
+        let mut affected: Vec<u32> = inner.subscribers.iter()
             .filter_map(|(issi, sub)| (sub.client_id == id).then_some(*issi)).collect();
-        for issi in &removed_issis { inner.subscribers.remove(issi); }
+        if negotiated {
+            affected.extend(inner.fed.rib_in.iter().filter_map(|(issi, offers)| offers.contains_key(&id).then_some(*issi)));
+        }
+        affected.sort_unstable();
+        affected.dedup();
+        let previous: Vec<(u32, Option<Subscriber>)> = affected.iter().map(|issi| (*issi, inner.subscribers.get(issi).cloned())).collect();
+        for (issi, old) in &previous {
+            if let Some(offers) = inner.fed.rib_in.get_mut(issi) {
+                offers.remove(&id);
+                if offers.is_empty() { inner.fed.rib_in.remove(issi); }
+            }
+            if old.as_ref().is_some_and(|o| o.client_id == id) { inner.subscribers.remove(issi); }
+        }
 
         for clients in inner.group_clients.values_mut() { clients.remove(&id); }
         inner.group_clients.retain(|_, clients| !clients.is_empty());
 
-        let removed_calls: Vec<Uuid> = inner.calls.iter()
+        for (issi, old) in &previous {
+            crate::fedroute::reroute(&mut inner, *issi);
+            crate::fedroute::publish(&inner, *issi, old.as_ref());
+        }
+
+        // Calls this client took part in, ended the way router::end_call ends
+        // them: a private call ends for both parties; a group call ends only
+        // if its owner (the talker's side) is the one that vanished -- a
+        // departing listener is just dropped from the recipients, so everyone
+        // else keeps hearing it. The remaining participants get the
+        // CALL_RELEASE / CALL_GROUP_IDLE a hangup would have relayed, so their
+        // radios drop the call now instead of waiting for their own timers.
+        // Removal happens under this write lock, so a call already ended
+        // (end_call, the timeout sweep, the SIP bridge) is never ended twice.
+        let involved: Vec<Uuid> = inner.calls.iter()
             .filter_map(|(uuid, call)| (call.owner == id || call.peers.contains(&id)).then_some(*uuid)).collect();
-        for uuid in &removed_calls {
-            if let Some(call) = inner.calls.remove(uuid) {
-                if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(uuid) {
-                    inner.group_floor.remove(&call.destination);
-                }
+        let mut removed_calls = Vec::new();
+        let mut end_notices: Vec<(mpsc::UnboundedSender<Vec<u8>>, Vec<u8>)> = Vec::new();
+        for uuid in involved {
+            let Some(call) = inner.calls.get_mut(&uuid) else { continue };
+            if call.kind == CallKind::Group && call.owner != id {
+                call.peers.remove(&id);
+                continue;
             }
+            let Some(call) = inner.calls.remove(&uuid) else { continue };
+            if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(&uuid) {
+                inner.group_floor.remove(&call.destination);
+            }
+            let end_state = if call.kind == CallKind::Group { crate::protocol::CALL_GROUP_IDLE } else { crate::protocol::CALL_RELEASE };
+            let msg = crate::protocol::build_call_cause(end_state, &uuid, crate::protocol::CAUSE_SWMI_REQUESTED_DISCONNECTION);
+            let mut recipients = call.peers.clone();
+            if call.kind == CallKind::Private { recipients.insert(call.owner); }
+            recipients.remove(&id);
+            end_notices.extend(recipients.iter().filter_map(|c| inner.clients.get(c)).map(|c| (c.tx.clone(), msg.clone())));
+            removed_calls.push(uuid);
         }
         inner.sds_routes.retain(|_, route| route.source_client != id && !route.targets.contains(&id));
-
-        // Federation: the disconnected client's registrations just vanished
-        // above; tell every remaining peer so they don't keep routing to a
-        // now-dead ISSI (mirrors the relay in router::handle_subscriber, but
-        // there is no live source client left to split-horizon against here
-        // -- the one that just disconnected can't receive it anyway).
-        let peer_txs: Vec<_> = if removed_issis.is_empty() { Vec::new() } else {
-            inner.clients.values()
-                .filter(|c| c.mode == ClientMode::Peer)
-                .map(|c| c.tx.clone())
-                .collect()
-        };
+        // A call or SDS accepted over this link may now arrive over another
+        // one (rerouted): that copy is no longer a duplicate.
+        inner.recent_calls.retain(|_, (link, _)| *link != id);
         drop(inner);
-        for issi in removed_issis {
-            let withdraw = crate::protocol::build_subscriber_message(crate::protocol::SUB_DEREGISTER, issi, &[]);
-            for tx in &peer_txs { let _ = tx.send(withdraw.clone()); }
-        }
+        for (tx, msg) in end_notices { let _ = tx.send(msg); }
 
-        // The calls this client took part in are gone: end them on the
-        // dashboard too, and hang up any SIP leg bridged to one, otherwise
-        // both UIs keep showing a call that no longer exists.
+        // The calls ended above are gone: end them on the dashboard too, and
+        // hang up any SIP leg bridged to one, otherwise both UIs keep showing
+        // a call that no longer exists. A group call that only lost a
+        // listener is still running and stays.
         let bridge = match self.sip.read().await.as_ref() {
             Some(h) => h.transport.bridge.read().await.clone(),
             None => None,

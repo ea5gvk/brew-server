@@ -362,7 +362,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let target_tx = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, version_announced: false, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
             inner.calls.insert(brew_call_id, ActiveCall {
                 kind: CallKind::Private,
                 owner: virtual_client,
@@ -493,7 +493,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let target_txs = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, version_announced: false, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
             let members = inner.group_clients.entry(gssi).or_default();
             members.insert(virtual_client);
             let targets: HashSet<ClientId> = members.iter().copied().filter(|c| *c != virtual_client).collect();
@@ -625,7 +625,7 @@ impl BrewBridge {
         let (virtual_tx, virtual_rx) = mpsc::unbounded_channel();
         let brew_target_tx = {
             let mut inner = self.app.inner.write().await;
-            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
+            inner.clients.insert(virtual_client, Client { tx: virtual_tx, mode: ClientMode::Terminal, version: ConnVersion::V1, version_announced: false, remote_addr: None, connected_at_ms: crate::telemetry::now_ms(), username: None });
             inner.calls.insert(link.call_id, ActiveCall {
                 kind: CallKind::Private,
                 owner: link.client,

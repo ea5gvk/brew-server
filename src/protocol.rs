@@ -11,6 +11,18 @@ pub const CLASS_CALL_CONTROL: u8 = 0xf1;
 pub const CLASS_FRAME: u8 = 0xf2;
 pub const CLASS_ERROR: u8 = 0xf3;
 pub const CLASS_SERVICE: u8 = 0xf4;
+/// Not part of the Brew spec: only exchanged between brew-servers that
+/// negotiated loop-safe federation (`X-Brew-Federation`); never sent to anyone
+/// else. Route adverts cannot ride on `CLASS_SUBSCRIBER`: its group list runs
+/// to the end of the message, so an older peer would read any added field as
+/// groups. Kept clear of 0xf5 upwards, left for the spec. Layout in
+/// `fedroute::FedMessage`.
+pub const CLASS_FEDERATION: u8 = 0xfe;
+
+/// `CLASS_FEDERATION` types.
+pub const FED_WITHDRAW: u8 = 0;
+pub const FED_ROUTE: u8 = 1;
+pub const FED_PRUNE: u8 = 2;
 
 pub const SUB_DEREGISTER: u8 = 0;
 pub const SUB_REGISTER: u8 = 1;
@@ -30,6 +42,15 @@ pub const CALL_RELEASE: u8 = 10;
 pub const CALL_SHORT_TRANSFER: u8 = 11;
 pub const CALL_SIMPLEX_GRANTED: u8 = 12;
 pub const CALL_SIMPLEX_IDLE: u8 = 13;
+
+/// Disconnect causes (ETSI EN 300 392-2 clause 14.8.18) for the cause byte of
+/// call-control messages this server originates itself.
+/// "Called party not reachable": a private call's destination is not
+/// registered anywhere this server can route to.
+pub const CAUSE_CALLED_PARTY_NOT_REACHABLE: u8 = 3;
+/// "SwMI requested disconnection": the network ended the call, here because
+/// a participant's connection dropped.
+pub const CAUSE_SWMI_REQUESTED_DISCONNECTION: u8 = 14;
 
 pub const FRAME_TRAFFIC_CHANNEL: u8 = 0;
 pub const FRAME_SDS_TRANSFER: u8 = 1;
@@ -137,6 +158,26 @@ impl ConnVersion {
     pub fn from_header_value(v: Option<u8>) -> Self {
         match v { Some(x) if x >= 1 => ConnVersion::V1, _ => ConnVersion::V0 }
     }
+}
+
+/// `raw` as a connection that negotiated `version` may receive it. Brew v1
+/// appends the SS-TPI `mnemonic[34]` to CALL_GROUP_TX and CALL_SETUP_REQUEST
+/// only (CONNECT_REQUEST is cut at the mnemonic offset in every version); a
+/// v0 recipient gets those two cut back to their v0 length, so a v1 talker
+/// name never reaches a parser that does not expect it. Only ever strips: a
+/// v0 message goes to a v1 recipient unchanged, which parses it fine.
+pub fn adapt_to_version(raw: &[u8], version: ConnVersion) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    if version.has_mnemonic() || raw.len() < 2 || raw[0] != CLASS_CALL_CONTROL {
+        return Cow::Borrowed(raw);
+    }
+    // 18 = class + call state + 16-byte call UUID, ahead of the payload.
+    let v0_len = 18 + match raw[1] {
+        CALL_GROUP_TX => GROUP_TX_BASE_LEN,
+        CALL_SETUP_REQUEST => CIRCULAR_CALL_BASE_LEN,
+        _ => return Cow::Borrowed(raw),
+    };
+    if raw.len() > v0_len { Cow::Owned(raw[..v0_len].to_vec()) } else { Cow::Borrowed(raw) }
 }
 
 #[derive(Debug, Clone)]
@@ -1059,6 +1100,53 @@ mod tests {
         let CallPayload::CircularCall(c) = cc.payload else { panic!() };
         assert_eq!(c.source, 5001);
         assert_eq!(c.mnemonic, None);
+    }
+
+    fn with_mnemonic(mut wire: Vec<u8>, name: &[u8]) -> Vec<u8> {
+        let mut mnem = vec![0x00u8, (name.len() * 8) as u8];
+        mnem.extend_from_slice(name);
+        mnem.resize(MNEMONIC_FIELD_LEN, 0);
+        wire.extend_from_slice(&mnem);
+        wire
+    }
+
+    #[test]
+    fn v0_recipient_gets_group_tx_and_setup_without_mnemonic() {
+        let id = Uuid::new_v4();
+        let v0_tx = build_group_tx(&id, 1001, 91, 3);
+        let v1_tx = with_mnemonic(v0_tx.clone(), b"BOB");
+        assert_eq!(adapt_to_version(&v1_tx, ConnVersion::V0).as_ref(), v0_tx.as_slice());
+        let (msg, detected) = parse_with_version(&adapt_to_version(&v1_tx, ConnVersion::V0), ConnVersion::V0).unwrap();
+        assert_eq!(detected, ConnVersion::V0, "a stripped GROUP_TX reads as v0");
+        let BrewMessage::CallControl(cc) = msg else { panic!() };
+        let CallPayload::GroupTransmission(gt) = cc.payload else { panic!() };
+        assert_eq!((gt.source, gt.destination, gt.priority, gt.mnemonic), (1001, 91, 3, None));
+
+        let v0_setup = build_circular_call_setup(&id, 5001, 6002, 2);
+        let v1_setup = with_mnemonic(v0_setup.clone(), b"CTRL");
+        assert_eq!(adapt_to_version(&v1_setup, ConnVersion::V0).as_ref(), v0_setup.as_slice());
+    }
+
+    #[test]
+    fn version_adaptation_only_ever_strips() {
+        let id = Uuid::new_v4();
+        let v0_tx = build_group_tx(&id, 1001, 91, 3);
+        let v1_tx = with_mnemonic(v0_tx.clone(), b"BOB");
+        // A v1 recipient gets everything as sent, v1 or v0.
+        assert_eq!(adapt_to_version(&v1_tx, ConnVersion::V1).as_ref(), v1_tx.as_slice());
+        assert_eq!(adapt_to_version(&v0_tx, ConnVersion::V1).as_ref(), v0_tx.as_slice());
+        assert_eq!(adapt_to_version(&v0_tx, ConnVersion::V0).as_ref(), v0_tx.as_slice());
+        // Nothing else carries the mnemonic: other call states, frames and
+        // subscriber messages pass through untouched, whatever their length.
+        let connect = build_circular_connect_request(&id, 5001, 6002, 2);
+        assert_eq!(adapt_to_version(&connect, ConnVersion::V0).as_ref(), connect.as_slice());
+        let release = build_call_cause(CALL_RELEASE, &id, 0);
+        assert_eq!(adapt_to_version(&release, ConnVersion::V0).as_ref(), release.as_slice());
+        let frame = build_traffic_frame(&id, &[0x55; ACELP_CODED_FRAME_BYTES], &[0xAA; ACELP_CODED_FRAME_BYTES]);
+        assert_eq!(adapt_to_version(&frame, ConnVersion::V0).as_ref(), frame.as_slice());
+        let sub = build_subscriber_message(SUB_AFFILIATE, 1001, &[91; 20]);
+        assert_eq!(adapt_to_version(&sub, ConnVersion::V0).as_ref(), sub.as_slice());
+        assert_eq!(adapt_to_version(&[CLASS_CALL_CONTROL], ConnVersion::V0).as_ref(), &[CLASS_CALL_CONTROL]);
     }
 
     /// Pins the real production bug: this server used to send/expect a
