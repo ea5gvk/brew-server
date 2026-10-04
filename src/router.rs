@@ -213,9 +213,10 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         last_activity_ms: ActiveCall::new_activity(),
     });
     crate::fedroute::note_call(&mut inner, id, gt.source, source, now);
-    // Each recipient gets the GROUP_TX in the layout it negotiated: a v0
-    // connection must not be handed the v1 talker-name tail.
-    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| (c.tx.clone(), c.version))).collect::<Vec<_>>();
+    // Each recipient gets the GROUP_TX in its own layout: a connection that
+    // announced v0 is not handed the v1 talker-name tail (see
+    // `Client::forward_version`).
+    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| (c.tx.clone(), c.forward_version()))).collect::<Vec<_>>();
     drop(inner);
     for (tx, version) in txs { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
     if let Some(old) = preempted {
@@ -502,7 +503,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     }
     let peers = HashSet::from([target_client]);
     inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now(), last_activity_ms: ActiveCall::new_activity() });
-    let target = inner.clients.get(&target_client).map(|c| (c.tx.clone(), c.version));
+    let target = inner.clients.get(&target_client).map(|c| (c.tx.clone(), c.forward_version()));
     drop(inner);
     if let Some((tx, version)) = target { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
     state.monitor.call_started(id, "private", source_issi, destination, 0).await;
@@ -892,11 +893,11 @@ mod forwarding_tests {
     use crate::{protocol::ConnVersion, state::{Client, ClientMode}};
 
     /// A Basestation connection (so registrations are not relayed anywhere)
-    /// that negotiated `version`, plus the queue of what it is sent.
+    /// that announced `version`, plus the queue of what it is sent.
     async fn connect(state: &AppState, version: ConnVersion) -> (ClientId, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = uuid::Uuid::new_v4();
-        state.inner.write().await.clients.insert(id, Client { tx, mode: ClientMode::Basestation, version, remote_addr: None, connected_at_ms: 0, username: None });
+        state.inner.write().await.clients.insert(id, Client { tx, mode: ClientMode::Basestation, version, version_announced: true, remote_addr: None, connected_at_ms: 0, username: None });
         (id, rx)
     }
 
@@ -945,6 +946,27 @@ mod forwarding_tests {
         let v1_setup = with_mnemonic(protocol::build_circular_call_setup(&to_v1, 5001, 6003, 0), b"CTRL");
         handle_packet(state.clone(), caller, v1_setup.clone()).await;
         assert_eq!(drain(&mut v1_rx), vec![v1_setup]);
+    }
+
+    /// FlowStation without digest credentials: no X-Brew-Version anywhere and
+    /// never a mnemonic of its own, so v0 here -- but it parses the v1 tail
+    /// and shows the talker name, so it keeps getting it.
+    #[tokio::test]
+    async fn a_connection_that_announced_no_version_keeps_the_mnemonic() {
+        let state = AppState::for_test();
+        let (talker, _talker_rx) = connect(&state, ConnVersion::V1).await;
+        let (tx, mut silent_rx) = mpsc::unbounded_channel();
+        let silent = uuid::Uuid::new_v4();
+        state.inner.write().await.clients.insert(silent, Client { tx, mode: ClientMode::Basestation, version: ConnVersion::V0, version_announced: false, remote_addr: None, connected_at_ms: 0, username: None });
+        handle_packet(state.clone(), silent, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+
+        let v1_tx = with_mnemonic(protocol::build_group_tx(&uuid::Uuid::new_v4(), 1001, 91, 0), b"BOB");
+        handle_packet(state.clone(), talker, v1_tx.clone()).await;
+        assert_eq!(drain(&mut silent_rx), vec![v1_tx]);
+
+        let v1_setup = with_mnemonic(protocol::build_circular_call_setup(&uuid::Uuid::new_v4(), 5001, 6002, 0), b"CTRL");
+        handle_packet(state.clone(), talker, v1_setup.clone()).await;
+        assert_eq!(drain(&mut silent_rx), vec![v1_setup]);
     }
 
     fn setup_reject(id: &uuid::Uuid) -> Vec<u8> {
@@ -1049,7 +1071,7 @@ mod forwarding_tests {
     async fn connect_as(state: &AppState, mode: ClientMode) -> (ClientId, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = uuid::Uuid::new_v4();
-        state.inner.write().await.clients.insert(id, Client { tx, mode, version: ConnVersion::V0, remote_addr: None, connected_at_ms: 0, username: None });
+        state.inner.write().await.clients.insert(id, Client { tx, mode, version: ConnVersion::V0, version_announced: true, remote_addr: None, connected_at_ms: 0, username: None });
         (id, rx)
     }
 

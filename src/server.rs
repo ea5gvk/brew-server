@@ -113,18 +113,20 @@ fn check_brew_version(headers: &HeaderMap) -> Result<ConnVersion, Response> {
 /// both on the discovery GET (`discovered`); FlowStation sends neither on the
 /// upgrade itself, while brew-server peers up to 1.12 sent them only on the
 /// upgrade. An X-Brew-Mode on the upgrade wins; the version is the higher of
-/// the two, so neither request can demote the other.
-fn upgrade_mode_version(headers: &HeaderMap, discovered: Option<(ClientMode, ConnVersion)>) -> (ClientMode, ConnVersion) {
+/// the two, so neither request can demote the other, and `None` when neither
+/// announced one (see `Client::version_announced`).
+fn upgrade_mode_version(headers: &HeaderMap, discovered: Option<(ClientMode, Option<ConnVersion>)>) -> (ClientMode, Option<ConnVersion>) {
     let (mode, version) = discovered.unwrap_or_default();
     let mode = if headers.contains_key(X_BREW_MODE) { brew_mode(headers) } else { mode };
     // Only consulted when present, so a plain upgrade does not log the
-    // "seeding V0" fallback for a version discovery already settled.
-    let announced = if headers.contains_key(X_BREW_VERSION) {
-        check_brew_version(headers).unwrap_or(ConnVersion::V0)
-    } else {
-        ConnVersion::V0
+    // "seeding V0" fallback for a version discovery already settled; a value
+    // we cannot use announces nothing.
+    let announced = if headers.contains_key(X_BREW_VERSION) { check_brew_version(headers).ok() } else { None };
+    let version = match (version, announced) {
+        (Some(v), Some(a)) if a.as_u8() > v.as_u8() => Some(a),
+        (v, a) => v.or(a),
     };
-    (mode, if announced.as_u8() > version.as_u8() { announced } else { version })
+    (mode, version)
 }
 
 /// Loop-safe federation negotiation for one inbound connection: Ok(Some(neighbour_id))
@@ -150,8 +152,9 @@ async fn brew_discovery(
     let (mut parts, _body) = request.into_parts();
     let request_uri = parts.uri.path().to_string();
 
+    // `None` when the request announced no version at all.
     let seed_version = match check_brew_version(&parts.headers) {
-        Ok(v) => v,
+        Ok(v) => parts.headers.contains_key(X_BREW_VERSION).then_some(v),
         Err(resp) => return resp,
     };
 
@@ -254,7 +257,7 @@ async fn brew_session_endpoint(
     upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, username).await
 }
 
-async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>) -> Response {
+async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::request::Parts, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>) -> Response {
     // Decided on the upgrade's own headers, which every brew-server that
     // speaks it sends whether or not [auth] put a discovery GET in between.
     let own_id = state.inner.read().await.fed.self_id;
@@ -268,7 +271,7 @@ async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::reques
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=seed_version.as_u8(), loop_safe=fed_neighbour.is_some(), "WebSocket upgrade request");
+            debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=?seed_version.map(ConnVersion::as_u8), loop_safe=fed_neighbour.is_some(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
             let mut response = ws.protocols([protocol])
                 .on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username, fed_neighbour))
@@ -361,7 +364,7 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     Some(username.clone())
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: ConnVersion, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -371,9 +374,10 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
     // connected, but that is only half the story -- an inbound-only link (or
     // one that reconnects from the far end) would otherwise never learn about
     // registrations that predate it.
-    let client = Client { tx, mode, version: seed_version, remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() };
+    let version = seed_version.unwrap_or_default();
+    let client = Client { tx, mode, version, version_announced: seed_version.is_some(), remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() };
     crate::federation::attach_client(&state, id, client, fed_neighbour).await;
-    info!(%id, mode=mode.as_str(), version=seed_version.as_u8(), %remote_addr, username=username.as_deref().unwrap_or(""),
+    info!(%id, mode=mode.as_str(), version=version.as_u8(), version_announced=seed_version.is_some(), %remote_addr, username=username.as_deref().unwrap_or(""),
         loop_safe_neighbour=fed_neighbour.map(fedroute::format_server_id).unwrap_or_default(), "Basestation connected");
 
     // A federation link is pinged and closed once silent (see
@@ -435,9 +439,20 @@ mod tests {
     #[test]
     fn plain_upgrade_keeps_what_discovery_announced() {
         // FlowStation: mode/version on the discovery GET only.
-        let discovered = Some((ClientMode::Terminal, ConnVersion::V1));
-        assert_eq!(upgrade_mode_version(&headers(&[]), discovered), (ClientMode::Terminal, ConnVersion::V1));
-        assert_eq!(upgrade_mode_version(&headers(&[]), None), (ClientMode::Basestation, ConnVersion::V0));
+        let discovered = Some((ClientMode::Terminal, Some(ConnVersion::V1)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), discovered), (ClientMode::Terminal, Some(ConnVersion::V1)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), None), (ClientMode::Basestation, None));
+    }
+
+    #[test]
+    fn only_an_x_brew_version_announces_a_version() {
+        // FlowStation without digest credentials: no discovery GET, a bare upgrade.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Mode", "Basestation")]), None), (ClientMode::Basestation, None));
+        // An explicit v0, on either request.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Version", "0")]), None), (ClientMode::Basestation, Some(ConnVersion::V0)));
+        assert_eq!(upgrade_mode_version(&headers(&[]), Some((ClientMode::Basestation, Some(ConnVersion::V0)))), (ClientMode::Basestation, Some(ConnVersion::V0)));
+        // A value we cannot use is no announcement.
+        assert_eq!(upgrade_mode_version(&headers(&[("X-Brew-Version", "99")]), None), (ClientMode::Basestation, None));
     }
 
     #[test]
@@ -445,16 +460,16 @@ mod tests {
         // brew-server <= 1.12 dialling a server with [auth]: the discovery GET
         // carried nothing, so the session token holds the defaults.
         let upgrade = headers(&[("X-Brew-Mode", "Peer"), ("X-Brew-Version", "1")]);
-        let discovered = Some((ClientMode::Basestation, ConnVersion::V0));
-        assert_eq!(upgrade_mode_version(&upgrade, discovered), (ClientMode::Peer, ConnVersion::V1));
+        let discovered = Some((ClientMode::Basestation, None));
+        assert_eq!(upgrade_mode_version(&upgrade, discovered), (ClientMode::Peer, Some(ConnVersion::V1)));
     }
 
     #[test]
     fn upgrade_never_demotes_the_discovered_version() {
         let upgrade = headers(&[("X-Brew-Version", "0")]);
-        assert_eq!(upgrade_mode_version(&upgrade, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
+        assert_eq!(upgrade_mode_version(&upgrade, Some((ClientMode::Peer, Some(ConnVersion::V1)))), (ClientMode::Peer, Some(ConnVersion::V1)));
         let bogus = headers(&[("X-Brew-Version", "99")]);
-        assert_eq!(upgrade_mode_version(&bogus, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
+        assert_eq!(upgrade_mode_version(&bogus, Some((ClientMode::Peer, Some(ConnVersion::V1)))), (ClientMode::Peer, Some(ConnVersion::V1)));
     }
 
     #[test]
@@ -620,7 +635,8 @@ mod tests {
             assert!(response.starts_with(b"HTTP/1.1 200"));
         };
         // A bare upgrade, with the given User-Agent: the mode and version it
-        // was registered with, once it has gone again.
+        // was registered with (and whether the version was announced), once
+        // it has gone again.
         let connect = |agent: Option<&'static str>| {
             let state = state.clone();
             async move {
@@ -629,7 +645,7 @@ mod tests {
                 let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                 let registered = loop {
-                    let clients: Vec<_> = state.inner.read().await.clients.values().map(|c| (c.mode, c.version)).collect();
+                    let clients: Vec<_> = state.inner.read().await.clients.values().map(|c| (c.mode, c.version, c.version_announced)).collect();
                     if !clients.is_empty() || tokio::time::Instant::now() >= deadline { break clients; }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 };
@@ -640,7 +656,7 @@ mod tests {
                 registered
             }
         };
-        let defaults = vec![(ClientMode::Basestation, ConnVersion::V0)];
+        let defaults = vec![(ClientMode::Basestation, ConnVersion::V0, false)];
 
         // FlowStation: mode and version on the discovery GET, a bare upgrade
         // with the same User-Agent.
@@ -649,7 +665,7 @@ mod tests {
         assert_eq!(connect(Some("BlueStation/1")).await, defaults);
         assert_eq!(connect(None).await, defaults);
         // ...the one that announced it does, once.
-        assert_eq!(connect(Some("FlowStation/1")).await, vec![(ClientMode::Terminal, ConnVersion::V1)]);
+        assert_eq!(connect(Some("FlowStation/1")).await, vec![(ClientMode::Terminal, ConnVersion::V1, true)]);
         assert_eq!(connect(Some("FlowStation/1")).await, defaults);
 
         // Nothing is kept for a client that does not name itself...

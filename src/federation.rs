@@ -445,7 +445,7 @@ async fn run_peer_session(
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let connected_at_ms = crate::telemetry::now_ms();
     attach_client(&state, id, Client {
-        tx, mode: ClientMode::Peer, version: ConnVersion::V1, remote_addr, connected_at_ms, username: None,
+        tx, mode: ClientMode::Peer, version: ConnVersion::V1, version_announced: false, remote_addr, connected_at_ms, username: None,
     }, neighbour).await;
     info!(%id, peer = %peer.name, "federation: peer registered");
 

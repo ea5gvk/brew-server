@@ -57,6 +57,10 @@ pub struct Client {
     /// discovery `X-Brew-Version` header (if any) and promoted lazily as v1
     /// message layouts are observed on the wire.
     pub version: ConnVersion,
+    /// Whether the client announced `version` (an `X-Brew-Version` on its
+    /// discovery GET or upgrade) rather than it being the v0 default; see
+    /// `forward_version`.
+    pub version_announced: bool,
     /// Remote address of the WebSocket connection, when known. `None` for the
     /// virtual clients the SIP bridge registers (see `sip::bridge`), which
     /// have no real socket.
@@ -69,6 +73,19 @@ pub struct Client {
     /// clients). Used to match a live connection to its `[bts_locations]`
     /// entry on the dashboard map.
     pub username: Option<String>,
+}
+
+impl Client {
+    /// The layout CALL_GROUP_TX and CALL_SETUP_REQUEST are forwarded to this
+    /// connection in (see `protocol::adapt_to_version`). Only a connection
+    /// that announced v0 has the v1 mnemonic stripped; one that announced no
+    /// version gets them as sent, as it always did -- FlowStation without
+    /// digest credentials upgrades with no X-Brew headers and never sends a
+    /// mnemonic itself, so it stays v0 here, yet parses and shows the talker
+    /// name.
+    pub fn forward_version(&self) -> ConnVersion {
+        if self.version_announced { self.version } else { ConnVersion::V1 }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -138,14 +155,16 @@ pub struct Inner {
     pub group_floor: HashMap<u32, Uuid>,
     pub sds_routes: HashMap<Uuid, SdsRoute>,
     pub digest_nonces: HashMap<String, Instant>,
-    pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion, Option<String>)>,
+    /// Session token -> what the discovery GET announced: mode, version (`None`
+    /// when it sent no `X-Brew-Version`) and the digest username.
+    pub auth_sessions: HashMap<String, (Instant, ClientMode, Option<ConnVersion>, Option<String>)>,
     /// With `[auth]` disabled, what a client's discovery GET announced
     /// (`X-Brew-Mode` / `X-Brew-Version`) and the `User-Agent` it sent, for its
     /// WebSocket upgrade from the same address: a Basestation announces both
     /// on discovery only, and without a session token there is nothing else to
     /// carry them over. One per address; only an upgrade with the same
     /// `User-Agent` takes it, so another client behind the same NAT does not.
-    pub discovery_hints: HashMap<std::net::IpAddr, (Instant, String, ClientMode, ConnVersion)>,
+    pub discovery_hints: HashMap<std::net::IpAddr, (Instant, String, ClientMode, Option<ConnVersion>)>,
     /// (call/SDS uuid, source ISSI) -> (link it was accepted from, when): drops
     /// a copy of a call or SDS that reaches this server again over another
     /// peer link (see `fedroute::is_duplicate`).
@@ -211,7 +230,7 @@ mod basestation_count_tests {
 
     fn client(mode: ClientMode) -> Client {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Client { tx, mode, version: ConnVersion::default(), remote_addr: None, connected_at_ms: 0, username: None }
+        Client { tx, mode, version: ConnVersion::default(), version_announced: false, remote_addr: None, connected_at_ms: 0, username: None }
     }
 
     #[test]

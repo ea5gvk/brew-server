@@ -35,13 +35,16 @@ Unreleased adds:
   `CALL_GROUP_IDLE` / `CALL_RELEASE` a normal hangup would send (cause 14,
   "SwMI requested disconnection"). A group listener dropping no longer ends
   the call for everybody else.
-- **Talker names only to v1 connections.** `GROUP_TX` and `SETUP_REQUEST`
-  forwarded to a connection that negotiated Brew v0 lose the v1
-  `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client
-  announces on its discovery `GET` now also apply to its WebSocket upgrade
-  from the same address with the same `User-Agent` (FlowStation sends one on
-  both), so other clients behind the same NAT are unaffected; the `Peer` mode
-  is never carried over, a peer announces it on the upgrade itself.
+- **No talker names to v0 connections.** `GROUP_TX` and `SETUP_REQUEST`
+  forwarded to a connection that announced Brew v0 (`X-Brew-Version: 0`)
+  lose the v1 `mnemonic[34]` tail. A connection that announced no version
+  still gets them as sent: FlowStation without digest credentials upgrades
+  with no `X-Brew-*` header at all, yet shows the talker name. With `[auth]`
+  disabled, the mode and version a client announces on its discovery `GET`
+  now also apply to its WebSocket upgrade from the same address with the
+  same `User-Agent` (FlowStation sends one on both), so other clients behind
+  the same NAT are unaffected; the `Peer` mode is never carried over, a peer
+  announces it on the upgrade itself.
 - **Loop-safe federation (opt-in).** With `[federation] loop_safe = true` on
   both ends, peers negotiate it at connect time (`X-Brew-Federation` /
   `X-Brew-Server-Id`) and exchange path-vector route adverts instead of

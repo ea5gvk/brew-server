@@ -817,7 +817,7 @@ mod mesh_tests {
 
     fn connection(mode: ClientMode) -> (Client, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Client { tx, mode, version: ConnVersion::V1, remote_addr: None, connected_at_ms: 0, username: None }, rx)
+        (Client { tx, mode, version: ConnVersion::V1, version_announced: false, remote_addr: None, connected_at_ms: 0, username: None }, rx)
     }
 
     impl Net {
