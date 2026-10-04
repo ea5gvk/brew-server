@@ -1291,7 +1291,7 @@ const HA_PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta na
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const yn=b=>b?'yes':'no';
 const roleBadge=r=>`<span class="badge ha-${r}">${esc(r).toUpperCase()}</span>`;
-let admin=false,formLoaded=false;
+let admin=false,formLoaded=false,last=null;
 function replText(d){const r=d.replication;if(!r)return '-';if(!r.needed)return '<span class=muted>nothing to replicate</span>';
   if(d.role==='active')return r.connected?'serving the Standby':'<b>no Standby connected</b>';
   const ago=r.last_rx_ms_ago!=null?` <span class=muted>(${(r.last_rx_ms_ago/1000).toFixed(0)}s ago)</span>`:'';
@@ -1300,6 +1300,7 @@ function node(title,rows){return `<div class=bts-card><h3>${title}</h3><table>${
 async function load(){
   try{
     const d=await (await fetch('/api/ha')).json();
+    last=d;
     $('status').textContent='Live';
     $('ha-off').style.display=d.enabled?'none':'block';
     $('ha-actions').style.display=admin&&d.enabled?'block':'none';
@@ -1329,13 +1330,32 @@ async function post(url,body,out){
   const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.note||(typeof j.result==='string'?j.result:'done');}catch(e){}
   $(out).textContent=(r.ok?'':'Error: ')+msg;return r.ok;
 }
+// Confirmation texts name both nodes and spell out the consequences.
+const me=()=>last?last.node:'this node';
+const peerName=()=>last&&last.peer?last.peer.node:'the peer';
+const replNote=(who,ok)=>ok?'':`\n\nWarning: ${who}'s copy of the call history and SMS Center queue is not up to date; anything not copied yet stays behind.`;
 async function act(which){
-  if(!confirm(which==='active'?'Make this node Active? The peer hands over the VIP; its sessions reconnect here.':'Make this node Standby? The peer takes over the VIP; this node restarts.'))return;
+  const d=last||{},p=d.peer||{},r=d.replication||{};
+  const msg=which==='active'
+    ?`Make ${me()} Active?\n\n${peerName()} hands the VIP over to ${me()}. Basestations, peers and SIP calls on ${peerName()} are dropped and reconnect here; ${peerName()} restarts into Standby.\n\n${me()} then keeps the VIP (manual hold) until it leaves Active or a Persist button is pressed.`+replNote(me(),!r.needed||r.synced)
+    :`Make ${me()} Standby?\n\n${peerName()} takes over the VIP. Basestations, peers and SIP calls on ${me()} are dropped and reconnect to ${peerName()}; ${me()} restarts into Standby.\n\n${peerName()} then keeps the VIP (manual hold) until it leaves Active or a Persist button is pressed.`+replNote(peerName(),p.synced!==false);
+  if(!confirm(msg))return;
   await post('/api/ha/'+which,{},'act-result');load();
 }
-async function persist(v){await post('/api/ha/persist',{persist:v},'act-result');load();}
+async function persist(v){
+  if(v===null){
+    const c=window._haCfg?(window._haCfg.persist?'on':'off'):'the config file value';
+    if(!confirm(`Reset Persist on ${me()} to the config default (${c})?\n\nThis removes the dashboard override and ends any manual hold. If persist ends up off and ${peerName()} has the higher weight, ${peerName()} takes over the VIP once its copy of the data is up to date, and sessions on ${me()} reconnect there.`))return;
+  }
+  await post('/api/ha/persist',{persist:v},'act-result');load();
+}
 async function applyCfg(force){
-  if(!force&&!confirm('Apply the saved config file? This node restarts (handing over first if it is Active).'))return;
+  const d=last||{},changes=(d.pending_diff||[]).join(', ');
+  const what=changes?`Changes to apply: ${changes}`:'No setting changes are pending; this only restarts the node.';
+  const how=d.role==='active'
+    ?`${me()} is Active: it hands the VIP over to ${peerName()} first, then restarts. Sessions on ${me()} reconnect to ${peerName()}.`
+    :`${me()} is ${d.role||'not Active'}: it restarts; service on ${peerName()} is not affected.`;
+  if(!force&&!confirm(`Apply the saved config on ${me()}?\n\n${what}\n\n${how}`))return;
   const r=await fetch('/api/ha/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force})});
   const t=await r.text();
   if(!r.ok&&r.status===409&&!force){if(confirm(t+'\n\nRestart anyway?'))return applyCfg(true);}
