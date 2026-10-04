@@ -39,7 +39,9 @@ Unreleased adds:
   forwarded to a connection that negotiated Brew v0 lose the v1
   `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client
   announces on its discovery `GET` now also apply to its WebSocket upgrade
-  from the same address.
+  from the same address with the same `User-Agent` (FlowStation sends one on
+  both), so other clients behind the same NAT are unaffected; the `Peer` mode
+  is never carried over, a peer announces it on the upgrade itself.
 - **Loop-safe federation (opt-in).** With `[federation] loop_safe = true` on
   both ends, peers negotiate it at connect time (`X-Brew-Federation` /
   `X-Brew-Server-Id`) and exchange path-vector route adverts instead of

@@ -140,10 +140,12 @@ pub struct Inner {
     pub digest_nonces: HashMap<String, Instant>,
     pub auth_sessions: HashMap<String, (Instant, ClientMode, ConnVersion, Option<String>)>,
     /// With `[auth]` disabled, what a client's discovery GET announced
-    /// (`X-Brew-Mode` / `X-Brew-Version`), for its WebSocket upgrade from the
-    /// same address: a Basestation announces both on discovery only, and
-    /// without a session token there is nothing else to carry them over.
-    pub discovery_hints: HashMap<std::net::IpAddr, (Instant, ClientMode, ConnVersion)>,
+    /// (`X-Brew-Mode` / `X-Brew-Version`) and the `User-Agent` it sent, for its
+    /// WebSocket upgrade from the same address: a Basestation announces both
+    /// on discovery only, and without a session token there is nothing else to
+    /// carry them over. One per address; only an upgrade with the same
+    /// `User-Agent` takes it, so another client behind the same NAT does not.
+    pub discovery_hints: HashMap<std::net::IpAddr, (Instant, String, ClientMode, ConnVersion)>,
     /// (call/SDS uuid, source ISSI) -> (link it was accepted from, when): drops
     /// a copy of a call or SDS that reaches this server again over another
     /// peer link (see `fedroute::is_duplicate`).
@@ -375,7 +377,7 @@ impl AppState {
         let mut inner = self.inner.write().await;
         inner.digest_nonces.retain(|_, at| now.duration_since(*at) < Duration::from_secs(120));
         inner.auth_sessions.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
-        inner.discovery_hints.retain(|_, (at, _, _)| now.duration_since(*at) < session_ttl);
+        inner.discovery_hints.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
         inner.recent_calls.retain(|_, (_, at)| now.duration_since(*at) < crate::fedroute::CALL_DEDUP_WINDOW);
     }

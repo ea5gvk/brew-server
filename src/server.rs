@@ -69,6 +69,12 @@ fn brew_mode(headers: &HeaderMap) -> ClientMode {
     ClientMode::from_header(headers.get(X_BREW_MODE).and_then(|v| v.to_str().ok()))
 }
 
+/// The request's `User-Agent`, if it sent a non-empty one: what ties an
+/// upgrade to its own discovery GET when `[auth]` is disabled.
+fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(str::trim).filter(|ua| !ua.is_empty())
+}
+
 /// Validates the client's advertised `X-Brew-Version` header against the version
 /// this server implements and returns the connection's seed version. A missing
 /// header is accepted for backward compatibility and seeds `V0` (the version is
@@ -157,10 +163,17 @@ async fn brew_discovery(
     // Direct WS mode remains available only when Digest is disabled. A
     // Basestation announces its mode and version on the discovery GET and
     // upgrades without them, so pick up what the same address announced
-    // there (see `discovery_hints`); with no hint this is the upgrade's own
+    // there (see `discovery_hints`) -- only when the upgrade comes with the
+    // same User-Agent, as FlowStation's does, so another client behind the
+    // same NAT never inherits it. With no hint this is the upgrade's own
     // headers, as before.
     if is_upgrade && !state.config.auth.enabled {
-        let hint = state.inner.write().await.discovery_hints.remove(&remote_addr.ip()).map(|(_, m, v)| (m, v));
+        let hint = {
+            let mut inner = state.inner.write().await;
+            let agent = user_agent(&parts.headers);
+            let ours = inner.discovery_hints.get(&remote_addr.ip()).is_some_and(|(_, hinted, _, _)| Some(hinted.as_str()) == agent);
+            if ours { inner.discovery_hints.remove(&remote_addr.ip()).map(|(_, _, m, v)| (m, v)) } else { None }
+        };
         let (mode, seed_version) = upgrade_mode_version(&parts.headers, hint);
         return upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, None).await;
     }
@@ -182,8 +195,15 @@ async fn brew_discovery(
         ).into_response();
     }
 
-    if parts.headers.contains_key(X_BREW_MODE) || parts.headers.contains_key(X_BREW_VERSION) {
-        state.inner.write().await.discovery_hints.insert(remote_addr.ip(), (Instant::now(), mode, seed_version));
+    // Never for a peer: every brew-server announces Peer on the upgrade itself,
+    // and an address alone must not make some other client a peer (full table
+    // sync, relayed registrations).
+    let announced = parts.headers.contains_key(X_BREW_MODE) || parts.headers.contains_key(X_BREW_VERSION);
+    if announced && mode != ClientMode::Peer {
+        if let Some(agent) = user_agent(&parts.headers) {
+            let hint = (Instant::now(), agent.to_string(), mode, seed_version);
+            state.inner.write().await.discovery_hints.insert(remote_addr.ip(), hint);
+        }
     }
     (
         StatusCode::OK,
@@ -583,6 +603,7 @@ mod tests {
         use super::{brew_discovery, get, AppState, SocketAddr};
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         let state = AppState::for_test();
         let app = axum::Router::new().route("/brew", get(brew_discovery)).with_state(state.clone());
@@ -591,30 +612,51 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
         });
-        let connected = || async {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                let clients: Vec<_> = state.inner.read().await.clients.values().map(|c| (c.mode, c.version)).collect();
-                if !clients.is_empty() || tokio::time::Instant::now() >= deadline { return clients; }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let discover = |announce: &'static str| async move {
+            let mut http = tokio::net::TcpStream::connect(addr).await.unwrap();
+            http.write_all(format!("GET /brew HTTP/1.1\r\nHost: x\r\n{announce}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            http.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        };
+        // A bare upgrade, with the given User-Agent: the mode and version it
+        // was registered with, once it has gone again.
+        let connect = |agent: Option<&'static str>| {
+            let state = state.clone();
+            async move {
+                let mut request = format!("ws://{addr}/brew").into_client_request().unwrap();
+                if let Some(agent) = agent { request.headers_mut().insert("User-Agent", agent.parse().unwrap()); }
+                let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let registered = loop {
+                    let clients: Vec<_> = state.inner.read().await.clients.values().map(|c| (c.mode, c.version)).collect();
+                    if !clients.is_empty() || tokio::time::Instant::now() >= deadline { break clients; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                drop(ws);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !state.inner.read().await.clients.is_empty() { tokio::time::sleep(Duration::from_millis(20)).await; }
+                }).await.expect("closed connection cleaned up");
+                registered
             }
         };
+        let defaults = vec![(ClientMode::Basestation, ConnVersion::V0)];
 
-        // FlowStation: mode and version on the discovery GET, a bare upgrade.
-        let mut http = tokio::net::TcpStream::connect(addr).await.unwrap();
-        http.write_all(b"GET /brew HTTP/1.1\r\nHost: x\r\nX-Brew-Mode: Terminal\r\nX-Brew-Version: 1\r\nConnection: close\r\n\r\n").await.unwrap();
-        let mut response = Vec::new();
-        http.read_to_end(&mut response).await.unwrap();
-        assert!(response.starts_with(b"HTTP/1.1 200"));
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/brew")).await.unwrap();
-        assert_eq!(connected().await, vec![(ClientMode::Terminal, ConnVersion::V1)]);
-        drop(ws);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.inner.read().await.clients.is_empty() { tokio::time::sleep(Duration::from_millis(20)).await; }
-        }).await.expect("closed connection cleaned up");
+        // FlowStation: mode and version on the discovery GET, a bare upgrade
+        // with the same User-Agent.
+        discover("User-Agent: FlowStation/1\r\nX-Brew-Mode: Terminal\r\nX-Brew-Version: 1\r\n").await;
+        // Another client behind the same address does not take it...
+        assert_eq!(connect(Some("BlueStation/1")).await, defaults);
+        assert_eq!(connect(None).await, defaults);
+        // ...the one that announced it does, once.
+        assert_eq!(connect(Some("FlowStation/1")).await, vec![(ClientMode::Terminal, ConnVersion::V1)]);
+        assert_eq!(connect(Some("FlowStation/1")).await, defaults);
 
-        // The hint is used once: a later bare upgrade gets the defaults again.
-        let (_ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/brew")).await.unwrap();
-        assert_eq!(connected().await, vec![(ClientMode::Basestation, ConnVersion::V0)]);
+        // Nothing is kept for a client that does not name itself...
+        discover("X-Brew-Mode: Terminal\r\nX-Brew-Version: 1\r\n").await;
+        assert_eq!(connect(None).await, defaults);
+        // ...nor for a peer, which announces Peer on its own upgrade.
+        discover("User-Agent: brew-server/1\r\nX-Brew-Mode: Peer\r\nX-Brew-Version: 1\r\n").await;
+        assert_eq!(connect(Some("brew-server/1")).await, defaults);
     }
 }
