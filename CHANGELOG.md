@@ -26,6 +26,11 @@ Version 1.14.0 adds:
   persist, VIP holder, heartbeat and role-change log, plus a role badge in
   every page header. Admins can switch the Active node, set persist (kept
   in `ha-state.json`, no restart), edit `[ha]` and apply the saved config.
+  Make Active, Make Standby, Config default and Apply ask for confirmation,
+  naming both nodes and what drops, restarts or takes the VIP. Warnings
+  flag unapplied saved changes and a config that differs from the peer's,
+  and name the settings involved (never their values); the peer comparison
+  ignores `[ha]`, file paths, comments and formatting.
 - **No automatic config reload with HA.** With `[ha]` enabled, config file
   changes are applied only from the dashboard's **Apply saved config**,
   which hands an Active node over to its Standby before restarting it.

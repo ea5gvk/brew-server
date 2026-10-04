@@ -154,7 +154,12 @@ header shows this node's role.
 
 Admins (see `[dashboard] admins`) also get **Make Active**, **Make
 Standby**, **Persist On / Off / Config default**, **Apply saved config**,
-and a form for every `[ha]` setting.
+and a form for every `[ha]` setting. **Make Active**, **Make Standby**,
+**Config default** and **Apply saved config** ask for confirmation first,
+spelling out what happens: which node takes the VIP, which sessions drop and
+reconnect, which node restarts, the manual hold, the pending changes that
+Apply would load, and a warning when the node about to take over has an
+out-of-date copy of the history and SMS queue.
 
 ## Replication
 
