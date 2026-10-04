@@ -285,6 +285,9 @@ pub struct AppState {
     /// Active/standby role and dashboard commands (see `ha`). Always reports
     /// Active when `[ha]` is disabled.
     pub ha: crate::ha::HaHandle,
+    /// The history log, shared with `monitor` and `telemetry`; HA replication
+    /// reads and extends it. `None` with `[storage]` disabled.
+    pub store: Option<std::sync::Arc<crate::store::Store>>,
 }
 
 #[cfg(test)]
@@ -344,6 +347,7 @@ impl AppState {
                 aprs_tx,
                 sms_center,
                 ha,
+                store,
             },
             aprs_rx,
         )

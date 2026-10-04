@@ -17,6 +17,11 @@ Version 1.14.0 adds:
   that leaves Active restarts into Standby. Optional `check_gateway` keeps a
   node without an uplink from taking the VIP. See
   [High Availability](https://github.com/ysamouhos/brew-server/wiki/High-Availability).
+- **HA replication.** The Standby keeps a live copy of the Active node's
+  call/SDS history and SMS Center queue over an authenticated TCP link on
+  `heartbeat_port`, so a failover loses neither; history that moves between
+  the nodes is never duplicated. A returning higher-weight node takes over
+  only once its copy is up to date.
 - **High Availability dashboard page** (`/ha`): both nodes' role, weight,
   persist, VIP holder, heartbeat and role-change log, plus a role badge in
   every page header. Admins can switch the Active node, set persist (kept

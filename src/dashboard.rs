@@ -1255,7 +1255,7 @@ const HA_PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta na
 <span class=muted style="margin-left:12px">Persist:</span><button onclick="persist(true)">On</button><button onclick="persist(false)">Off</button><button onclick="persist(null)">Config default</button>
 <span class=muted style="margin-left:12px">Config:</span><button id=btn-apply onclick="applyCfg(false)">Apply saved config</button></div>
 <div class=ctl-result id=act-result></div>
-<p class=map-note style="color:#8fa2b8;font-size:12px">Make Active / Make Standby hand the VIP over to the other node, which then holds it (manual hold) until it leaves Active. Persist keeps the Active node Active even when a higher-weight peer comes back; the buttons override the config value until "Config default", and any of them ends a manual hold. While HA is enabled, config changes (here, on Settings, or in the file) take effect only through <b>Apply saved config</b>: an Active node hands over to the Standby first, then restarts. A node that leaves Active restarts into Standby, dropping its sessions so they reconnect to the new Active node through the VIP.</p>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Make Active / Make Standby hand the VIP over to the other node, which then holds it (manual hold) until it leaves Active. Persist keeps the Active node Active even when a higher-weight peer comes back; the buttons override the config value until "Config default", and any of them ends a manual hold. While HA is enabled, config changes (here, on Settings, or in the file) take effect only through <b>Apply saved config</b>: an Active node hands over to the Standby first, then restarts. A node that leaves Active restarts into Standby, dropping its sessions so they reconnect to the new Active node through the VIP. The Standby keeps a copy of the Active node's call/SDS history and SMS Center queue; a returning higher-weight node takes over only once its copy is up to date (manual switches do not wait).</p>
 </section>
 <section class=panel id=ha-form style="display:none"><h2>Settings</h2>
 <div class=ctl-row><label><input id=f-enabled type=checkbox> enabled</label><label>node name <input id=f-node_name></label><label>weight <input id=f-weight type=number min=0></label><label><input id=f-persist type=checkbox> persist</label></div>
@@ -1271,6 +1271,10 @@ const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>
 const yn=b=>b?'yes':'no';
 const roleBadge=r=>`<span class="badge ha-${r}">${esc(r).toUpperCase()}</span>`;
 let admin=false,formLoaded=false;
+function replText(d){const r=d.replication;if(!r)return '-';if(!r.needed)return '<span class=muted>nothing to replicate</span>';
+  if(d.role==='active')return r.connected?'serving the Standby':'<b>no Standby connected</b>';
+  const ago=r.last_rx_ms_ago!=null?` <span class=muted>(${(r.last_rx_ms_ago/1000).toFixed(0)}s ago)</span>`:'';
+  return (r.synced?'in sync':r.connected?'<b>catching up</b>':'<b>not connected</b>')+ago;}
 function node(title,rows){return `<div class=bts-card><h3>${title}</h3><table>${rows.map(([k,v])=>`<tr><th>${k}</th><td>${v}</td></tr>`).join('')}</table></div>`;}
 async function load(){
   try{
@@ -1288,9 +1292,10 @@ async function load(){
       $('ha-nodes').innerHTML=node(`This node: ${esc(d.node)} ${roleBadge(d.role)}`,[
         ['Weight',d.weight],['Persist',`${yn(d.persist)} <span class=muted>(${d.persist_source==='override'?'dashboard override':'config'})</span>`],
         ['Manual hold',yn(d.hold)],['VIP',`${esc(d.vip)} ${d.vip_held?'<b>held here</b>':'<span class=muted>not held</span>'}`],
-        ['Gateway check',d.gateway_ok?'ok':'<b>failing</b>'],['Handing over to',esc(d.handover_to||'-')]])
+        ['Gateway check',d.gateway_ok?'ok':'<b>failing</b>'],['Handing over to',esc(d.handover_to||'-')],
+        ['Replication',replText(d)],['Records from peer',d.replication&&d.replication.needed?`${d.replication.records_received} (+${d.replication.sms_snapshots_received} SMS queue snapshots)`:'-']])
       +node(p?`Peer: ${esc(p.node)} ${p.alive?roleBadge(p.role):roleBadge('down')}`:'Peer: never heard',p?[
-        ['Address',esc(p.ip)],['Weight',p.weight],['Persist',yn(p.persist)],['Manual hold',yn(p.hold)],
+        ['Address',esc(p.ip)],['Weight',p.weight],['Persist',yn(p.persist)],['Manual hold',yn(p.hold)],['Replica up to date',yn(p.synced)],
         ['Last heartbeat',`${(p.last_seen_ms_ago/1000).toFixed(1)}s ago`]]:[['Status','no heartbeat received yet']]);
       $('btn-active').disabled=d.role!=='standby';$('btn-standby').disabled=d.role!=='active';
     }

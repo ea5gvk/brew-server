@@ -148,9 +148,29 @@ Admins (see `[dashboard] admins`) also get **Make Active**, **Make
 Standby**, **Persist On / Off / Config default**, **Apply saved config**,
 and a form for every `[ha]` setting.
 
-## Not covered yet
+## Replication
 
-Call/SDS history (`brew-history.bin`) and the SMS Center queue are kept per
-node and are not yet replicated: after a failover the new Active node shows
-its own history, and messages queued on the other node wait until it is
-Active again.
+The Standby keeps a copy of the Active node's **call/SDS history**
+(`[storage]`) and **SMS Center queue** (`[sms_center]`), so a failover loses
+neither.
+
+- The Standby connects to the Active node's real IP on TCP `heartbeat_port`
+  (the same port number as the UDP heartbeat; allow both in a firewall).
+  Both sides authenticate with `shared_secret`. The stream is not encrypted:
+  keep the pair on a trusted network.
+- History is streamed from where the Standby left off (kept in
+  `<state_path>.repl.json`, e.g. `ha-state.repl.json`) and then followed
+  live. Records that already exist on the Standby are skipped, so history
+  that went back and forth between the nodes is never duplicated.
+- The SMS Center queue is sent in full whenever it changes and replaces the
+  Standby's.
+- A node returning after a failure takes the VIP back by weight only once
+  its copy is up to date (the dashboard shows *Replication: in sync* and
+  *Replica up to date* on the peer). Failover itself never waits, and
+  neither do Make Active / Make Standby.
+
+Live state (registrations, affiliations, calls in progress) is not
+replicated: Basestations re-register when they reconnect, and calls in
+progress drop. The SMS Center page on the Standby shows the replicated
+queue; change it on the Active node, since the next update from the Active
+node replaces the Standby's copy.

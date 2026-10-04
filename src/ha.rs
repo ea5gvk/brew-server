@@ -70,6 +70,14 @@ pub struct Heartbeat {
     pub takeover_request: bool,
     /// Hash of the config file, so the dashboard can flag a mismatch.
     pub config_hash: u64,
+    /// This node holds an up-to-date replica of the Active node's history
+    /// and SMS queue (always true when there is nothing to replicate).
+    #[serde(default = "yes")]
+    pub synced: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The parts of the peer's heartbeat the election looks at.
@@ -83,6 +91,7 @@ pub struct PeerView {
     pub handover_to: Option<String>,
     pub handover_manual: bool,
     pub takeover_request: bool,
+    pub synced: bool,
 }
 
 impl From<&Heartbeat> for PeerView {
@@ -96,6 +105,7 @@ impl From<&Heartbeat> for PeerView {
             handover_to: h.handover_to.clone(),
             handover_manual: h.handover_manual,
             takeover_request: h.takeover_request,
+            synced: h.synced,
         }
     }
 }
@@ -270,7 +280,9 @@ impl Election {
                 } else if p.takeover_request {
                     let to = p.node.clone();
                     self.start_handover(&to, true, now_ms);
-                } else if !self.persist && !self.hold && Self::preferred(them, me) {
+                } else if !self.persist && !self.hold && p.synced && Self::preferred(them, me) {
+                    // Preempt only once the peer holds a current replica, so
+                    // no history or queued SMS is lost by handing over.
                     let to = p.node.clone();
                     self.start_handover(&to, false, now_ms);
                 }
@@ -391,11 +403,21 @@ impl Vip {
             .context("running `ip`")
     }
 
+    /// Whether the VIP is currently configured on the interface. Used to
+    /// judge a failed add/del, since `ip`'s error wording varies by version.
+    async fn present(&self) -> bool {
+        let out = tokio::process::Command::new("ip")
+            .args(["-o", "-4", "addr", "show", "dev", &self.iface])
+            .output()
+            .await;
+        out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(" {} ", self.cidr)))
+    }
+
     /// Adds the VIP (already present is fine) and announces it.
     pub async fn up(&self) -> Result<()> {
         let out = self.ip("add").await?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() && !stderr.contains("File exists") {
+        if !out.status.success() && !self.present().await {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("ip addr add {} dev {}: {}", self.cidr, self.iface, stderr.trim());
         }
         // Unsolicited ARP so switches and Basestations repoint the VIP at us.
@@ -414,9 +436,8 @@ impl Vip {
     /// Removes the VIP (already absent is fine).
     pub async fn down(&self) -> Result<()> {
         let out = self.ip("del").await?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let absent = stderr.contains("Cannot assign requested address") || stderr.contains("Address not found");
-        if !out.status.success() && !absent {
+        if !out.status.success() && self.present().await {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("ip addr del {} dev {}: {}", self.cidr, self.iface, stderr.trim());
         }
         Ok(())
@@ -454,6 +475,7 @@ pub struct HaStatus {
     pub peer: Option<PeerStatus>,
     pub config_hash: u64,
     pub transitions: VecDeque<Transition>,
+    pub replication: Option<crate::ha_repl::ReplView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -467,6 +489,7 @@ pub struct PeerStatus {
     pub hold: bool,
     pub last_seen_ms_ago: u64,
     pub config_hash: u64,
+    pub synced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -491,6 +514,8 @@ pub enum HaCommand {
 /// Shared between the HA task and the rest of the server.
 pub struct HaHandle {
     pub status: watch::Sender<HaStatus>,
+    /// Replication progress (see `ha_repl`).
+    pub repl: crate::ha_repl::ReplStatus,
     pub commands: mpsc::UnboundedSender<HaCommand>,
     commands_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<HaCommand>>>,
 }
@@ -513,8 +538,9 @@ impl HaHandle {
             peer: None,
             config_hash,
             transitions: VecDeque::new(),
+            replication: None,
         };
-        Self { status: watch::channel(status).0, commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
+        Self { status: watch::channel(status).0, repl: Default::default(), commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
     }
 
     /// Sends a dashboard command to the HA task and waits for its answer.
@@ -527,6 +553,10 @@ impl HaHandle {
             Ok(Ok(r)) => r,
             _ => Err("HA task did not answer".into()),
         }
+    }
+
+    pub fn role(&self) -> Role {
+        self.status.borrow().role
     }
 
     /// Resolves once this node is Active (immediately with HA disabled).
@@ -774,6 +804,7 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
             handover_manual: election.handover_target().is_some_and(|(_, m)| m),
             takeover_request: election.takeover_requested(now),
             config_hash,
+            synced: crate::ha_repl::synced(&state),
         };
         if let Err(e) = sock.send_to(&encode(&key, &hb), peer_addr).await {
             // Expected while the peer host is down (ICMP unreachable).
@@ -798,7 +829,9 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
                 hold: lp.hb.hold,
                 last_seen_ms_ago: now.saturating_sub(lp.at_ms),
                 config_hash: lp.hb.config_hash,
+                synced: lp.hb.synced,
             });
+            s.replication = Some(state.ha.repl.view(crate::ha_repl::needed(&state), now));
             if before != after {
                 s.transitions.push_front(Transition { ts_ms: now, from: before, to: after, reason: reason.clone() });
                 s.transitions.truncate(TRANSITION_LOG_LEN);
@@ -887,6 +920,7 @@ mod tests {
             handover_to: None,
             handover_manual: false,
             takeover_request: false,
+            synced: true,
         }
     }
 
@@ -943,6 +977,14 @@ mod tests {
         // b clears the handover once a is Active, and stays Standby.
         assert_eq!(b.tick(10, Some(&peer("a", Role::Active, 200)), true), Role::Standby);
         assert_eq!(b.handover_target(), None);
+    }
+
+    #[test]
+    fn no_preemption_until_peer_is_synced() {
+        let mut b = running("b", 100, Role::Active);
+        let unsynced = PeerView { synced: false, ..peer("a", Role::Standby, 200) };
+        assert_eq!(b.tick(0, Some(&unsynced), true), Role::Active);
+        assert_eq!(b.tick(10, Some(&peer("a", Role::Standby, 200)), true), Role::Standby);
     }
 
     #[test]
@@ -1050,7 +1092,7 @@ mod tests {
         let hb = Heartbeat {
             node: "a".into(), boot_id: 1, seq: 1, ts_ms: 1000, role: Role::Active, weight: 200,
             persist: false, hold: false, handover_to: None, handover_manual: false,
-            takeover_request: false, config_hash: 7,
+            takeover_request: false, config_hash: 7, synced: true,
         };
         let mut wire = encode(&key, &hb);
         assert_eq!(decode(&key, &wire), Some(hb));
@@ -1066,7 +1108,7 @@ mod tests {
         let mut hb = Heartbeat {
             node: "a".into(), boot_id: 1, seq: 5, ts_ms: 100_000, role: Role::Active, weight: 1,
             persist: false, hold: false, handover_to: None, handover_manual: false,
-            takeover_request: false, config_hash: 0,
+            takeover_request: false, config_hash: 0, synced: true,
         };
         assert!(g.accept(&hb, 100_000));
         assert!(!g.accept(&hb, 100_000), "same seq");

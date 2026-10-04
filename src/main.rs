@@ -6,6 +6,7 @@ mod federation;
 mod fedroute;
 mod fsnet;
 mod ha;
+mod ha_repl;
 mod monitor;
 mod position;
 mod protocol;
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::try_join!(
         ha::run(state.clone()),
+        ha_repl::run(state.clone()),
         dashboard::run(state.clone()),
         services(state.clone(), aprs_rx),
     )?;
