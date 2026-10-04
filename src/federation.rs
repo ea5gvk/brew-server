@@ -70,12 +70,28 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+/// `User-Agent` this server identifies itself with when dialling a peer.
+const USER_AGENT: &str = concat!("brew-server/", env!("CARGO_PKG_VERSION"));
+
 /// Sends one plain (non-upgrade) `GET`, closes the connection after reading
 /// the response. Used only for the discovery/digest pre-flight -- the actual
 /// WebSocket upgrade is a separate connection via `tokio_tungstenite`.
+///
+/// Every request -- the unauthenticated first one and the digest retry alike
+/// -- announces `X-Brew-Mode: Peer` and `X-Brew-Version`, the way a
+/// Basestation announces its own mode on discovery. That matters: with
+/// `[auth]` enabled, the far end records the mode of the *authorized*
+/// discovery request in the session token and ignores whatever the upgrade
+/// says, so without them this link used to be registered over there as a
+/// Basestation (no table sync, no relay) and federation only worked in one
+/// direction. Some Brew servers also refuse a discovery without a
+/// `User-Agent` (400).
 async fn http_get(remote_host: &str, path: &str, authorization: Option<&str>) -> anyhow::Result<HttpResponse> {
     let mut stream = TcpStream::connect(remote_host).await?;
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {remote_host}\r\nConnection: close\r\n");
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {remote_host}\r\nUser-Agent: {USER_AGENT}\r\nX-Brew-Mode: Peer\r\nX-Brew-Version: {}\r\nConnection: close\r\n",
+        protocol::BREW_PROTOCOL_VERSION,
+    );
     if let Some(a) = authorization {
         req.push_str(&format!("Authorization: {a}\r\n"));
     }
@@ -140,6 +156,9 @@ async fn connect_and_run(state: &Arc<AppState>, peer: &FederationPeerConfig) -> 
 
     let ws_url = format!("ws://{}{}", peer.remote_host, normalize_path(&ws_path));
     let mut request = ws_url.into_client_request()?;
+    request.headers_mut().insert("User-Agent", USER_AGENT.parse()?);
+    // Also on the upgrade, not just discovery: a peer with `[auth]` disabled
+    // takes the mode straight from the upgrade request.
     request.headers_mut().insert("X-Brew-Mode", "Peer".parse()?);
     request.headers_mut().insert("X-Brew-Version", protocol::BREW_PROTOCOL_VERSION.to_string().parse()?);
     request.headers_mut().insert("Sec-WebSocket-Protocol", "brew".parse()?);
@@ -216,5 +235,72 @@ pub async fn sync_peer(state: &Arc<AppState>, tx: &mpsc::UnboundedSender<Vec<u8>
         if !groups.is_empty() {
             let _ = tx.send(protocol::build_subscriber_message(protocol::SUB_AFFILIATE, issi, &groups));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Loopback HTTP server: answers one connection per entry of `responses`,
+    /// in order, and returns the request head each connection sent.
+    async fn http_stub(responses: Vec<&'static str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 1024];
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    if n == 0 { break; }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                requests.push(String::from_utf8(buf).unwrap());
+                sock.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (addr, handle)
+    }
+
+    fn assert_identifies_as_peer(request: &str) {
+        let expected_ua = format!("User-Agent: brew-server/{}\r\n", env!("CARGO_PKG_VERSION"));
+        assert!(request.contains(&expected_ua), "no User-Agent in {request:?}");
+        assert!(request.contains("X-Brew-Mode: Peer\r\n"), "no X-Brew-Mode in {request:?}");
+        let expected_version = format!("X-Brew-Version: {}\r\n", protocol::BREW_PROTOCOL_VERSION);
+        assert!(request.contains(&expected_version), "no X-Brew-Version in {request:?}");
+    }
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n/brew/";
+
+    #[tokio::test]
+    async fn discovery_without_auth_identifies_as_peer() {
+        let (addr, server) = http_stub(vec![OK]).await;
+        let peer = FederationPeerConfig { remote_host: addr, ..Default::default() };
+        assert_eq!(discover(&peer, "/brew").await.unwrap(), "/brew/");
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("GET /brew HTTP/1.1\r\n"));
+        assert_identifies_as_peer(&requests[0]);
+    }
+
+    #[tokio::test]
+    async fn both_digest_requests_identify_as_peer() {
+        // The far end keeps the mode of the *authorized* request, so the
+        // retry must carry the headers as well as the first attempt.
+        let challenge = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, server) = http_stub(vec![challenge, OK]).await;
+        let peer = FederationPeerConfig {
+            remote_host: addr, username: "9000001".into(), password: "secret".into(), ..Default::default()
+        };
+        assert_eq!(discover(&peer, "/brew").await.unwrap(), "/brew/");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in &requests { assert_identifies_as_peer(request); }
+        assert!(!requests[0].contains("Authorization:"));
+        assert!(requests[1].contains("Authorization: Digest username=\"9000001\""));
     }
 }

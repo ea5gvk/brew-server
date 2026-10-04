@@ -2,6 +2,18 @@
 
 All notable changes to brew-server, newest first.
 
+Unreleased adds:
+
+- **Federation discovery identifies the peer.** The discovery `GET` of an
+  outbound peer link now carries `User-Agent: brew-server/<version>`,
+  `X-Brew-Mode: Peer` and `X-Brew-Version`. With `[auth]` enabled the far
+  end takes the mode from that request, so between two brew-servers the link
+  used to be registered there as a Basestation (no table sync, no relay) and
+  federation only worked in one direction; servers that require a
+  User-Agent on discovery no longer refuse the link. Inbound, a peer that
+  announces its mode and version only on the WebSocket upgrade (brew-server
+  1.12 and older) is now recognised too.
+
 Version 1.12.0 adds:
 
 - **Basestation version.** Each Basestation card shows the software version

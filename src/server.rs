@@ -103,6 +103,24 @@ fn check_brew_version(headers: &HeaderMap) -> Result<ConnVersion, Response> {
     }
 }
 
+/// Mode and seed version a WebSocket upgrade runs with. Brew clients announce
+/// both on the discovery GET (`discovered`); FlowStation sends neither on the
+/// upgrade itself, while brew-server peers up to 1.12 sent them only on the
+/// upgrade. An X-Brew-Mode on the upgrade wins; the version is the higher of
+/// the two, so neither request can demote the other.
+fn upgrade_mode_version(headers: &HeaderMap, discovered: Option<(ClientMode, ConnVersion)>) -> (ClientMode, ConnVersion) {
+    let (mode, version) = discovered.unwrap_or_default();
+    let mode = if headers.contains_key(X_BREW_MODE) { brew_mode(headers) } else { mode };
+    // Only consulted when present, so a plain upgrade does not log the
+    // "seeding V0" fallback for a version discovery already settled.
+    let announced = if headers.contains_key(X_BREW_VERSION) {
+        check_brew_version(headers).unwrap_or(ConnVersion::V0)
+    } else {
+        ConnVersion::V0
+    };
+    (mode, if announced.as_u8() > version.as_u8() { announced } else { version })
+}
+
 async fn brew_discovery(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -181,11 +199,15 @@ async fn brew_session_endpoint(
 
     // Session URLs are single-use. The established WebSocket is the authenticated
     // session. Recover the mode, seed version and authenticated username
-    // captured during the discovery GET; the WebSocket handshake itself
-    // carries neither the X-Brew-Mode/X-Brew-Version headers nor Authorization.
-    let (mode, seed_version, username) = state.inner.write().await.auth_sessions.remove(&token)
+    // captured during the discovery GET; a Basestation's WebSocket handshake
+    // carries neither the X-Brew-Mode/X-Brew-Version headers nor
+    // Authorization. Older brew-server peers announce mode and version only
+    // on the handshake, so those still count when present (see
+    // `upgrade_mode_version`).
+    let (stored_mode, stored_version, username) = state.inner.write().await.auth_sessions.remove(&token)
         .map(|(_, mode, ver, user)| (mode, ver, user))
         .unwrap_or_default();
+    let (mode, seed_version) = upgrade_mode_version(&parts.headers, Some((stored_mode, stored_version)));
     upgrade_from_parts(state, &mut parts, mode, seed_version, remote_addr, username).await
 }
 
@@ -314,7 +336,38 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_brew_username;
+    use super::{is_valid_brew_username, upgrade_mode_version, ClientMode, ConnVersion, HeaderMap};
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs { h.insert(*k, v.parse().unwrap()); }
+        h
+    }
+
+    #[test]
+    fn plain_upgrade_keeps_what_discovery_announced() {
+        // FlowStation: mode/version on the discovery GET only.
+        let discovered = Some((ClientMode::Terminal, ConnVersion::V1));
+        assert_eq!(upgrade_mode_version(&headers(&[]), discovered), (ClientMode::Terminal, ConnVersion::V1));
+        assert_eq!(upgrade_mode_version(&headers(&[]), None), (ClientMode::Basestation, ConnVersion::V0));
+    }
+
+    #[test]
+    fn old_peer_announcing_on_upgrade_only_is_recognised() {
+        // brew-server <= 1.12 dialling a server with [auth]: the discovery GET
+        // carried nothing, so the session token holds the defaults.
+        let upgrade = headers(&[("X-Brew-Mode", "Peer"), ("X-Brew-Version", "1")]);
+        let discovered = Some((ClientMode::Basestation, ConnVersion::V0));
+        assert_eq!(upgrade_mode_version(&upgrade, discovered), (ClientMode::Peer, ConnVersion::V1));
+    }
+
+    #[test]
+    fn upgrade_never_demotes_the_discovered_version() {
+        let upgrade = headers(&[("X-Brew-Version", "0")]);
+        assert_eq!(upgrade_mode_version(&upgrade, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
+        let bogus = headers(&[("X-Brew-Version", "99")]);
+        assert_eq!(upgrade_mode_version(&bogus, Some((ClientMode::Peer, ConnVersion::V1))), (ClientMode::Peer, ConnVersion::V1));
+    }
 
     #[test]
     fn accepts_1_to_7_digits() {
