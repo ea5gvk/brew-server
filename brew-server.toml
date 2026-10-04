@@ -276,3 +276,30 @@ reconnect_interval_seconds = 15
 name = "Athens HQ"
 lat = 37.9917
 lon = 23.7640
+
+# Active/standby high availability: two brew-servers on the same LAN / Layer 2
+# segment (or the same host, each with its own real IP) share one virtual IP.
+# Basestations, terminals and federation peers connect to the VIP; when the
+# Active node fails, the Standby takes the VIP over (ip addr + gratuitous ARP)
+# and they simply reconnect. Needs CAP_NET_ADMIN and CAP_NET_RAW, plus the
+# `ip` and `arping` (iputils) commands. Both nodes use the same vip,
+# heartbeat_port and shared_secret; node_name, weight, real_ip and peer_ip
+# differ. While HA is enabled, edits to this file are NOT applied
+# automatically: apply them from the dashboard's /ha page.
+[ha]
+enabled = false
+node_name = "bs-a"
+weight = 200                  # higher weight is the preferred Active node
+persist = false               # true: once this node is Active it stays Active,
+                              # even when a higher-weight peer comes back
+                              # (the dashboard can override this at runtime)
+vip = "192.0.2.100/24"
+vip_interface = "eth0"
+real_ip = "192.0.2.11"        # this node: heartbeat bind + always-on dashboard
+peer_ip = "192.0.2.12"        # the other node's real IP
+heartbeat_port = 9010         # UDP
+heartbeat_interval_ms = 500
+dead_after_ms = 2000
+shared_secret = "change-me"   # HMAC-SHA256 key for heartbeats
+check_gateway = ""            # optional: refuse Active if this IP doesn't answer ping
+state_path = "ha-state.json"  # runtime toggles set from the dashboard

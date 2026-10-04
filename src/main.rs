@@ -5,6 +5,7 @@ mod dashboard;
 mod federation;
 mod fedroute;
 mod fsnet;
+mod ha;
 mod monitor;
 mod position;
 mod protocol;
@@ -35,8 +36,14 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(state);
 
     // Watch the config file; when it changes, restart the whole process so the
-    // new configuration takes effect from a clean state.
-    tokio::spawn(config_watcher(path.clone()));
+    // new configuration takes effect from a clean state. Not with HA enabled:
+    // a restart of the Active node is a failover, so there changes are only
+    // applied when an admin asks for it from the dashboard.
+    if state.config.ha.enabled {
+        tracing::info!("HA enabled: config file changes are applied from the dashboard only");
+    } else {
+        tokio::spawn(config_watcher(path.clone()));
+    }
 
     if state.config.max_call_duration_seconds > 0 || state.config.call_inactivity_timeout_seconds > 0 {
         tokio::spawn(router::run_call_duration_sweep(state.clone()));
@@ -47,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(sms_center::run(state.clone()));
 
     tokio::try_join!(
+        ha::run(state.clone()),
         server::run(state.clone()),
         telemetry::run(state.clone()),
         control::run(state.clone()),

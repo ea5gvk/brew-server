@@ -282,6 +282,9 @@ pub struct AppState {
     pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
     /// Store-and-forward queue for SDS to offline subscribers.
     pub sms_center: crate::sms_center::SmsCenter,
+    /// Active/standby role and dashboard commands (see `ha`). Always reports
+    /// Active when `[ha]` is disabled.
+    pub ha: crate::ha::HaHandle,
 }
 
 #[cfg(test)]
@@ -327,6 +330,8 @@ impl AppState {
         };
         let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
         let sms_center = crate::sms_center::SmsCenter::open(config.sms_center.clone());
+        let config_hash = crate::ha::config_hash(&std::fs::read_to_string(&config_path).unwrap_or_default());
+        let ha = crate::ha::HaHandle::new(&config.ha, config_hash);
         (
             Self {
                 config,
@@ -338,6 +343,7 @@ impl AppState {
                 sip: RwLock::new(None),
                 aprs_tx,
                 sms_center,
+                ha,
             },
             aprs_rx,
         )

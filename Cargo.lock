@@ -173,6 +173,7 @@ name = "brew-server"
 version = "1.13.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "axum",
  "axum-server",
  "base64",

@@ -26,6 +26,8 @@ tokio-tungstenite = "0.29.0"
 # feature set, so no new crates are pulled in.
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 tokio-rustls = { version = "0.26", default-features = false }
+# HMAC-SHA256 for HA heartbeats; already in the tree through rustls.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 
 [build-dependencies]
 cc = "1"
