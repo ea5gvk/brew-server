@@ -40,6 +40,13 @@ Unreleased adds:
   `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client
   announces on its discovery `GET` now also apply to its WebSocket upgrade
   from the same address.
+- **Duplicate calls and SDS across peer links are dropped.** A `GROUP_TX`,
+  private `SETUP_REQUEST` or SDS reaching a server a second time over another
+  peer link (a ring, a mesh, two links between the same servers) is
+  recognised by (uuid, source ISSI) and dropped, instead of taking the call
+  over and being forwarded again; a late copy within 5 s of the call ending
+  no longer brings it back. A talker change inside a group call (same uuid,
+  another ISSI) is still accepted. Basestation traffic is never checked.
 
 Version 1.12.0 adds:
 

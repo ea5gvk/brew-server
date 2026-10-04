@@ -6,7 +6,7 @@ use crate::{
         CALL_SIMPLEX_IDLE, FRAME_SDS_REPORT, FRAME_SDS_TRANSFER, FRAME_TRAFFIC_CHANNEL,
         SUB_AFFILIATE, SUB_DEAFFILIATE, SUB_DEREGISTER, SUB_REGISTER, SUB_REREGISTER,
     },
-    state::{ActiveCall, AppState, CallKind, ClientId, SdsRoute, Subscriber},
+    state::{ActiveCall, AppState, CallKind, ClientId, ClientMode, Inner, SdsRoute, Subscriber},
 };
 use std::{collections::{HashMap, HashSet}, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
@@ -119,6 +119,14 @@ pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>)
 async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::GroupTransmission(gt) = payload else { return };
     let mut inner = state.inner.write().await;
+    let now = Instant::now();
+    // The same transmission reaching us again over another peer link (a ring,
+    // a mesh, a redundant link): drop it before it can pre-empt or take over
+    // the call it duplicates.
+    if is_peer(&inner, source) && crate::fedroute::is_duplicate(&inner, id, gt.source, source, now) {
+        debug!(%source, uuid=%id, src_issi=gt.source, gssi=gt.destination, "duplicate GROUP_TX from a second peer link dropped");
+        return;
+    }
     let mut preempted = None;
 
     if !state.config.allow_multiple_calls_per_group {
@@ -186,6 +194,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         started_at: std::time::Instant::now(),
         last_activity_ms: ActiveCall::new_activity(),
     });
+    crate::fedroute::note_call(&mut inner, id, gt.source, source, now);
     // Each recipient gets the GROUP_TX in the layout it negotiated: a v0
     // connection must not be handed the v1 talker-name tail.
     let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| (c.tx.clone(), c.version))).collect::<Vec<_>>();
@@ -206,6 +215,19 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
 
 async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::ShortTransfer { source: source_issi, destination } = payload else { return };
+    // A copy of an SDS already accepted over another peer link: dropped
+    // before its position is reported (APRS, telemetry) a second time.
+    // Checked and noted in one critical section, so two copies racing in
+    // over two links cannot both pass.
+    {
+        let mut inner = state.inner.write().await;
+        let now = Instant::now();
+        if is_peer(&inner, source) && crate::fedroute::is_duplicate(&inner, id, source_issi, source, now) {
+            debug!(%source, uuid=%id, source_issi, destination, "duplicate SDS from a second peer link dropped");
+            return;
+        }
+        crate::fedroute::note_call(&mut inner, id, source_issi, source, now);
+    }
     // TEMPORARY (position debugging): SHORT_TRANSFER sometimes carries the SDS
     // user-data inline. Dump it and try a position decode here too, so a beacon
     // that never produces a separate SDS_TRANSFER frame is still caught.
@@ -253,6 +275,7 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
     // was undeliverable) to recover the source ISSI and any delivery targets.
     let (source_issi, txs, store_for) = {
         let mut inner = state.inner.write().await;
+        let from_peer = is_peer(&inner, source);
         match inner.sds_routes.get_mut(&id) {
             Some(route) if route.source_client == source => {
                 // Store at most once per transaction, even if a client repeats the frame.
@@ -261,6 +284,9 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
                 let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
                 (source_issi, txs, store_for)
             }
+            // Over a second peer link this is the payload of a duplicate SDS
+            // (its header was dropped), expected in a ring or mesh.
+            Some(_) if from_peer => { debug!(%source, uuid=%id, "SDS_TRANSFER from non-originating peer link"); return; }
             Some(_) => { warn!(%source, uuid=%id, "SDS_TRANSFER from non-originating client"); return; }
             None => { warn!(uuid=%id, "SDS_TRANSFER without SHORT_TRANSFER (position may still decode)"); (0u32, Vec::new(), None) }
         }
@@ -393,6 +419,14 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
         },
     };
     let mut inner = state.inner.write().await;
+    // A copy of a setup already accepted over another peer link: dropped
+    // silently -- never rejected, never offered to SIP a second time.
+    let now = Instant::now();
+    if is_peer(&inner, source) && crate::fedroute::is_duplicate(&inner, id, source_issi, source, now) {
+        debug!(%source, uuid=%id, source_issi, destination, "duplicate private SETUP_REQUEST from a second peer link dropped");
+        return;
+    }
+    crate::fedroute::note_call(&mut inner, id, source_issi, source, now);
     let Some(target_client) = inner.subscribers.get(&destination).map(|s| s.client_id) else {
         drop(inner);
         // The destination is not a registered Brew subscriber. Before giving up,
@@ -503,7 +537,13 @@ async fn call_frame_recipients(state: &Arc<AppState>, source: ClientId, id: uuid
     let Some(call) = inner.calls.get(&id) else { debug!(uuid=%id, "{kind} frame for unknown call"); return None; };
     let mut allowed = call.peers.contains(&source) || call.owner == source;
     if call.kind == CallKind::Group { allowed = call.owner == source; }
-    if !allowed { warn!(%source, uuid=%id, "{kind} frame from non-participant"); return None; }
+    if !allowed {
+        // A peer link still sending the stream of a duplicate it was not
+        // accepted from (ring, mesh): expected, so not worth a warning.
+        if is_peer(&inner, source) { debug!(%source, uuid=%id, "{kind} frame from non-participant peer link"); }
+        else { warn!(%source, uuid=%id, "{kind} frame from non-participant"); }
+        return None;
+    }
     call.touch();
     let mut recipients = call.peers.clone();
     if call.kind == CallKind::Private { recipients.insert(call.owner); }
@@ -577,6 +617,9 @@ async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: 
     if !participant { inner.calls.insert(id, call); return; }
     if call.kind == CallKind::Group && call.owner != source { inner.calls.insert(id, call); return; }
     if call.kind == CallKind::Group && inner.group_floor.get(&call.destination) == Some(&id) { inner.group_floor.remove(&call.destination); }
+    // A copy of the call's setup still on its way over another peer link must
+    // not bring it back as a zombie that holds the group floor.
+    crate::fedroute::note_call(&mut inner, id, call.source_issi, call.owner, Instant::now());
     let mut recipients = call.peers.clone();
     if call.kind == CallKind::Private { recipients.insert(call.owner); }
     recipients.remove(&source);
@@ -594,6 +637,12 @@ async fn end_call(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, raw: 
             bridge.teardown_by_brew_call(id).await;
         }
     }
+}
+
+/// Whether `client` is a federation peer link (only such traffic is checked
+/// for duplicates).
+fn is_peer(inner: &Inner, client: ClientId) -> bool {
+    inner.clients.get(&client).is_some_and(|c| c.mode == ClientMode::Peer)
 }
 
 async fn handle_subscriber(state: &Arc<AppState>, source: ClientId, msg: SubscriberMessage) {
@@ -976,5 +1025,117 @@ mod forwarding_tests {
         want.sort();
         assert_eq!(got, want);
         assert!(state.inner.read().await.calls.is_empty());
+    }
+
+    /// A connection in `mode` (e.g. a federation peer link), negotiated v0.
+    async fn connect_as(state: &AppState, mode: ClientMode) -> (ClientId, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = uuid::Uuid::new_v4();
+        state.inner.write().await.clients.insert(id, Client { tx, mode, version: ConnVersion::V0, remote_addr: None, connected_at_ms: 0, username: None });
+        (id, rx)
+    }
+
+    fn voice(id: &uuid::Uuid) -> Vec<u8> {
+        protocol::build_traffic_frame(id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES])
+    }
+
+    #[tokio::test]
+    async fn group_tx_over_a_second_peer_link_is_dropped() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, mut second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (_, mut site_rx) = connect(&state, ConnVersion::V0).await;
+        let id = uuid::Uuid::new_v4();
+        let group_tx = protocol::build_group_tx(&id, 1001, 91, 0);
+        handle_packet(state.clone(), first, group_tx.clone()).await;
+        assert_eq!(drain(&mut site_rx), vec![group_tx.clone()]);
+        drain(&mut second_rx);
+
+        // The same transmission back over the other link: not forwarded
+        // again, and it does not take the call over.
+        handle_packet(state.clone(), second, group_tx.clone()).await;
+        assert!(drain(&mut site_rx).is_empty());
+        assert_eq!(state.inner.read().await.calls[&id].owner, first);
+        handle_packet(state.clone(), second, voice(&id)).await;
+        assert!(drain(&mut site_rx).is_empty(), "nor is its voice stream");
+        handle_packet(state.clone(), first, voice(&id)).await;
+        assert_eq!(drain(&mut site_rx), vec![voice(&id)]);
+
+        // Once the call ended, a late copy does not resurrect it.
+        let idle = protocol::build_call_cause(CALL_GROUP_IDLE, &id, 0);
+        handle_packet(state.clone(), first, idle.clone()).await;
+        assert_eq!(drain(&mut site_rx), vec![idle]);
+        handle_packet(state.clone(), second, group_tx).await;
+        assert!(drain(&mut site_rx).is_empty());
+        let inner = state.inner.read().await;
+        assert!(inner.calls.is_empty() && inner.group_floor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn talker_change_over_another_peer_link_is_accepted() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, _second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (_, mut site_rx) = connect(&state, ConnVersion::V0).await;
+        let id = uuid::Uuid::new_v4();
+        handle_packet(state.clone(), first, protocol::build_group_tx(&id, 1001, 91, 0)).await;
+        drain(&mut site_rx);
+        // Same call, another radio answering from behind the other link.
+        let answer = protocol::build_group_tx(&id, 1002, 91, 0);
+        handle_packet(state.clone(), second, answer.clone()).await;
+        assert_eq!(drain(&mut site_rx), vec![answer]);
+        let inner = state.inner.read().await;
+        assert_eq!((inner.calls[&id].owner, inner.calls[&id].source_issi), (second, 1002));
+    }
+
+    #[tokio::test]
+    async fn basestation_traffic_is_never_treated_as_a_duplicate() {
+        let state = AppState::for_test();
+        let (bs1, _bs1_rx) = connect(&state, ConnVersion::V0).await;
+        let (bs2, _bs2_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut site_rx) = connect(&state, ConnVersion::V0).await;
+        let id = uuid::Uuid::new_v4();
+        let group_tx = protocol::build_group_tx(&id, 1001, 91, 0);
+        handle_packet(state.clone(), bs1, group_tx.clone()).await;
+        handle_packet(state.clone(), bs2, group_tx.clone()).await;
+        assert_eq!(drain(&mut site_rx), vec![group_tx.clone(), group_tx]);
+        assert_eq!(state.inner.read().await.calls[&id].owner, bs2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_private_setup_is_dropped_not_rejected() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, mut second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (callee, mut callee_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), callee, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        drain(&mut second_rx);
+        let id = uuid::Uuid::new_v4();
+        let setup = protocol::build_circular_call_setup(&id, 5001, 6002, 0);
+        handle_packet(state.clone(), first, setup.clone()).await;
+        assert_eq!(drain(&mut callee_rx), vec![setup.clone()]);
+        handle_packet(state.clone(), second, setup).await;
+        assert!(drain(&mut callee_rx).is_empty());
+        assert!(drain(&mut second_rx).is_empty(), "a duplicate is never answered with a reject");
+        assert_eq!(state.inner.read().await.calls[&id].owner, first);
+    }
+
+    #[tokio::test]
+    async fn duplicate_sds_is_dropped() {
+        let state = AppState::for_test();
+        let (first, _first_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (second, mut second_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (dest, mut dest_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), dest, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        drain(&mut second_rx);
+        let id = uuid::Uuid::new_v4();
+        let header = protocol::build_short_transfer(&id, 5001, 6002);
+        let payload = protocol::build_sds_transfer_frame(&id, 16, b"hi");
+        for link in [first, second] {
+            handle_packet(state.clone(), link, header.clone()).await;
+            handle_packet(state.clone(), link, payload.clone()).await;
+        }
+        assert_eq!(drain(&mut dest_rx), vec![header, payload], "delivered once");
+        assert!(drain(&mut second_rx).is_empty());
     }
 }

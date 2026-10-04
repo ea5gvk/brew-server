@@ -139,6 +139,10 @@ pub struct Inner {
     /// same address: a Basestation announces both on discovery only, and
     /// without a session token there is nothing else to carry them over.
     pub discovery_hints: HashMap<std::net::IpAddr, (Instant, ClientMode, ConnVersion)>,
+    /// (call/SDS uuid, source ISSI) -> (link it was accepted from, when): drops
+    /// a copy of a call or SDS that reaches this server again over another
+    /// peer link (see `fedroute::is_duplicate`).
+    pub recent_calls: HashMap<(Uuid, u32), (ClientId, Instant)>,
 }
 
 impl Inner {
@@ -366,6 +370,7 @@ impl AppState {
         inner.auth_sessions.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.discovery_hints.retain(|_, (at, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
+        inner.recent_calls.retain(|_, (_, at)| now.duration_since(*at) < crate::fedroute::CALL_DEDUP_WINDOW);
     }
 
     pub async fn cleanup_client(&self, id: ClientId) {
@@ -411,6 +416,9 @@ impl AppState {
             removed_calls.push(uuid);
         }
         inner.sds_routes.retain(|_, route| route.source_client != id && !route.targets.contains(&id));
+        // A call or SDS accepted over this link may now arrive over another
+        // one (rerouted): that copy is no longer a duplicate.
+        inner.recent_calls.retain(|_, (link, _)| *link != id);
 
         // Federation: the disconnected client's registrations just vanished
         // above; tell every remaining peer so they don't keep routing to a
