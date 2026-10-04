@@ -349,6 +349,30 @@ impl AppState {
         )
     }
 
+    /// Where a service (Brew, telemetry, control, SIP) binds: with `[ha]`
+    /// enabled, a wildcard address means the VIP, so only the Active node
+    /// answers on it (and two nodes can share one host). Explicit addresses
+    /// are kept as configured.
+    pub fn service_bind(&self, addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        match self.config.ha.vip_parts() {
+            Ok((vip, _)) if self.config.ha.enabled && addr.ip().is_unspecified() => {
+                std::net::SocketAddr::new(vip.into(), addr.port())
+            }
+            _ => addr,
+        }
+    }
+
+    /// Where the dashboard binds: with `[ha]` enabled, a wildcard address
+    /// means this node's real IP, so both nodes' dashboards stay reachable
+    /// whatever their role.
+    pub fn dashboard_bind(&self, addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        if self.config.ha.enabled && addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(self.config.ha.real_ip, addr.port())
+        } else {
+            addr
+        }
+    }
+
     /// Registers the SIP runtime handles once the SIP listener has bound. Called
     /// from the SIP transport during startup.
     pub async fn set_sip(

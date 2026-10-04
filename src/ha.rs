@@ -335,6 +335,9 @@ impl ReplayGuard {
 pub struct HaState {
     /// Dashboard override of `[ha] persist`; `None` = use the config value.
     pub persist_override: Option<bool>,
+    /// Recent role changes, newest first, kept across the restart a node
+    /// does when it stops being Active.
+    pub transitions: VecDeque<Transition>,
 }
 
 impl HaState {
@@ -405,7 +408,8 @@ impl Vip {
     pub async fn down(&self) -> Result<()> {
         let out = self.ip("del").await?;
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() && !stderr.contains("Cannot assign requested address") {
+        let absent = stderr.contains("Cannot assign requested address") || stderr.contains("Address not found");
+        if !out.status.success() && !absent {
             anyhow::bail!("ip addr del {} dev {}: {}", self.cidr, self.iface, stderr.trim());
         }
         Ok(())
@@ -458,7 +462,7 @@ pub struct PeerStatus {
     pub config_hash: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transition {
     pub ts_ms: u64,
     pub from: Role,
@@ -502,10 +506,34 @@ impl HaHandle {
         Self { status: watch::channel(status).0, commands: tx, commands_rx: std::sync::Mutex::new(Some(rx)) }
     }
 
-    /// The current role. Always `Active` with HA disabled.
-    pub fn role(&self) -> Role {
-        self.status.borrow().role
+    /// Resolves once this node is Active (immediately with HA disabled).
+    pub async fn wait_active(&self) {
+        let mut rx = self.status.subscribe();
+        let _ = rx.wait_for(|s| s.role == Role::Active).await;
     }
+}
+
+/// After a handover on a shared host, the old Active node still holds the
+/// VIP ports until it restarts (within about a heartbeat of seeing us take
+/// over). Waits, up to a limit, for every enabled service's VIP port to be
+/// bindable, so the listeners don't fail with "address in use".
+pub async fn wait_ports_free(state: &AppState) {
+    let c = &state.config;
+    let mut tcp = vec![state.service_bind(c.listen)];
+    if c.telemetry.enabled { tcp.push(state.service_bind(c.telemetry.listen)); }
+    if c.control.enabled { tcp.push(state.service_bind(c.control.listen)); }
+    let udp = c.sip.enabled.then(|| state.service_bind(c.sip.listen));
+    let free = || {
+        tcp.iter().all(|a| std::net::TcpListener::bind(a).is_ok())
+            && udp.is_none_or(|a| std::net::UdpSocket::bind(a).is_ok())
+    };
+    for _ in 0..100 {
+        if free() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    warn!("service ports still in use after 10s; starting anyway");
 }
 
 /// FNV-1a: stable across builds, unlike `DefaultHasher`, so both nodes agree.
@@ -534,9 +562,13 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     let vip = Vip::new(&cfg)?;
     let config_hash = state.ha.status.borrow().config_hash;
 
-    // A VIP left behind by a crash or an exec restart: drop it before the
-    // election, so we never answer for it while not Active.
-    if let Err(e) = vip.down().await {
+    // A VIP left behind by a crash: drop it before the election, so we never
+    // answer for it while not Active. Not when both nodes share this host:
+    // there is only one VIP on the interface, and it may be the peer's.
+    let shared_host = std::net::UdpSocket::bind(SocketAddr::new(cfg.peer_ip, 0)).is_ok();
+    if shared_host {
+        info!("peer runs on this host; leaving any existing VIP alone at startup");
+    } else if let Err(e) = vip.down().await {
         error!(error = %e, "cannot clear the VIP at startup (missing CAP_NET_ADMIN?)");
     }
 
@@ -547,6 +579,8 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
 
     let mut ha_state = HaState::load(&cfg.state_path);
     let persist = ha_state.persist_override.unwrap_or(cfg.persist);
+    state.ha.status.send_modify(|s| s.transitions = ha_state.transitions.clone());
+    let mut was_active = false;
     let mut election = Election::new(&cfg.node_name, cfg.weight, persist, now_ms(), cfg.dead_after_ms);
     let mut guard = ReplayGuard::default();
     let mut last_peer: Option<LastPeer> = None;
@@ -558,11 +592,21 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     let mut vip_fault_until_ms = 0u64;
 
     // Gateway check runs on its own so a slow ping never delays heartbeats.
-    let (gw_tx, gw_rx) = watch::channel(true);
+    let mut gw_ok = true;
+    if !cfg.check_gateway.is_empty() {
+        // Settle the gateway state before the election starts, so a node
+        // without an uplink never briefly claims the VIP after a restart.
+        gw_ok = false;
+        for _ in 0..3 {
+            if ping(&cfg.check_gateway).await { gw_ok = true; break; }
+        }
+        if !gw_ok { warn!(gateway = %cfg.check_gateway, "gateway unreachable at startup"); }
+    }
+    let (gw_tx, gw_rx) = watch::channel(gw_ok);
     if !cfg.check_gateway.is_empty() {
         let gw = cfg.check_gateway.clone();
         tokio::spawn(async move {
-            let mut misses = 0u32;
+            let mut misses = if gw_ok { 0u32 } else { 3 };
             loop {
                 if ping(&gw).await { misses = 0 } else { misses += 1 }
                 // Three misses in a row before declaring Fault.
@@ -713,6 +757,27 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
                 s.transitions.truncate(TRANSITION_LOG_LEN);
             }
         });
+        if before != after {
+            ha_state.transitions = state.ha.status.borrow().transitions.clone();
+            if let Err(e) = ha_state.save(&cfg.state_path) {
+                warn!(error = %e, "cannot save HA state");
+            }
+        }
+
+        // Services start once on the first Active (see `main::services`)
+        // and are never stopped in place: a node that leaves Active restarts
+        // into a clean Standby, which drops every Basestation, peer and SIP
+        // session at once so they reconnect to the new Active node. A node
+        // handing over first keeps heartbeating until the peer has taken
+        // over (or the handover timed out).
+        was_active |= after == Role::Active && vip_held;
+        if was_active && after != Role::Active && election.handover_target().is_none() {
+            if vip_held {
+                if let Err(e) = vip.down().await { error!(error = %e, "cannot release the VIP"); }
+            }
+            warn!(role = ?after, "left Active: restarting into Standby");
+            crate::restart_process();
+        }
     }
 }
 
@@ -961,7 +1026,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ha-state.json");
         assert_eq!(HaState::load(&path), HaState::default());
-        let s = HaState { persist_override: Some(true) };
+        let s = HaState { persist_override: Some(true), ..HaState::default() };
         s.save(&path).unwrap();
         assert_eq!(HaState::load(&path), s);
         std::fs::remove_dir_all(&dir).unwrap();

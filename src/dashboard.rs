@@ -25,6 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `[dashboard]` config section. Returns immediately if disabled.
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let cfg = &state.config.dashboard;
+    let listen = state.dashboard_bind(cfg.listen);
     if !cfg.enabled {
         return Ok(());
     }
@@ -88,13 +89,13 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 cfg.tls.key_path.display()
             )
         })?;
-        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=true, "dashboard listening (TLS)");
-        axum_server::bind_rustls(cfg.listen, rustls_config)
+        tracing::info!(listen=%listen, auth=!cfg.users.is_empty(), tls=true, "dashboard listening (TLS)");
+        axum_server::bind_rustls(listen, rustls_config)
             .serve(app.into_make_service())
             .await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=false, "dashboard listening");
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        tracing::info!(listen=%listen, auth=!cfg.users.is_empty(), tls=false, "dashboard listening");
         axum::serve(listener, app).await?;
     }
     Ok(())

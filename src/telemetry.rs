@@ -696,7 +696,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     }
     let cfg = fsnet::ListenerConfig {
         name: "telemetry",
-        listen: state.config.telemetry.listen,
+        listen: state.service_bind(state.config.telemetry.listen),
         subprotocol: "bluestation-telemetry-v2",
         users: state.config.telemetry.users.clone(),
         tls: state.config.telemetry.tls.clone(),

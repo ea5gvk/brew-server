@@ -42,13 +42,15 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 tls.key_path.display()
             )
         })?;
-        info!(listen=%state.config.listen, websocket_path=%base, auth=state.config.auth.enabled, tls=true, "Brew server listening (TLS)");
-        axum_server::bind_rustls(state.config.listen, rustls_config)
+        let listen = state.service_bind(state.config.listen);
+        info!(%listen, websocket_path=%base, auth=state.config.auth.enabled, tls=true, "Brew server listening (TLS)");
+        axum_server::bind_rustls(listen, rustls_config)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
-        info!(listen=%state.config.listen, websocket_path=%base, auth=state.config.auth.enabled, tls=false, "Brew server listening");
+        let listen = state.service_bind(state.config.listen);
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        info!(%listen, websocket_path=%base, auth=state.config.auth.enabled, tls=false, "Brew server listening");
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
