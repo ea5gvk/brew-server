@@ -2,7 +2,7 @@
 
 All notable changes to brew-server, newest first.
 
-Unreleased adds:
+Version 1.13.0 adds:
 
 - **Federation discovery identifies the peer.** The discovery `GET` of an
   outbound peer link now carries `User-Agent: brew-server/<version>`,
