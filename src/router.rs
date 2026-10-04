@@ -186,9 +186,11 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         started_at: std::time::Instant::now(),
         last_activity_ms: ActiveCall::new_activity(),
     });
-    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| c.tx.clone())).collect::<Vec<_>>();
+    // Each recipient gets the GROUP_TX in the layout it negotiated: a v0
+    // connection must not be handed the v1 talker-name tail.
+    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| (c.tx.clone(), c.version))).collect::<Vec<_>>();
     drop(inner);
-    for tx in txs { let _ = tx.send(raw.clone()); }
+    for (tx, version) in txs { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
     if let Some(old) = preempted {
         state.monitor.call_ended(old).await;
         if let Some(h) = state.sip.read().await.as_ref() {
@@ -431,9 +433,9 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     if target_client == source { return; }
     let peers = HashSet::from([target_client]);
     inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now(), last_activity_ms: ActiveCall::new_activity() });
-    let tx = inner.clients.get(&target_client).map(|c| c.tx.clone());
+    let target = inner.clients.get(&target_client).map(|c| (c.tx.clone(), c.version));
     drop(inner);
-    if let Some(tx) = tx { let _ = tx.send(raw); }
+    if let Some((tx, version)) = target { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
     state.monitor.call_started(id, "private", source_issi, destination, 0).await;
     info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST");
 }
@@ -790,5 +792,67 @@ mod call_duration_tests {
         let mut calls = HashMap::new();
         calls.insert(uuid::Uuid::new_v4(), call(now, CallKind::Private));
         assert!(expired_calls(&calls, Duration::from_secs(60)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+    use crate::{protocol::ConnVersion, state::{Client, ClientMode}};
+
+    /// A Basestation connection (so registrations are not relayed anywhere)
+    /// that negotiated `version`, plus the queue of what it is sent.
+    async fn connect(state: &AppState, version: ConnVersion) -> (ClientId, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = uuid::Uuid::new_v4();
+        state.inner.write().await.clients.insert(id, Client { tx, mode: ClientMode::Basestation, version, remote_addr: None, connected_at_ms: 0, username: None });
+        (id, rx)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn with_mnemonic(mut wire: Vec<u8>, name: &[u8]) -> Vec<u8> {
+        let mut mnem = vec![0x00u8, (name.len() * 8) as u8];
+        mnem.extend_from_slice(name);
+        mnem.resize(34, 0);
+        wire.extend_from_slice(&mnem);
+        wire
+    }
+
+    #[tokio::test]
+    async fn group_tx_reaches_each_listener_in_its_own_version() {
+        let state = AppState::for_test();
+        let (talker, _talker_rx) = connect(&state, ConnVersion::V1).await;
+        let (_, mut v0_rx) = connect(&state, ConnVersion::V0).await;
+        let (_, mut v1_rx) = connect(&state, ConnVersion::V1).await;
+        let id = uuid::Uuid::new_v4();
+        let v0_tx = protocol::build_group_tx(&id, 1001, 91, 0);
+        let v1_tx = with_mnemonic(v0_tx.clone(), b"BOB");
+
+        handle_packet(state.clone(), talker, v1_tx.clone()).await;
+        assert_eq!(drain(&mut v0_rx), vec![v0_tx]);
+        assert_eq!(drain(&mut v1_rx), vec![v1_tx]);
+    }
+
+    #[tokio::test]
+    async fn private_setup_reaches_a_v0_callee_without_mnemonic() {
+        let state = AppState::for_test();
+        let (caller, _caller_rx) = connect(&state, ConnVersion::V1).await;
+        let (v0_site, mut v0_rx) = connect(&state, ConnVersion::V0).await;
+        let (v1_site, mut v1_rx) = connect(&state, ConnVersion::V1).await;
+        handle_packet(state.clone(), v0_site, protocol::build_subscriber_message(SUB_REGISTER, 6002, &[])).await;
+        handle_packet(state.clone(), v1_site, protocol::build_subscriber_message(SUB_REGISTER, 6003, &[])).await;
+
+        let to_v0 = uuid::Uuid::new_v4();
+        let v0_setup = protocol::build_circular_call_setup(&to_v0, 5001, 6002, 0);
+        handle_packet(state.clone(), caller, with_mnemonic(v0_setup.clone(), b"CTRL")).await;
+        assert_eq!(drain(&mut v0_rx), vec![v0_setup]);
+
+        let to_v1 = uuid::Uuid::new_v4();
+        let v1_setup = with_mnemonic(protocol::build_circular_call_setup(&to_v1, 5001, 6003, 0), b"CTRL");
+        handle_packet(state.clone(), caller, v1_setup.clone()).await;
+        assert_eq!(drain(&mut v1_rx), vec![v1_setup]);
     }
 }

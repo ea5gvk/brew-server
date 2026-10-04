@@ -26,6 +26,11 @@ Unreleased adds:
   closed after `keepalive_timeout_seconds` (default `45`) without any frame,
   so a half-open link no longer keeps routes pointing at it; `0` disables.
   Dialling a peer now gives up after 30 s instead of possibly hanging.
+- **Talker names only to v1 connections.** `GROUP_TX` and `SETUP_REQUEST`
+  forwarded to a connection that negotiated Brew v0 lose the v1
+  `mnemonic[34]` tail. With `[auth]` disabled, the mode and version a client
+  announces on its discovery `GET` now also apply to its WebSocket upgrade
+  from the same address.
 
 Version 1.12.0 adds:
 
