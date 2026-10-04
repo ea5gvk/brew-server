@@ -26,6 +26,13 @@ services:
       - brew-server-data:/var/lib/brew-server
     environment:
       RUST_LOG: brew_server=info
+    # Active/standby pair ([ha] enabled): the VIP lives on the host's
+    # interface, so drop the `ports:` list above and use instead
+    #   network_mode: host
+    #   cap_add: [NET_ADMIN, NET_RAW]
+    # and point the healthcheck at the dashboard's /healthz on this node's
+    # real IP (the Brew one answers only on the Active node). See
+    # docs/High-Availability.md.
 
 volumes:
   brew-server-data:

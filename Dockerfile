@@ -8,7 +8,14 @@ RUN cargo build --release --bins
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/brew-server brew \
     && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+       iproute2 iputils-arping iputils-ping libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    # [ha]: the non-root brew user moves the VIP and pings through these, using
+    # the NET_ADMIN/NET_RAW the container is given with cap_add (without
+    # cap_add, `ip` would refuse to start, but it only runs with [ha] enabled).
+    && setcap cap_net_admin+ep "$(command -v ip)" \
+    && setcap cap_net_raw+ep "$(command -v arping)" \
+    && setcap cap_net_raw+ep "$(command -v ping)"
 COPY --from=build /src/target/release/brew-server /usr/local/bin/brew-server
 COPY --from=build /src/target/release/brew-history /usr/local/bin/brew-history
 COPY brew-server.toml /etc/brew-server.toml

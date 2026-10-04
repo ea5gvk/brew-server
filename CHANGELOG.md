@@ -2,6 +2,42 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.14.0 adds:
+
+- **Active/standby high availability.** New `[ha]` section (off by
+  default): two brew-servers on one LAN / Layer 2 segment, or on one host,
+  share a virtual IP. They elect an Active node over HMAC-signed UDP
+  heartbeats: the higher `weight` wins, and `persist = true` keeps a node
+  Active even when a higher-weight peer comes back. The Active node holds
+  the VIP (`ip addr` + gratuitous ARP; needs `CAP_NET_ADMIN` and
+  `CAP_NET_RAW`) and alone runs the Brew, telemetry, control and SIP
+  listeners and the background tasks, binding the VIP for listeners set to
+  `0.0.0.0`. On failure the Standby takes over within `dead_after_ms`
+  (default 2 s), and Basestations reconnect to the same address. A node
+  that leaves Active restarts into Standby. Optional `check_gateway` keeps a
+  node without an uplink from taking the VIP. See
+  [High Availability](https://github.com/ysamouhos/brew-server/wiki/High-Availability).
+- **HA replication.** The Standby keeps a live copy of the Active node's
+  call/SDS history and SMS Center queue over an authenticated TCP link on
+  `heartbeat_port`, so a failover loses neither; history that moves between
+  the nodes is never duplicated. A returning higher-weight node takes over
+  only once its copy is up to date.
+- **High Availability dashboard page** (`/ha`): both nodes' role, weight,
+  persist, VIP holder, heartbeat and role-change log, plus a role badge in
+  every page header. Admins can switch the Active node, set persist (kept
+  in `ha-state.json`, no restart), edit `[ha]` and apply the saved config.
+  Make Active, Make Standby, Config default and Apply ask for confirmation,
+  naming both nodes and what drops, restarts or takes the VIP. Warnings
+  flag unapplied saved changes and a config that differs from the peer's,
+  and name the settings involved (never their values); the peer comparison
+  ignores `[ha]`, file paths, comments and formatting.
+- **No automatic config reload with HA.** With `[ha]` enabled, config file
+  changes are applied only from the dashboard's **Apply saved config**,
+  which hands an Active node over to its Standby before restarting it.
+- **Dashboard `/healthz`.** The dashboard listener answers an
+  unauthenticated `/healthz` (`ok`, or `ok active` / `ok standby` with HA),
+  for health checks that must pass on both HA nodes.
+
 Version 1.13.0 adds:
 
 - **Federation discovery identifies the peer.** The discovery `GET` of an

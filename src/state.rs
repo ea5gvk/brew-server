@@ -282,6 +282,12 @@ pub struct AppState {
     pub aprs_tx: mpsc::UnboundedSender<crate::aprs::PositionReport>,
     /// Store-and-forward queue for SDS to offline subscribers.
     pub sms_center: crate::sms_center::SmsCenter,
+    /// Active/standby role and dashboard commands (see `ha`). Always reports
+    /// Active when `[ha]` is disabled.
+    pub ha: crate::ha::HaHandle,
+    /// The history log, shared with `monitor` and `telemetry`; HA replication
+    /// reads and extends it. `None` with `[storage]` disabled.
+    pub store: Option<std::sync::Arc<crate::store::Store>>,
 }
 
 #[cfg(test)]
@@ -327,6 +333,8 @@ impl AppState {
         };
         let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
         let sms_center = crate::sms_center::SmsCenter::open(config.sms_center.clone());
+        let config_hash = crate::ha::config_hash(&config);
+        let ha = crate::ha::HaHandle::new(&config.ha, config_hash, crate::ha::config_sections(&config, false));
         (
             Self {
                 config,
@@ -338,9 +346,35 @@ impl AppState {
                 sip: RwLock::new(None),
                 aprs_tx,
                 sms_center,
+                ha,
+                store,
             },
             aprs_rx,
         )
+    }
+
+    /// Where a service (Brew, telemetry, control, SIP) binds: with `[ha]`
+    /// enabled, a wildcard address means the VIP, so only the Active node
+    /// answers on it (and two nodes can share one host). Explicit addresses
+    /// are kept as configured.
+    pub fn service_bind(&self, addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        match self.config.ha.vip_parts() {
+            Ok((vip, _)) if self.config.ha.enabled && addr.ip().is_unspecified() => {
+                std::net::SocketAddr::new(vip.into(), addr.port())
+            }
+            _ => addr,
+        }
+    }
+
+    /// Where the dashboard binds: with `[ha]` enabled, a wildcard address
+    /// means this node's real IP, so both nodes' dashboards stay reachable
+    /// whatever their role.
+    pub fn dashboard_bind(&self, addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        if self.config.ha.enabled && addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(self.config.ha.real_ip, addr.port())
+        } else {
+            addr
+        }
     }
 
     /// Registers the SIP runtime handles once the SIP listener has bound. Called

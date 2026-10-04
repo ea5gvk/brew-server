@@ -583,6 +583,14 @@ impl TelemetryState {
         }
     }
 
+    /// Adds an SDS telemetry record replicated from the HA peer (already in
+    /// the store) to the dashboard's recent list.
+    pub fn ingest_replicated(&mut self, rec: SdsTelemetryRecord) {
+        self.recent_sds.push_front(rec);
+        while self.recent_sds.len() > 200 { self.recent_sds.pop_back(); }
+        self.recent_sds_out = self.recent_sds.iter().cloned().collect();
+    }
+
     /// Records an SDS telemetry entry for `bts` in the durable, cross-restart
     /// log (independent of the ephemeral per-station `recent_sds`).
     fn record_sds_telemetry(&mut self, bts: &str, entry: &SdsLogEntry) {
@@ -696,7 +704,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     }
     let cfg = fsnet::ListenerConfig {
         name: "telemetry",
-        listen: state.config.telemetry.listen,
+        listen: state.service_bind(state.config.telemetry.listen),
         subprotocol: "bluestation-telemetry-v2",
         users: state.config.telemetry.users.clone(),
         tls: state.config.telemetry.tls.clone(),

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, net::SocketAddr, path::Path, path::PathBuf};
+use std::{collections::HashMap, fs, net::{IpAddr, Ipv4Addr, SocketAddr}, path::Path, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +44,113 @@ pub struct Config {
     /// logs in as that Basestation, no separate ID scheme needed. Purely
     /// informational (dashboard map markers); has no effect on routing.
     pub bts_locations: HashMap<String, BtsLocationConfig>,
+    /// Active/standby pair: two brew-servers on one LAN sharing a virtual IP.
+    /// See `ha`.
+    pub ha: HaConfig,
+}
+
+/// Active/standby high availability. Two nodes exchange signed UDP
+/// heartbeats over their real IPs; the Active one holds `vip` on
+/// `vip_interface` (moved with `ip addr` + gratuitous ARP, so both nodes must
+/// share a Layer 2 segment). Runtime toggles made from the dashboard (persist
+/// override) live in `state_path`, not here, so they never restart the node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HaConfig {
+    pub enabled: bool,
+    /// This node's name; must differ from the peer's. Breaks weight ties.
+    pub node_name: String,
+    /// Higher weight is the preferred Active node.
+    pub weight: u32,
+    /// Default for "once Active, stay Active even when a higher-weight peer
+    /// comes back". The dashboard can override it (stored in `state_path`).
+    pub persist: bool,
+    /// Virtual IPv4 address with prefix length, e.g. "192.0.2.100/24".
+    pub vip: String,
+    pub vip_interface: String,
+    /// This node's own address: heartbeat bind address.
+    pub real_ip: IpAddr,
+    /// The other node's real address.
+    pub peer_ip: IpAddr,
+    /// UDP heartbeat port, the same on both nodes.
+    pub heartbeat_port: u16,
+    pub heartbeat_interval_ms: u64,
+    /// The peer counts as dead after this long without a valid heartbeat.
+    pub dead_after_ms: u64,
+    /// HMAC-SHA256 key for heartbeats; identical on both nodes.
+    pub shared_secret: String,
+    /// Optional IP that must answer a ping before this node may take the VIP
+    /// (guards against a node that lost its uplink grabbing the VIP). Empty
+    /// disables the check.
+    pub check_gateway: String,
+    /// JSON file holding the runtime toggles set from the dashboard.
+    pub state_path: PathBuf,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_name: String::new(),
+            weight: 100,
+            persist: false,
+            vip: String::new(),
+            vip_interface: "eth0".into(),
+            real_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            heartbeat_port: 9010,
+            heartbeat_interval_ms: 500,
+            dead_after_ms: 2000,
+            shared_secret: String::new(),
+            check_gateway: String::new(),
+            state_path: PathBuf::from("ha-state.json"),
+        }
+    }
+}
+
+impl HaConfig {
+    /// Parses `vip` ("a.b.c.d/nn") into the address and prefix length.
+    pub fn vip_parts(&self) -> Result<(Ipv4Addr, u8)> {
+        let (addr, prefix) = self.vip.split_once('/')
+            .context("ha.vip must be an IPv4 address with prefix, e.g. 192.0.2.100/24")?;
+        let addr: Ipv4Addr = addr.trim().parse().context("ha.vip: invalid IPv4 address")?;
+        let prefix: u8 = prefix.trim().parse().context("ha.vip: invalid prefix length")?;
+        anyhow::ensure!((1..=32).contains(&prefix), "ha.vip: prefix length must be 1..=32");
+        Ok((addr, prefix))
+    }
+
+    /// Checks an enabled `[ha]` section for mistakes that would otherwise
+    /// only show up at failover time.
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(!self.node_name.trim().is_empty(), "ha.node_name must be set");
+        anyhow::ensure!(!self.vip_interface.trim().is_empty(), "ha.vip_interface must be set");
+        anyhow::ensure!(!self.shared_secret.is_empty(), "ha.shared_secret must be set");
+        let (vip, prefix) = self.vip_parts()?;
+        let IpAddr::V4(real) = self.real_ip else { anyhow::bail!("ha.real_ip must be IPv4") };
+        let IpAddr::V4(peer) = self.peer_ip else { anyhow::bail!("ha.peer_ip must be IPv4") };
+        anyhow::ensure!(!real.is_unspecified(), "ha.real_ip must be set");
+        anyhow::ensure!(!peer.is_unspecified(), "ha.peer_ip must be set");
+        anyhow::ensure!(real != peer, "ha.peer_ip must differ from ha.real_ip");
+        anyhow::ensure!(vip != real && vip != peer, "ha.vip must differ from both real IPs");
+        let mask = u32::MAX << (32 - prefix as u32);
+        anyhow::ensure!(
+            u32::from(vip) & mask == u32::from(real) & mask,
+            "ha.vip {} is not in the same /{prefix} subnet as ha.real_ip {real}", self.vip
+        );
+        anyhow::ensure!(self.heartbeat_port != 0, "ha.heartbeat_port must be set");
+        anyhow::ensure!(self.heartbeat_interval_ms >= 100, "ha.heartbeat_interval_ms must be at least 100");
+        anyhow::ensure!(
+            self.dead_after_ms >= 3 * self.heartbeat_interval_ms,
+            "ha.dead_after_ms must be at least 3 x ha.heartbeat_interval_ms"
+        );
+        if !self.check_gateway.is_empty() {
+            self.check_gateway.parse::<IpAddr>().context("ha.check_gateway: invalid IP address")?;
+        }
+        Ok(())
+    }
 }
 
 /// One Basestation's fixed location, for the dashboard MS map. Keyed by Brew
@@ -590,6 +697,7 @@ impl Default for Config {
             aprs: AprsConfig::default(),
             sms_center: SmsCenterConfig::default(),
             bts_locations: HashMap::new(),
+            ha: HaConfig::default(),
         }
     }
 }
@@ -654,14 +762,18 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.ha.validate()?;
+        Ok(cfg)
     }
 
     /// Parses `text` as a config, same rules `load` applies to a file's
     /// contents. Used by the dashboard's config editor to validate a proposed
     /// change before writing it to disk.
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).context("parsing config")
+        let cfg: Self = toml::from_str(text).context("parsing config")?;
+        cfg.ha.validate()?;
+        Ok(cfg)
     }
 
     /// Renders this config back to TOML, the same shape `load` accepts. Used
@@ -756,6 +868,43 @@ mod tests {
         match &parsed.sip.routes[0].from {
             Some(RouteEndpoint::BrewPrivate { issi }) => assert_eq!(*issi, 42),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    fn ha_ok() -> HaConfig {
+        HaConfig {
+            enabled: true,
+            node_name: "bs-a".into(),
+            vip: "192.0.2.100/24".into(),
+            real_ip: "192.0.2.11".parse().unwrap(),
+            peer_ip: "192.0.2.12".parse().unwrap(),
+            shared_secret: "s3cret".into(),
+            ..HaConfig::default()
+        }
+    }
+
+    #[test]
+    fn ha_validate_accepts_a_sane_config() {
+        ha_ok().validate().unwrap();
+        assert!(HaConfig::default().validate().is_ok(), "disabled HA is never checked");
+    }
+
+    #[test]
+    fn ha_validate_rejects_mistakes() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut HaConfig)>)> = vec![
+            ("vip subnet", Box::new(|c| c.vip = "198.51.100.1/24".into())),
+            ("vip prefix", Box::new(|c| c.vip = "192.0.2.100".into())),
+            ("same ips", Box::new(|c| c.peer_ip = c.real_ip)),
+            ("vip = real", Box::new(|c| c.vip = "192.0.2.11/24".into())),
+            ("no secret", Box::new(|c| c.shared_secret.clear())),
+            ("no name", Box::new(|c| c.node_name.clear())),
+            ("dead_after", Box::new(|c| c.dead_after_ms = 1000)),
+            ("gateway", Box::new(|c| c.check_gateway = "nope".into())),
+        ];
+        for (what, edit) in cases {
+            let mut c = ha_ok();
+            edit(&mut c);
+            assert!(c.validate().is_err(), "{what} should be rejected");
         }
     }
 }

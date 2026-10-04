@@ -27,27 +27,17 @@ impl Monitor {
         let mut inner = Inner::default();
         if let Ok(records) = crate::store::Store::replay(store.path()) {
             for rec in records {
-                match rec {
-                    crate::store::StoredRecord::Call(r) => {
-                        inner.total_calls += 1;
-                        inner.voice_frames += r.voice_frames;
-                        inner.calls.push_front(r);
-                        while inner.calls.len() > 200 { inner.calls.pop_back(); }
-                    }
-                    crate::store::StoredRecord::Sds(r) => {
-                        inner.total_sds += 1;
-                        inner.sds.push_front(r);
-                        while inner.sds.len() > 200 { inner.sds.pop_back(); }
-                    }
-                    crate::store::StoredRecord::SdsReport { uuid } => {
-                        if let Some(r) = inner.sds.iter_mut().find(|r| r.uuid == uuid) { r.reports += 1; }
-                    }
-                    crate::store::StoredRecord::SdsTelemetry(_) => {}
-                }
+                apply_record(&mut inner, rec);
             }
             tracing::info!(path = %store.path().display(), calls = inner.total_calls, sds = inner.total_sds, "replayed persisted history");
         }
         Self { inner: RwLock::new(inner), tx, store: Some(store) }
+    }
+
+    /// Adds a history record replicated from the HA peer (already appended
+    /// to the store by the caller) to the in-memory lists and counters.
+    pub async fn ingest_replicated(&self, rec: crate::store::StoredRecord) {
+        apply_record(&mut *self.inner.write().await, rec);
     }
 
     fn persist(&self, rec: &crate::store::StoredRecord) {
@@ -70,6 +60,28 @@ impl Monitor {
     pub async fn sds(&self, uuid: Uuid, source: u32, destination: u32) { let r=SdsRecord{uuid,source,destination,at_ms:now_ms(),reports:0}; let mut i=self.inner.write().await; i.total_sds+=1; i.sds.push_front(r.clone()); while i.sds.len()>200{i.sds.pop_back();} drop(i); self.persist(&crate::store::StoredRecord::Sds(r.clone())); self.emit("sds",serde_json::json!(r)); }
     pub async fn sds_report(&self, uuid: Uuid) { let mut i=self.inner.write().await; if let Some(r)=i.sds.iter_mut().find(|r|r.uuid==uuid){r.reports+=1;} drop(i); self.persist(&crate::store::StoredRecord::SdsReport { uuid }); }
     pub async fn snapshot(&self, clients: usize, subscribers: usize, groups: usize) -> Snapshot { let i=self.inner.read().await; Snapshot{connected_basestations:clients,subscribers,groups,active_calls:i.active.values().cloned().collect(),recent_calls:i.calls.iter().take(50).cloned().collect(),recent_sds:i.sds.iter().take(50).cloned().collect(),total_calls:i.total_calls,total_sds:i.total_sds,voice_frames:i.voice_frames} }
+}
+
+/// Folds one persisted record into the in-memory history (startup replay and
+/// HA replication).
+fn apply_record(inner: &mut Inner, rec: crate::store::StoredRecord) {
+    match rec {
+        crate::store::StoredRecord::Call(r) => {
+            inner.total_calls += 1;
+            inner.voice_frames += r.voice_frames;
+            inner.calls.push_front(r);
+            while inner.calls.len() > 200 { inner.calls.pop_back(); }
+        }
+        crate::store::StoredRecord::Sds(r) => {
+            inner.total_sds += 1;
+            inner.sds.push_front(r);
+            while inner.sds.len() > 200 { inner.sds.pop_back(); }
+        }
+        crate::store::StoredRecord::SdsReport { uuid } => {
+            if let Some(r) = inner.sds.iter_mut().find(|r| r.uuid == uuid) { r.reports += 1; }
+        }
+        crate::store::StoredRecord::SdsTelemetry(_) => {}
+    }
 }
 
 #[cfg(test)]

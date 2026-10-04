@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex},
     time::{Duration, Instant},
 };
 use tracing::{debug, error, info, warn};
@@ -123,6 +123,8 @@ pub struct Snapshot {
 pub struct SmsCenter {
     cfg: SmsCenterConfig,
     data: Mutex<SmsFile>,
+    /// Bumped on every change, so HA replication knows when to resend.
+    revision: AtomicU64,
 }
 
 /// Window in which an identical SDS is treated as a retransmission.
@@ -137,7 +139,7 @@ impl SmsCenter {
         if cfg.enabled {
             info!(path = %cfg.path.display(), queued = data.messages.len(), known = data.known_issis.len(), "SMS Center enabled");
         }
-        Self { cfg, data: Mutex::new(data) }
+        Self { cfg, data: Mutex::new(data), revision: AtomicU64::new(1) }
     }
 
     pub fn enabled(&self) -> bool {
@@ -325,7 +327,30 @@ impl SmsCenter {
         Snapshot { enabled: self.cfg.enabled, known_issis: d.known_issis.len(), messages: d.messages.clone() }
     }
 
+    /// Change counter for HA replication (see `export`).
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
+    }
+
+    /// The whole queue and known-ISSI set as JSON, for HA replication.
+    pub fn export(&self) -> Vec<u8> {
+        let d = self.data.lock().unwrap();
+        let file = SmsFile { version: 1, known_issis: d.known_issis.clone(), messages: d.messages.clone() };
+        serde_json::to_vec(&file).unwrap_or_default()
+    }
+
+    /// Replaces the queue with one exported by the HA Active node, and saves
+    /// it, so this node continues from the same queue if it takes over.
+    pub fn import(&self, json: &[u8]) -> anyhow::Result<()> {
+        let file: SmsFile = serde_json::from_slice(json)?;
+        let mut d = self.data.lock().unwrap();
+        *d = file;
+        self.persist(&d);
+        Ok(())
+    }
+
     fn persist(&self, d: &SmsFile) {
+        self.revision.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = save(&self.cfg.path, d) {
             error!(path = %self.cfg.path.display(), error = %e, "SMS Center: cannot write queue file");
         }

@@ -27,3 +27,11 @@ docker compose up --build
 ```bash
 curl http://127.0.0.1:9000/healthz
 ```
+
+With `[ha]` enabled, the Brew `/healthz` answers only on the Active node; the
+dashboard's `/healthz` (port 9003) answers on both, with the node's role.
+
+## High availability
+
+Two brew-servers can run as an active/standby pair sharing a virtual IP on
+one LAN. See [docs/High-Availability.md](docs/High-Availability.md).

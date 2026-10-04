@@ -25,6 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `[dashboard]` config section. Returns immediately if disabled.
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let cfg = &state.config.dashboard;
+    let listen = state.dashboard_bind(cfg.listen);
     if !cfg.enabled {
         return Ok(());
     }
@@ -44,6 +45,11 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
         .route("/api/config/bts-locations/{username}", axum::routing::post(upsert_bts_location).delete(delete_bts_location))
         .route("/api/sms-center/{id}", axum::routing::delete(sms_center_delete))
+        .route("/api/ha/active", axum::routing::post(ha_make_active))
+        .route("/api/ha/standby", axum::routing::post(ha_make_standby))
+        .route("/api/ha/persist", axum::routing::post(ha_set_persist))
+        .route("/api/ha/apply", axum::routing::post(ha_apply))
+        .route("/api/config/ha", get(ha_config_get).put(ha_config_put))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     let app = Router::new()
@@ -70,9 +76,14 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/sip/config", get(sip_config))
         .route("/api/whoami", get(whoami))
         .route("/sms-center", get(sms_center_page))
+        .route("/ha", get(ha_page))
+        .route("/api/ha", get(ha_status))
         .route("/api/sms-center", get(sms_center_snapshot))
         .merge(settings_routes)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_basic))
+        // Unauthenticated liveness probe that works on both HA nodes (the
+        // Brew listener's /healthz only exists on the Active one).
+        .route("/healthz", get(dashboard_healthz))
         .with_state(state.clone());
 
     if cfg.tls.enabled {
@@ -88,13 +99,13 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 cfg.tls.key_path.display()
             )
         })?;
-        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=true, "dashboard listening (TLS)");
-        axum_server::bind_rustls(cfg.listen, rustls_config)
+        tracing::info!(listen=%listen, auth=!cfg.users.is_empty(), tls=true, "dashboard listening (TLS)");
+        axum_server::bind_rustls(listen, rustls_config)
             .serve(app.into_make_service())
             .await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-        tracing::info!(listen=%cfg.listen, auth=!cfg.users.is_empty(), tls=false, "dashboard listening");
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        tracing::info!(listen=%listen, auth=!cfg.users.is_empty(), tls=false, "dashboard listening");
         axum::serve(listener, app).await?;
     }
     Ok(())
@@ -795,6 +806,17 @@ async fn save_config(state: &Arc<AppState>, cfg: &config::Config) -> anyhow::Res
 /// Applies `edit` to a clone of the live config and saves it. Used by every
 /// structured (non-raw-editor) settings endpoint below so they share one
 /// clone/edit/validate/write/report path.
+/// What a successful config save tells the admin: with HA the file is only
+/// applied from the /ha page (no automatic restart, see `main`).
+fn saved_note(state: &AppState) -> serde_json::Value {
+    let note = if state.config.ha.enabled {
+        "written to the config file; HA is enabled, so apply it from the High Availability page"
+    } else {
+        "written to the config file; the process restarts within a couple seconds to apply it"
+    };
+    serde_json::json!({ "saved": true, "note": note })
+}
+
 async fn mutate_and_save(
     state: &Arc<AppState>,
     edit: impl FnOnce(&mut config::Config),
@@ -802,10 +824,7 @@ async fn mutate_and_save(
     let mut cfg = state.config.clone();
     edit(&mut cfg);
     match save_config(state, &cfg).await {
-        Ok(()) => Json(serde_json::json!({
-            "saved": true,
-            "note": "written to the config file; the process restarts within a couple seconds to apply it",
-        })).into_response(),
+        Ok(()) => Json(saved_note(state)).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -841,10 +860,7 @@ pub async fn config_raw_put(State(state): State<Arc<AppState>>, body: String) ->
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response(),
     };
     match save_config(&state, &cfg).await {
-        Ok(()) => Json(serde_json::json!({
-            "saved": true,
-            "note": "written to the config file; the process restarts within a couple seconds to apply it",
-        })).into_response(),
+        Ok(()) => Json(saved_note(&state)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -940,11 +956,19 @@ const STYLE: &str = r#"<style>
 h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 .badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:11px;font-weight:600}.badge-pos{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.badge-sds{background:#203047;color:#8fa2b8}.pos-undec{color:#8fa2b8;font-style:italic}
 .badge-reg-in{background:#173822;color:#52d273;border:1px solid #245c37}.badge-reg-out{background:#203047;color:#8fa2b8;border:1px solid #2c405c}.badge-reg-timeout{background:#3a2f12;color:#e8b93d;border:1px solid #5c4a1d}
-</style>"#;
+.ha-active{background:#173822;color:#52d273;border:1px solid #245c37}.ha-standby{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.ha-init{background:#203047;color:#8fa2b8}.ha-fault,.ha-down{background:#3a1414;color:#f2545b;border:1px solid #5c1d1d}a.ha-hdr{text-decoration:none;font-size:11px}
+</style><script>
+// HA role badge in every page header (only when [ha] is enabled).
+document.addEventListener('DOMContentLoaded',()=>{const h=document.querySelector('.hdr-status');if(!h)return;
+const tick=()=>fetch('/api/ha').then(r=>r.json()).then(d=>{let a=document.getElementById('ha-hdr');if(!d.enabled){if(a)a.remove();return;}
+if(!a){a=document.createElement('a');a.id='ha-hdr';a.href='/ha';h.insertBefore(a,h.querySelector('.ver'));}
+a.className='badge ha-hdr ha-'+d.role;a.textContent='HA '+d.node+': '+d.role.toUpperCase();}).catch(()=>{});
+tick();setInterval(tick,5000);});
+</script>"#;
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
-<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sms-center">SMS Center<span class=sub>Messages stored for offline radios</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
+<section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sms-center">SMS Center<span class=sub>Messages stored for offline radios</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/ha">High Availability<span class=sub>Active/standby role, VIP &amp; failover</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class="bts-grid wide" id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
 <section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
@@ -1119,6 +1143,240 @@ function doLogout(){location.href=location.protocol+'//logout:'+Date.now()+'@'+l
 fetch('/api/whoami').then(r=>r.json()).then(w=>{if(!w.admin)$('settings-link').style.display='none';if(w.username){$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}).catch(()=>{});
 </script></body></html>"#;
 
+// ---------------------------------------------------------------------------
+// High availability (`ha`): status for everyone, controls for admins.
+
+/// `/api/ha`: the HA task's status plus whether the config file on disk
+/// differs from the one this process runs (saved but not applied yet).
+pub async fn ha_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let status = state.ha.status.borrow().clone();
+    // A file that no longer loads also counts as pending (Apply refuses it).
+    let on_disk = config::Config::load(&state.config_path);
+    let mut v = serde_json::to_value(&status).unwrap_or_default();
+    match &on_disk {
+        Ok(saved) => {
+            // Setting names only, never values (this endpoint is not
+            // admin-only and settings include passwords). Includes [ha].
+            let diff = crate::ha::config_diff(
+                &crate::ha::config_sections(&state.config, true),
+                &crate::ha::config_sections(saved, true),
+            );
+            v["pending_changes"] = (!diff.is_empty()).into();
+            v["pending_diff"] = diff.into();
+        }
+        Err(_) => {
+            v["pending_changes"] = true.into();
+            v["pending_diff"] = vec!["(the saved file does not load)"].into();
+        }
+    }
+    let peer_differs = status.peer.as_ref().is_some_and(|p| p.config_hash != status.config_hash);
+    v["peer_config_differs"] = peer_differs.into();
+    v["peer_config_diff"] = match (peer_differs, state.ha.peer_config_sections.lock().unwrap().as_ref()) {
+        (true, Some(peer)) => crate::ha::config_diff(&state.ha.config_sections, peer).into(),
+        _ => serde_json::Value::Array(vec![]),
+    };
+    Json(v)
+}
+
+fn ha_reply<T: serde::Serialize>(r: Result<T, String>) -> Response {
+    match r {
+        Ok(v) => Json(serde_json::json!({ "ok": true, "result": v })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+pub async fn ha_make_active(State(state): State<Arc<AppState>>) -> Response {
+    ha_reply(state.ha.command(crate::ha::HaCommand::MakeActive).await)
+}
+
+pub async fn ha_make_standby(State(state): State<Arc<AppState>>) -> Response {
+    ha_reply(state.ha.command(crate::ha::HaCommand::MakeStandby).await)
+}
+
+#[derive(serde::Deserialize)]
+pub struct PersistBody {
+    /// `null` clears the dashboard override (back to `[ha] persist`).
+    persist: Option<bool>,
+}
+
+pub async fn ha_set_persist(State(state): State<Arc<AppState>>, Json(body): Json<PersistBody>) -> Response {
+    ha_reply(state.ha.command(|tx| crate::ha::HaCommand::SetPersist(body.persist, tx)).await)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ApplyBody {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Restarts this node to apply the saved config file, handing over first
+/// when it is Active (see `HaCommand::Apply`). Refuses a file that would not
+/// load, so a bad edit never takes a node down.
+pub async fn ha_apply(State(state): State<Arc<AppState>>, Json(body): Json<ApplyBody>) -> Response {
+    if let Err(e) = config::Config::load(&state.config_path) {
+        return (StatusCode::BAD_REQUEST, format!("the saved config does not load, not applying: {e:#}")).into_response();
+    }
+    ha_reply(state.ha.command(|reply| crate::ha::HaCommand::Apply { force: body.force, reply }).await)
+}
+
+/// `[ha]` as saved in the config file (which may be ahead of the running
+/// config until applied), for the /ha settings form.
+pub async fn ha_config_get(State(state): State<Arc<AppState>>) -> Response {
+    match config::Config::load(&state.config_path) {
+        Ok(cfg) => Json(cfg.ha).into_response(),
+        Err(_) => Json(state.config.ha.clone()).into_response(),
+    }
+}
+
+/// Saves `[ha]` into the config file, keeping the rest of the file as saved.
+/// A changed `persist` also clears the dashboard override, so the saved
+/// value is the one in effect.
+pub async fn ha_config_put(State(state): State<Arc<AppState>>, Json(ha): Json<config::HaConfig>) -> Response {
+    if let Err(e) = ha.validate() {
+        return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+    }
+    let mut cfg = match config::Config::load(&state.config_path) {
+        Ok(cfg) => cfg,
+        Err(_) => state.config.clone(),
+    };
+    let persist_changed = cfg.ha.persist != ha.persist;
+    cfg.ha = ha;
+    if let Err(e) = save_config(&state, &cfg).await {
+        return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+    }
+    if persist_changed && state.config.ha.enabled {
+        let _ = state.ha.command(|tx| crate::ha::HaCommand::SetPersist(None, tx)).await;
+    }
+    Json(saved_note(&state)).into_response()
+}
+
+/// `ok active` / `ok standby` / ... (or plain `ok` without HA): this process
+/// is up and serving its dashboard, whatever its role.
+async fn dashboard_healthz(State(state): State<Arc<AppState>>) -> String {
+    if state.config.ha.enabled {
+        let role = serde_json::to_value(state.ha.status.borrow().role).unwrap_or_default();
+        format!("ok {}\n", role.as_str().unwrap_or("unknown"))
+    } else {
+        "ok\n".into()
+    }
+}
+
+pub async fn ha_page() -> Html<&'static str> { Html(HA_HTML.as_str()) }
+
+static HA_HTML: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| HA_PAGE.replace("__STYLE__", STYLE).replace("__VERSION__", VERSION));
+
+const HA_PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>High Availability - TETRA Network</title>__STYLE__</head><body><header><h1>HIGH AVAILABILITY</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
+<p><a class=backlink href="/">&larr; Back to dashboard</a></p>
+<div class=banner id=ha-banner></div>
+<div id=ha-off class=panel style="display:none"><p class=muted>HA is not enabled on this node. Fill in the form below and set <b>enabled</b> to turn it on (the node restarts to apply it).</p></div>
+<section class=bts-grid id=ha-nodes></section>
+<section class=panel id=ha-actions style="display:none"><h2>Controls</h2>
+<div class=ctl-row><button id=btn-active onclick="act('active')">Make Active</button><button id=btn-standby onclick="act('standby')">Make Standby</button>
+<span class=muted style="margin-left:12px">Persist:</span><button onclick="persist(true)">On</button><button onclick="persist(false)">Off</button><button onclick="persist(null)">Config default</button>
+<span class=muted style="margin-left:12px">Config:</span><button id=btn-apply onclick="applyCfg(false)">Apply saved config</button></div>
+<div class=ctl-result id=act-result></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Make Active / Make Standby hand the VIP over to the other node, which then holds it (manual hold) until it leaves Active. Persist keeps the Active node Active even when a higher-weight peer comes back; the buttons override the config value until "Config default", and any of them ends a manual hold. While HA is enabled, config changes (here, on Settings, or in the file) take effect only through <b>Apply saved config</b>: an Active node hands over to the Standby first, then restarts. A node that leaves Active restarts into Standby, dropping its sessions so they reconnect to the new Active node through the VIP. The Standby keeps a copy of the Active node's call/SDS history and SMS Center queue; a returning higher-weight node takes over only once its copy is up to date (manual switches do not wait).</p>
+</section>
+<section class=panel id=ha-form style="display:none"><h2>Settings</h2>
+<div class=ctl-row><label><input id=f-enabled type=checkbox> enabled</label><label>node name <input id=f-node_name></label><label>weight <input id=f-weight type=number min=0></label><label><input id=f-persist type=checkbox> persist</label></div>
+<div class=ctl-row><label>VIP (a.b.c.d/nn) <input id=f-vip></label><label>interface <input id=f-vip_interface></label><label>this node's real IP <input id=f-real_ip></label><label>peer real IP <input id=f-peer_ip></label></div>
+<div class=ctl-row><label>heartbeat port <input id=f-heartbeat_port type=number></label><label>interval ms <input id=f-heartbeat_interval_ms type=number></label><label>dead after ms <input id=f-dead_after_ms type=number></label><label>shared secret <input id=f-shared_secret type=password></label><label>gateway check IP <input id=f-check_gateway placeholder="optional"></label></div>
+<div class=ctl-row><button onclick="saveCfg()">Save</button></div>
+<div class=ctl-result id=cfg-result></div>
+<p class=map-note style="color:#8fa2b8;font-size:12px">Both nodes need the same VIP, heartbeat port and secret; node name, weight and the two real IPs are per node (swap real/peer IP on the other node). Saving writes the config file only; apply it with the button above.</p>
+</section>
+<section class=panel><h2>Role changes</h2><table><thead><tr><th>Time</th><th>From</th><th>To</th><th>Reason</th></tr></thead><tbody id=log></tbody></table></section>
+</main><script>
+const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const yn=b=>b?'yes':'no';
+const roleBadge=r=>`<span class="badge ha-${r}">${esc(r).toUpperCase()}</span>`;
+let admin=false,formLoaded=false,last=null;
+function replText(d){const r=d.replication;if(!r)return '-';if(!r.needed)return '<span class=muted>nothing to replicate</span>';
+  if(d.role==='active')return r.connected?'serving the Standby':'<b>no Standby connected</b>';
+  const ago=r.last_rx_ms_ago!=null?` <span class=muted>(${(r.last_rx_ms_ago/1000).toFixed(0)}s ago)</span>`:'';
+  return (r.synced?'in sync':r.connected?'<b>catching up</b>':'<b>not connected</b>')+ago;}
+function node(title,rows){return `<div class=bts-card><h3>${title}</h3><table>${rows.map(([k,v])=>`<tr><th>${k}</th><td>${v}</td></tr>`).join('')}</table></div>`;}
+async function load(){
+  try{
+    const d=await (await fetch('/api/ha')).json();
+    last=d;
+    $('status').textContent='Live';
+    $('ha-off').style.display=d.enabled?'none':'block';
+    $('ha-actions').style.display=admin&&d.enabled?'block':'none';
+    const b=[];
+    const list=a=>a&&a.length?': '+a.map(x=>`<code>${esc(x)}</code>`).join(', '):'';
+    if(d.pending_changes)b.push('The config file has saved changes that are not applied yet'+list(d.pending_diff));
+    if(d.peer_config_differs)b.push('The peer runs a different config'+(d.peer_config_diff&&d.peer_config_diff.length?list(d.peer_config_diff):' (details arrive within a few seconds)'));
+    if(d.enabled&&!d.gateway_ok)b.push('Gateway check failing: this node cannot become Active.');
+    $('ha-banner').style.display=b.length?'block':'none';$('ha-banner').innerHTML=b.join('<br>');
+    if(d.enabled){
+      const p=d.peer;
+      $('ha-nodes').innerHTML=node(`This node: ${esc(d.node)} ${roleBadge(d.role)}`,[
+        ['Weight',d.weight],['Persist',`${yn(d.persist)} <span class=muted>(${d.persist_source==='override'?'dashboard override':'config'})</span>`],
+        ['Manual hold',yn(d.hold)],['VIP',`${esc(d.vip)} ${d.vip_held?'<b>held here</b>':'<span class=muted>not held</span>'}`],
+        ['Gateway check',d.gateway_ok?'ok':'<b>failing</b>'],['Handing over to',esc(d.handover_to||'-')],
+        ['Replication',replText(d)],['Records from peer',d.replication&&d.replication.needed?`${d.replication.records_received} (+${d.replication.sms_snapshots_received} SMS queue snapshots)`:'-']])
+      +node(p?`Peer: ${esc(p.node)} ${p.alive?roleBadge(p.role):roleBadge('down')}`:'Peer: never heard',p?[
+        ['Address',esc(p.ip)],['Weight',p.weight],['Persist',yn(p.persist)],['Manual hold',yn(p.hold)],['Replica up to date',yn(p.synced)],
+        ['Last heartbeat',`${(p.last_seen_ms_ago/1000).toFixed(1)}s ago`]]:[['Status','no heartbeat received yet']]);
+      $('btn-active').disabled=d.role!=='standby';$('btn-standby').disabled=d.role!=='active';
+    }
+    $('log').innerHTML=(d.transitions||[]).map(t=>`<tr><td>${new Date(t.ts_ms).toLocaleString()}</td><td>${roleBadge(t.from)}</td><td>${roleBadge(t.to)}</td><td>${esc(t.reason)}</td></tr>`).join('')||'<tr><td colspan=4 class=muted>No role changes yet</td></tr>';
+  }catch(e){$('status').textContent='Disconnected';}
+}
+async function post(url,body,out){
+  const r=await fetch(url,{method:url.includes('/config/')?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const t=await r.text();let msg=t;try{const j=JSON.parse(t);msg=j.note||(typeof j.result==='string'?j.result:'done');}catch(e){}
+  $(out).textContent=(r.ok?'':'Error: ')+msg;return r.ok;
+}
+// Confirmation texts name both nodes and spell out the consequences.
+const me=()=>last?last.node:'this node';
+const peerName=()=>last&&last.peer?last.peer.node:'the peer';
+const replNote=(who,ok)=>ok?'':`\n\nWarning: ${who}'s copy of the call history and SMS Center queue is not up to date; anything not copied yet stays behind.`;
+async function act(which){
+  const d=last||{},p=d.peer||{},r=d.replication||{};
+  const msg=which==='active'
+    ?`Make ${me()} Active?\n\n${peerName()} hands the VIP over to ${me()}. Basestations, peers and SIP calls on ${peerName()} are dropped and reconnect here; ${peerName()} restarts into Standby.\n\n${me()} then keeps the VIP (manual hold) until it leaves Active or a Persist button is pressed.`+replNote(me(),!r.needed||r.synced)
+    :`Make ${me()} Standby?\n\n${peerName()} takes over the VIP. Basestations, peers and SIP calls on ${me()} are dropped and reconnect to ${peerName()}; ${me()} restarts into Standby.\n\n${peerName()} then keeps the VIP (manual hold) until it leaves Active or a Persist button is pressed.`+replNote(peerName(),p.synced!==false);
+  if(!confirm(msg))return;
+  await post('/api/ha/'+which,{},'act-result');load();
+}
+async function persist(v){
+  if(v===null){
+    const c=window._haCfg?(window._haCfg.persist?'on':'off'):'the config file value';
+    if(!confirm(`Reset Persist on ${me()} to the config default (${c})?\n\nThis removes the dashboard override and ends any manual hold. If persist ends up off and ${peerName()} has the higher weight, ${peerName()} takes over the VIP once its copy of the data is up to date, and sessions on ${me()} reconnect there.`))return;
+  }
+  await post('/api/ha/persist',{persist:v},'act-result');load();
+}
+async function applyCfg(force){
+  const d=last||{},changes=(d.pending_diff||[]).join(', ');
+  const what=changes?`Changes to apply: ${changes}`:'No setting changes are pending; this only restarts the node.';
+  const how=d.role==='active'
+    ?`${me()} is Active: it hands the VIP over to ${peerName()} first, then restarts. Sessions on ${me()} reconnect to ${peerName()}.`
+    :`${me()} is ${d.role||'not Active'}: it restarts; service on ${peerName()} is not affected.`;
+  if(!force&&!confirm(`Apply the saved config on ${me()}?\n\n${what}\n\n${how}`))return;
+  const r=await fetch('/api/ha/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force})});
+  const t=await r.text();
+  if(!r.ok&&r.status===409&&!force){if(confirm(t+'\n\nRestart anyway?'))return applyCfg(true);}
+  try{$('act-result').textContent=r.ok?JSON.parse(t).result:'Error: '+t;}catch(e){$('act-result').textContent=t;}
+}
+const fields=['enabled','node_name','weight','persist','vip','vip_interface','real_ip','peer_ip','heartbeat_port','heartbeat_interval_ms','dead_after_ms','shared_secret','check_gateway'];
+async function loadCfg(){
+  const c=await (await fetch('/api/config/ha')).json();
+  for(const f of fields){const el=$('f-'+f);if(el.type==='checkbox')el.checked=!!c[f];else el.value=c[f]??'';}
+  c.state_path=c.state_path;window._haCfg=c;
+}
+async function saveCfg(){
+  const c=Object.assign({},window._haCfg||{});
+  for(const f of fields){const el=$('f-'+f);c[f]=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value.trim();}
+  await post('/api/config/ha',c,'cfg-result');load();
+}
+function doLogout(){location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}
+fetch('/api/whoami').then(r=>r.json()).then(w=>{admin=!!w.admin;if(admin){$('ha-form').style.display='block';loadCfg();}if(w.username){$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}load();}).catch(()=>load());
+setInterval(load,2000);
+</script></body></html>"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1451,7 @@ mod tests {
             ("sip-config", SIP_CONFIG_HTML.as_str()),
             ("connections", CONNECTIONS_HTML.as_str()),
             ("settings", SETTINGS_HTML.as_str()),
+            ("ha", HA_HTML.as_str()),
         ];
         for (name, html) in pages {
             assert!(html.contains("id=whoami") || html.contains("id=\"whoami\""), "{name}: whoami span present");

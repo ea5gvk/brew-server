@@ -13,6 +13,7 @@ use crate::telemetry::SdsTelemetryRecord;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// One persisted event, appended in the order it occurred.
@@ -32,6 +33,32 @@ pub enum StoredRecord {
 pub struct Store {
     path: PathBuf,
     file: Mutex<std::fs::File>,
+    /// Content hashes of every record in the log, so a record replicated
+    /// from the HA peer that is already here (one this node wrote and the
+    /// peer copied earlier) is not appended twice. See `append_replicated`.
+    known: Mutex<HashSet<u64>>,
+}
+
+/// FNV-1a over a record's serialized body.
+fn body_hash(body: &[u8]) -> u64 {
+    body.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Splits framed log bytes into record bodies, stopping at a torn or
+/// corrupt frame. Returns the bodies and how many bytes they covered.
+pub fn split_frames(buf: &[u8]) -> (Vec<&[u8]>, usize) {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= buf.len() {
+        let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        let end = pos + 4 + len;
+        if end > buf.len() {
+            break;
+        }
+        out.push(&buf[pos + 4..end]);
+        pos = end;
+    }
+    (out, pos)
 }
 
 impl Store {
@@ -49,19 +76,73 @@ impl Store {
             .append(true)
             .read(true)
             .open(&path)?;
-        Ok(Self { path, file: Mutex::new(file) })
+        let mut known = HashSet::new();
+        if let Ok(buf) = std::fs::read(&path) {
+            for body in split_frames(&buf).0 {
+                known.insert(body_hash(body));
+            }
+        }
+        Ok(Self { path, file: Mutex::new(file), known: Mutex::new(known) })
     }
 
     /// Appends one record, framed with a u32 length prefix, and flushes.
     pub fn append(&self, rec: &StoredRecord) -> std::io::Result<()> {
         let body = bincode::serialize(rec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.append_body(&body)
+    }
+
+    fn append_body(&self, body: &[u8]) -> std::io::Result<()> {
         let len = body.len() as u32;
         let mut f = self.file.lock().unwrap();
         f.write_all(&len.to_le_bytes())?;
-        f.write_all(&body)?;
+        f.write_all(body)?;
         f.flush()?;
+        self.known.lock().unwrap().insert(body_hash(body));
         Ok(())
+    }
+
+    /// Appends a record body received from the HA peer, unless an identical
+    /// record is already in the log. Returns the decoded record when it was
+    /// new, so the caller can add it to the in-memory history.
+    ///
+    /// Identity is by content: two genuinely separate but byte-identical
+    /// records (in practice only a second `SdsReport` for the same SDS) are
+    /// kept once.
+    pub fn append_replicated(&self, body: &[u8]) -> std::io::Result<Option<StoredRecord>> {
+        if self.known.lock().unwrap().contains(&body_hash(body)) {
+            return Ok(None);
+        }
+        let rec: StoredRecord = bincode::deserialize(body)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.append_body(body)?;
+        Ok(Some(rec))
+    }
+
+    /// Reads up to `max` bytes of complete frames starting at byte `offset`
+    /// of the log, for HA replication. An offset past the end (the log was
+    /// replaced) restarts from 0. Returns (start, frames, end).
+    pub fn read_frames(&self, offset: u64, max: usize) -> std::io::Result<(u64, Vec<u8>, u64)> {
+        use std::io::Seek;
+        let mut f = std::fs::File::open(&self.path)?;
+        let len = f.metadata()?.len();
+        let start = if offset > len { 0 } else { offset };
+        f.seek(std::io::SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        (&mut f).take(max as u64).read_to_end(&mut buf)?;
+        let (bodies, used) = split_frames(&buf);
+        if bodies.is_empty() && buf.len() >= 4 {
+            // A single record larger than `max`: read exactly that one.
+            let need = 4 + u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if (start + need as u64) <= len {
+                f.seek(std::io::SeekFrom::Start(start))?;
+                let mut one = vec![0u8; need];
+                f.read_exact(&mut one)?;
+                return Ok((start, one, start + need as u64));
+            }
+        }
+        buf.truncate(used);
+        Ok((start, buf, start + used as u64))
     }
 
     /// Reads the entire log from `path`, returning every complete record. A torn
@@ -77,20 +158,11 @@ impl Store {
         file.read_to_end(&mut buf)?;
 
         let mut out = Vec::new();
-        let mut pos = 0usize;
-        while pos + 4 <= buf.len() {
-            let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-            let start = pos + 4;
-            let end = start + len;
-            if end > buf.len() {
-                // Torn trailing record — stop cleanly.
-                break;
-            }
-            match bincode::deserialize::<StoredRecord>(&buf[start..end]) {
+        for body in split_frames(&buf).0 {
+            match bincode::deserialize::<StoredRecord>(body) {
                 Ok(rec) => out.push(rec),
                 Err(_) => break, // corrupt frame; stop at last good record
             }
-            pos = end;
         }
         Ok(out)
     }
@@ -160,6 +232,39 @@ mod tests {
         let recs = Store::replay(&p).unwrap();
         assert_eq!(recs.len(), 1, "should recover the one complete record and stop");
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn replicated_records_are_deduplicated_and_tail_reads_resume() {
+        let (pa, pb) = (tmp("repl-a"), tmp("repl-b"));
+        let a = Store::open(&pa).unwrap();
+        let b = Store::open(&pb).unwrap();
+        a.append(&StoredRecord::Call(call(1))).unwrap();
+        a.append(&StoredRecord::Sds(sds(2))).unwrap();
+
+        // b copies a's log in two small reads.
+        let (start, frames, mid) = a.read_frames(0, 8).unwrap();
+        assert_eq!(start, 0);
+        let (_, rest, end) = a.read_frames(mid, 1 << 20).unwrap();
+        for body in split_frames(&frames).0.into_iter().chain(split_frames(&rest).0) {
+            assert!(b.append_replicated(body).unwrap().is_some());
+        }
+        assert_eq!(end, std::fs::metadata(&pa).unwrap().len());
+        assert_eq!(a.read_frames(end, 1 << 20).unwrap().1.len(), 0, "nothing new");
+
+        // Copying a's log back from b adds nothing to a.
+        let (_, back, _) = b.read_frames(0, 1 << 20).unwrap();
+        for body in split_frames(&back).0 {
+            assert!(a.append_replicated(body).unwrap().is_none());
+        }
+        assert_eq!(Store::replay(&pa).unwrap().len(), 2);
+        // Dedup survives a reopen.
+        let a2 = Store::open(&pa).unwrap();
+        assert!(a2.append_replicated(split_frames(&back).0[0]).unwrap().is_none());
+        // An offset past the end restarts from 0.
+        assert_eq!(a.read_frames(end + 100, 1 << 20).unwrap().0, 0);
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
     }
 
     #[test]

@@ -5,6 +5,8 @@ mod dashboard;
 mod federation;
 mod fedroute;
 mod fsnet;
+mod ha;
+mod ha_repl;
 mod monitor;
 mod position;
 mod protocol;
@@ -35,8 +37,35 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(state);
 
     // Watch the config file; when it changes, restart the whole process so the
-    // new configuration takes effect from a clean state.
-    tokio::spawn(config_watcher(path.clone()));
+    // new configuration takes effect from a clean state. Not with HA enabled:
+    // a restart of the Active node is a failover, so there changes are only
+    // applied when an admin asks for it from the dashboard.
+    if state.config.ha.enabled {
+        tracing::info!("HA enabled: config file changes are applied from the dashboard only");
+    } else {
+        tokio::spawn(config_watcher(path.clone()));
+    }
+
+    tokio::try_join!(
+        ha::run(state.clone()),
+        ha_repl::run(state.clone()),
+        dashboard::run(state.clone()),
+        services(state.clone(), aprs_rx),
+    )?;
+    Ok(())
+}
+
+/// Everything that serves Basestations, terminals, peers and SIP. With HA
+/// enabled it starts only once this node is Active (and a node that stops
+/// being Active restarts itself, see `ha::run`); without HA, immediately.
+async fn services(
+    state: Arc<AppState>,
+    aprs_rx: tokio::sync::mpsc::UnboundedReceiver<aprs::PositionReport>,
+) -> anyhow::Result<()> {
+    state.ha.wait_active().await;
+    if state.config.ha.enabled {
+        ha::wait_ports_free(&state).await;
+    }
 
     if state.config.max_call_duration_seconds > 0 || state.config.call_inactivity_timeout_seconds > 0 {
         tokio::spawn(router::run_call_duration_sweep(state.clone()));
@@ -50,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
         server::run(state.clone()),
         telemetry::run(state.clone()),
         control::run(state.clone()),
-        dashboard::run(state.clone()),
         sip::run(state.clone()),
     )?;
     Ok(())
@@ -90,7 +118,7 @@ async fn config_watcher(path: String) {
 /// Re-executes the current binary with the original arguments, replacing this
 /// process. On success this never returns; on failure we log and exit non-zero
 /// so a process supervisor (systemd, Docker restart policy) can bring us back.
-fn restart_process() {
+pub(crate) fn restart_process() {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {

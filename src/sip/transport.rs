@@ -155,7 +155,7 @@ pub async fn run(app: Arc<crate::state::AppState>) -> anyhow::Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
-    let sock = Arc::new(UdpSocket::bind(cfg.listen).await?);
+    let sock = Arc::new(UdpSocket::bind(app.service_bind(cfg.listen)).await?);
     let local = sock.local_addr()?;
     let advertised_host = if cfg.advertised_host.is_empty() {
         if local.ip().is_unspecified() {
