@@ -333,7 +333,7 @@ impl AppState {
         };
         let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
         let sms_center = crate::sms_center::SmsCenter::open(config.sms_center.clone());
-        let config_hash = crate::ha::config_hash(&std::fs::read_to_string(&config_path).unwrap_or_default());
+        let config_hash = crate::ha::config_hash(&config);
         let ha = crate::ha::HaHandle::new(&config.ha, config_hash);
         (
             Self {

@@ -1150,9 +1150,13 @@ fetch('/api/whoami').then(r=>r.json()).then(w=>{if(!w.admin)$('settings-link').s
 /// differs from the one this process runs (saved but not applied yet).
 pub async fn ha_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let status = state.ha.status.borrow().clone();
-    let on_disk = crate::ha::config_hash(&std::fs::read_to_string(&state.config_path).unwrap_or_default());
+    // A file that no longer loads also counts as pending (Apply refuses it).
+    let on_disk = config::Config::load(&state.config_path).ok().map(|c| crate::ha::config_hash(&c));
     let mut v = serde_json::to_value(&status).unwrap_or_default();
-    v["pending_changes"] = (on_disk != status.config_hash).into();
+    let ha_changed = config::Config::load(&state.config_path).is_ok_and(|c| {
+        serde_json::to_value(&c.ha).ok() != serde_json::to_value(&state.config.ha).ok()
+    });
+    v["pending_changes"] = (ha_changed || on_disk != Some(status.config_hash)).into();
     v["peer_config_differs"] = status.peer.as_ref().is_some_and(|p| p.config_hash != status.config_hash).into();
     Json(v)
 }

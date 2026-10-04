@@ -589,8 +589,39 @@ pub async fn wait_ports_free(state: &AppState) {
     warn!("service ports still in use after 10s; starting anyway");
 }
 
-/// FNV-1a: stable across builds, unlike `DefaultHasher`, so both nodes agree.
-pub fn config_hash(text: &str) -> u64 {
+/// Fingerprint of the settings both HA nodes are expected to share, so the
+/// dashboard can flag a mismatch with the peer or unapplied changes on disk.
+///
+/// Hashes the parsed config (so comments, spacing and key order don't
+/// count) without the settings that legitimately differ per node: all of
+/// `[ha]`, and file locations -- every `*_path` (TLS certificate/key, CA
+/// bundle, pinned peer certificate, ...) plus the `[storage]` and
+/// `[sms_center]` file paths. `websocket_path` and a federation peer's URL
+/// `path` are kept: those are protocol settings, not files.
+pub fn config_hash(cfg: &crate::config::Config) -> u64 {
+    fn strip(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.retain(|k, _| !k.ends_with("_path") || k == "websocket_path");
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut v = serde_json::to_value(cfg).unwrap_or_default();
+    if let Some(map) = v.as_object_mut() {
+        map.remove("ha");
+        for section in ["storage", "sms_center"] {
+            if let Some(s) = map.get_mut(section).and_then(|s| s.as_object_mut()) {
+                s.remove("path");
+            }
+        }
+    }
+    strip(&mut v);
+    // serde_json maps are sorted by key, so this text is canonical.
+    let text = v.to_string();
+    // FNV-1a: stable across builds, unlike `DefaultHasher`, so both nodes agree.
     text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
@@ -1117,6 +1148,31 @@ mod tests {
         hb.boot_id = 2;
         hb.seq = 1;
         assert!(g.accept(&hb, 100_000), "restart resets seq");
+    }
+
+    #[test]
+    fn config_hash_ignores_per_node_settings_and_file_paths() {
+        use crate::config::Config;
+        let base = Config::default();
+        let mut other = base.clone();
+        other.ha.node_name = "b".into();
+        other.ha.weight = 1;
+        other.ha.real_ip = "192.0.2.12".parse().unwrap();
+        other.tls.cert_path = "/other/cert.pem".into();
+        other.dashboard.tls.key_path = "/other/key.pem".into();
+        other.storage.path = "/var/other.bin".into();
+        other.sms_center.path = "/var/other.json".into();
+        assert_eq!(config_hash(&base), config_hash(&other));
+
+        let mut routed = base.clone();
+        routed.route_without_affiliations = !base.route_without_affiliations;
+        assert_ne!(config_hash(&base), config_hash(&routed));
+        let mut ws = base.clone();
+        ws.websocket_path = "/other".into();
+        assert_ne!(config_hash(&base), config_hash(&ws), "websocket_path is a protocol setting");
+        let text = base.to_toml_pretty().unwrap();
+        let reparsed = Config::parse(&format!("# a comment\n{text}")).unwrap();
+        assert_eq!(config_hash(&base), config_hash(&reparsed), "comments don't count");
     }
 
     #[test]

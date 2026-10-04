@@ -141,7 +141,12 @@ The **High Availability** page (`/ha`) shows both nodes: role, weight,
 persist (and whether it comes from the config or the dashboard), manual hold,
 who holds the VIP, the gateway check, the time since the peer's last
 heartbeat, and the log of role changes. It warns when saved changes are not
-applied yet, or when the two nodes run different config files. Every page
+applied yet, or when the two nodes' configs differ. That comparison ignores
+everything that is meant to differ per node -- the whole `[ha]` section and
+file locations (TLS certificate/key and CA paths, pinned certificates, the
+`[storage]` and `[sms_center]` files) -- as well as comments and formatting,
+so it only fires for a real setting mismatch (routing, SIP, federation,
+users, ...). Every page
 header shows this node's role.
 
 Admins (see `[dashboard] admins`) also get **Make Active**, **Make
