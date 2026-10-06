@@ -2,7 +2,7 @@
 
 All notable changes to brew-server, newest first.
 
-Unreleased:
+Version 1.15.2 adds:
 
 - **Open/read-only dashboard mode with admin Login button.** A new
   `[dashboard.ui]` `open` flag (default `false`). When `ui.open = true`, the
