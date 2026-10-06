@@ -6,10 +6,10 @@ use crate::{
 };
 use anyhow::Context;
 use axum::{
-    extract::{Path, State, ws::{Message, WebSocket, WebSocketUpgrade}},
+    extract::{Path, Query, State, ws::{Message, WebSocket, WebSocketUpgrade}},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
 };
@@ -30,12 +30,18 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Settings (viewing and editing server config) is split into its own
-    // sub-router with an extra require_admin layer, merged into the rest of
-    // the dashboard. require_basic below applies to the merged whole and
-    // runs first (authenticate), then require_admin runs for just these
-    // routes (authorize) -- see both functions' docs.
+    // Privileged routes -- viewing/editing server config *and* issuing
+    // Basestation control commands -- are split into their own sub-router
+    // with an extra require_admin layer, merged into the rest of the
+    // dashboard. require_basic below applies to the merged whole and runs
+    // first (authenticate, or wave through when the dashboard is open), then
+    // require_admin runs for just these routes (authorize) -- see both
+    // functions' docs. `/login` lives here too so the header Login button,
+    // which just navigates to it, triggers require_admin's auth challenge
+    // and then bounces back to wherever Login was pressed.
     let settings_routes = Router::new()
+        .route("/login", get(login))
+        .route("/api/control/{id}", axum::routing::post(control_command))
         .route("/settings", get(settings_page))
         .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
         .route("/api/config/sip/full", get(sip_config_full))
@@ -69,7 +75,6 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/positions", get(positions_snapshot))
         .route("/api/bts-locations", get(bts_locations_snapshot))
         .route("/api/control", get(control_list))
-        .route("/api/control/{id}", axum::routing::post(control_command))
         .route("/sip", get(sip_page))
         .route("/sip-config", get(sip_config_page))
         .route("/api/sip", get(sip_snapshot))
@@ -114,39 +119,68 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 /// HTTP Basic auth guard for every dashboard route (including the `/api/live`
 /// WebSocket upgrade, which browsers authenticate with a normal Authorization
 /// header on the handshake). No configured users means auth is disabled.
+///
+/// When `[dashboard.ui].open` is set, viewing never requires a login: the
+/// request is waved through regardless of credentials, so anyone can watch
+/// the (read-only) dashboard and an admin logs in on demand via the header
+/// Login button. Privileged routes stay protected by `require_admin`
+/// underneath. When `open` is false (the default), configured `users` must
+/// present a valid credential just to view, the original behavior.
 async fn require_basic(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
-    let users = &state.config.dashboard.users;
+    let cfg = &state.config.dashboard;
+    if cfg.ui.open {
+        return next.run(request).await;
+    }
+    let users = &cfg.users;
     if users.is_empty() || basic_username(users, request.headers()).is_some() {
         return next.run(request).await;
     }
-    basic_challenge(&state.config.dashboard.realm)
+    basic_challenge(&cfg.realm)
 }
 
-/// Guards the settings sub-router (see `run`): only usernames listed in
-/// `[dashboard].admins` may view or change server config. Runs *after*
-/// `require_basic` (which already rejected a bad/missing credential), so
-/// this only needs to decide authorization, not authentication -- an empty
-/// `admins` list means "every dashboard user", matching this feature's
-/// pre-existing all-or-nothing behavior for anyone who doesn't need the
-/// split. A denied request gets a real `403` with a short explanation, not
-/// a bare/blank page, since the settings *page itself* is gated here (not
-/// just its data), so a non-admin following the Settings link needs to
-/// understand why nothing loaded.
+/// Guards the privileged sub-router (see `run`): only usernames listed in
+/// `[dashboard].admins` may view/change server config or issue Basestation
+/// control commands. An empty `admins` list means "every configured user",
+/// matching the pre-existing all-or-nothing behavior; empty `users` means
+/// auth is disabled entirely (everyone is an admin).
+///
+/// A request with a *valid but non-admin* credential gets a real `403` with
+/// a short explanation. A request with *no/invalid* credential instead gets
+/// a Basic-auth challenge (`401`): in open mode an anonymous visitor reaches
+/// here only by following the Settings link or pressing Login, and the
+/// challenge is what makes the browser pop its native login dialog. (In
+/// closed mode `require_basic` has already authenticated the caller, so the
+/// `None` arm isn't reached there.)
 async fn require_admin(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
     let cfg = &state.config.dashboard;
-    if cfg.users.is_empty() || cfg.admins.is_empty() {
-        return next.run(request).await;
+    if cfg.users.is_empty() {
+        return next.run(request).await; // auth disabled: everyone is an admin
     }
     match basic_username(&cfg.users, request.headers()) {
-        Some(user) if cfg.admins.iter().any(|a| a == &user) => next.run(request).await,
-        _ => (StatusCode::FORBIDDEN, "Forbidden: this dashboard user is not listed in [dashboard].admins\n").into_response(),
+        Some(user) if cfg.admins.is_empty() || cfg.admins.iter().any(|a| a == &user) => next.run(request).await,
+        Some(_) => (StatusCode::FORBIDDEN, "Forbidden: this dashboard user is not listed in [dashboard].admins\n").into_response(),
+        None => basic_challenge(&cfg.realm),
     }
 }
 
-/// Returns the authenticated username for `/api/whoami` -- lets the
-/// dashboard's own JS decide whether to show the Settings nav link, without
-/// duplicating the admin check client-side (the real enforcement is
-/// `require_admin`; this is purely a UI convenience).
+/// The header Login button's target. It sits behind `require_admin`, so by
+/// the time this runs the browser has supplied valid admin credentials (and
+/// cached them for the rest of the origin, unlocking `/settings`, the
+/// `/api/config/*` editors and Basestation control). It just bounces the
+/// user back to wherever they pressed Login. `next` is honored only when
+/// it's a local path, so the button can't be turned into an open redirect.
+async fn login(Query(q): Query<HashMap<String, String>>) -> Redirect {
+    let next = q.get("next").map(String::as_str).unwrap_or("/");
+    let safe = if next.starts_with('/') && !next.starts_with("//") { next } else { "/" };
+    Redirect::to(safe)
+}
+
+/// Returns the authenticated username for `/api/whoami`, plus whether the
+/// dashboard is in open/read-only mode and whether a Login button should be
+/// offered. Lets the dashboard's own JS swap the header Login/Logout control,
+/// hide the Settings link and Basestation control from non-admins, and mark
+/// the body read-only -- the real enforcement is `require_admin`/`require_basic`;
+/// this is purely a UI convenience.
 async fn whoami(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<serde_json::Value> {
     let cfg = &state.config.dashboard;
     let username = basic_username(&cfg.users, &headers);
@@ -155,7 +189,10 @@ async fn whoami(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<
         Some(user) => cfg.admins.is_empty() || cfg.admins.iter().any(|a| a == user),
         None => false,
     };
-    Json(serde_json::json!({ "username": username, "admin": admin }))
+    // A Login button is useful only in open mode, when nobody is signed in
+    // yet and there's actually a credential to sign in with.
+    let can_login = cfg.ui.open && username.is_none() && !cfg.users.is_empty();
+    Json(serde_json::json!({ "username": username, "admin": admin, "open": cfg.ui.open, "can_login": can_login }))
 }
 
 /// Validates the request's HTTP Basic credentials against `users` and
@@ -196,7 +233,7 @@ pub async fn index() -> Html<&'static str> { Html(INDEX_HTML.as_str()) }
 fn log_page(title: &str, endpoint: &str, extract_js: &str, row_js: &str, columns: &[&str], per_page: usize, empty_msg: &str) -> String {
     let headers: String = columns.iter().map(|c| format!("<th>{c}</th>")).collect();
     let colspan = columns.len();
-    format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title} - TETRA Network</title>{style}</head><body><header><h1>{title}</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+    format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title} - TETRA Network</title>{style}</head><body><header><h1>{title}</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <section class=panel><table><thead><tr>{headers}</tr></thead><tbody id=log></tbody></table><div class=pager id=log-pager></div></section>
 </main><script>
@@ -226,8 +263,6 @@ document.addEventListener('click',e=>{{const b=e.target.closest('button[data-pg]
 function draw(){{renderPaged('log',last,x=>{row_js},{per_page},{colspan},'{empty_msg}');}}
 async function load(){{try{{const d=await(await fetch('{endpoint}')).json();last={extract_js};draw();$('status').textContent='Live';}}catch(e){{$('status').textContent='Disconnected';}}}}
 load();setInterval(load,2000);
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#,
         title = title, style = STYLE, ver = VERSION, headers = headers, colspan = colspan,
         row_js = row_js, per_page = per_page, empty_msg = empty_msg,
@@ -264,7 +299,7 @@ static REGISTRATIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::ne
 static SMS_CENTER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| log_page(
     "SMS Center", "/api/sms-center",
     "(d.messages||[]).slice().sort((a,b)=>b.stored_at_ms-a.stored_at_ms)",
-    "`<tr><td>${new Date(x.stored_at_ms).toLocaleString()}</td><td>${x.source_issi}</td><td>${x.destination}</td><td>${x.text?esc(x.text):'<span class=muted>'+esc(x.data_hex.slice(0,24))+'</span>'}</td><td>${x.in_flight?'<span class=\"badge badge-reg-timeout\">Delivering</span>':'<span class=\"badge badge-sds\">Waiting</span>'}</td><td>${x.attempts}</td><td>${new Date(x.expires_at_ms).toLocaleString()}</td><td><button onclick=\"if(confirm('Delete this stored message?'))fetch('/api/sms-center/${x.id}',{method:'DELETE'}).then(load)\">Delete</button></td></tr>`",
+    "`<tr><td>${new Date(x.stored_at_ms).toLocaleString()}</td><td>${x.source_issi}</td><td>${x.destination}</td><td>${x.text?esc(x.text):'<span class=muted>'+esc(x.data_hex.slice(0,24))+'</span>'}</td><td>${x.in_flight?'<span class=\"badge badge-reg-timeout\">Delivering</span>':'<span class=\"badge badge-sds\">Waiting</span>'}</td><td>${x.attempts}</td><td>${new Date(x.expires_at_ms).toLocaleString()}</td><td><button class=admin-only onclick=\"if(confirm('Delete this stored message?'))fetch('/api/sms-center/${x.id}',{method:'DELETE'}).then(load)\">Delete</button></td></tr>`",
     &["Stored", "From", "To", "Message", "Status", "Attempts", "Expires", ""], 20, "No stored messages",
 ));
 
@@ -276,7 +311,7 @@ static MAP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| forma
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 {style}
 <style>#map{{height:70vh;border:1px solid #203047;border-radius:12px}}.map-note{{font-size:12px;color:#8fa2b8;margin-top:10px}}.leaflet-popup-content{{color:#0d1826}}</style>
-</head><body><header><h1>MS MAP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+</head><body><header><h1>MS MAP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <section class=panel><h2>Mobile station positions</h2><div id=map></div>
 <div class=map-note id=note>Loading positions&hellip;</div>
@@ -338,13 +373,11 @@ async function load(){{
   }}catch(e){{}}
 }}
 load();setInterval(load,3000);
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 /// SIP live panel: registrations, trunks and active calls, polled from
 /// /api/sip every 2s. Renders a clear "disabled" notice when SIP is off.
-static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+static SIP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP / VoIP - TETRA Network</title>{style}</head><body><header><h1>SIP / VoIP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP configuration &rarr;</a></p>
 <div class=banner id=disabled-banner>SIP subsystem is disabled. Enable it in the <code>[sip]</code> section of the config file.</div>
 <section class=cards>
@@ -382,14 +415,12 @@ async function load(){{
   }}catch(e){{$('status').textContent='Disconnected';}}
 }}
 load();setInterval(load,2000);
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 /// SIP configuration screen: a read-only view of the provisioned extensions,
 /// trunks and voice routes from the config file, plus an inline explanation
 /// that edits are made in the TOML (which the server hot-reloads).
-static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP Config - TETRA Network</title>{style}</head><body><header><h1>SIP CONFIGURATION</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+static SIP_CONFIG_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>SIP Config - TETRA Network</title>{style}</head><body><header><h1>SIP CONFIGURATION</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip">SIP live panel &rarr;</a></p>
 <div class=banner id=disabled-banner>SIP subsystem is disabled. Set <code>enabled = true</code> under <code>[sip]</code>.</div>
 <section class=panel><h2>General</h2><table><tbody id=general></tbody></table>
@@ -425,15 +456,13 @@ async function load(){{
   }}catch(e){{$('status').textContent='Disconnected';}}
 }}
 load();setInterval(load,5000);
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(!w.admin)$('settings-link').style.display='none';if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 /// Live "who's connected now" page: Brew connections, registered mobile
 /// stations, and SIP registrations/trunks. Distinct from `/registrations`,
 /// which is a historical event log (registers/deregisters over time), not a
 /// current-state snapshot.
-static CONNECTIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Connections - TETRA Network</title>{style}</head><body><header><h1>LIVE CONNECTIONS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+static CONNECTIONS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Connections - TETRA Network</title>{style}</head><body><header><h1>LIVE CONNECTIONS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/registrations">Registration event log &rarr;</a></p>
 <p class=map-note style="color:#8fa2b8;font-size:12px">Who is connected and registered right now, not a history of events. Refreshes every 5s.</p>
 
@@ -465,11 +494,9 @@ async function load(){{
   }}catch(e){{$('status').textContent='Disconnected';}}
 }}
 load();setInterval(load,5000);
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
-static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Settings - TETRA Network</title>{style}</head><body><header><h1>SETTINGS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
+static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Settings - TETRA Network</title>{style}</head><body><header><h1>SETTINGS</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a> &nbsp;·&nbsp; <a class=backlink href="/sip-config">SIP Config (read-only view) &rarr;</a></p>
 <div class=banner id=save-banner></div>
 <p class=map-note style="color:#8fa2b8;font-size:12px">Every save here writes the server's TOML config file and the process restarts within a couple seconds to apply it (the same mechanism as hand-editing the file). A brief connection drop across the restart is expected.</p>
@@ -581,8 +608,6 @@ async function saveRaw(){{
   banner(true,'Saved. Restarting to apply…');
 }}
 loadSip();loadRaw();loadBtsLocs();
-function doLogout(){{location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{{if(w.username){{$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}}}).catch(()=>{{}});
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
@@ -942,7 +967,7 @@ pub async fn control_command(
 /// Shared CSS for the dashboard and its sub-pages, so the standalone log pages
 /// match the main dashboard exactly.
 const STYLE: &str = r#"<style>
-:root{font-family:Inter,system-ui,sans-serif;color:#e7edf5;background:#09111c}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #203047;display:flex;justify-content:space-between;align-items:center}h1{font-size:20px;margin:0}.muted{color:#8fa2b8}.wrap{padding:24px;max-width:1500px;margin:auto}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}.card,.panel{background:#101b2a;border:1px solid #203047;border-radius:12px}.card{padding:16px}.n{font-size:28px;font-weight:700;margin-top:6px}.panel{margin-top:16px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#8fa2b8;margin:0 0 14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #1c2a3c;font-size:13px}th{color:#8fa2b8}.pill{padding:3px 8px;border-radius:99px;background:#203047}.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52d273;margin-right:7px}.hdr-status{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.ver{font-size:11px;color:#8fa2b8}.hdr-user{display:flex;align-items:center;gap:8px;font-size:12px;color:#cfe0f2}#logout-btn{display:none;background:#203047;color:#e7edf5;border:1px solid #2c405c;border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer}#logout-btn:hover{background:#2c405c}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
+:root{font-family:Inter,system-ui,sans-serif;color:#e7edf5;background:#09111c}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #203047;display:flex;justify-content:space-between;align-items:center}h1{font-size:20px;margin:0}.muted{color:#8fa2b8}.wrap{padding:24px;max-width:1500px;margin:auto}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}.card,.panel{background:#101b2a;border:1px solid #203047;border-radius:12px}.card{padding:16px}.n{font-size:28px;font-weight:700;margin-top:6px}.panel{margin-top:16px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#8fa2b8;margin:0 0 14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #1c2a3c;font-size:13px}th{color:#8fa2b8}.pill{padding:3px 8px;border-radius:99px;background:#203047}.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52d273;margin-right:7px}.hdr-status{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.ver{font-size:11px;color:#8fa2b8}.hdr-user{display:flex;align-items:center;gap:8px;font-size:12px;color:#cfe0f2}#logout-btn,#login-btn{display:none;background:#203047;color:#e7edf5;border:1px solid #2c405c;border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer}#logout-btn:hover,#login-btn:hover{background:#2c405c}body.not-admin .admin-only{display:none!important}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
 .health-ok{background:#173822;color:#52d273}.health-degraded{background:#3a2f12;color:#e8b93d}.health-critical{background:#3a1414;color:#f2545b}.health-unknown{background:#203047;color:#8fa2b8}
 .bts-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}.bts-grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(480px,100%),1fr))}.bts-card{min-width:0}.bts-card{background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px}.bts-card h3{margin:0;font-size:15px}.bts-meta{font-size:12px;margin-top:4px}.bts-card table{margin-top:10px}.bts-card th,.bts-card td{padding:6px;font-size:12px}
 .banner{display:none;background:#3a1414;border:1px solid #f2545b;color:#ffb4b8;padding:12px 18px;border-radius:10px;margin-bottom:16px;font-weight:600}
@@ -958,20 +983,42 @@ h2 .backlink{text-transform:none;letter-spacing:normal;margin-left:8px}
 .badge-reg-in{background:#173822;color:#52d273;border:1px solid #245c37}.badge-reg-out{background:#203047;color:#8fa2b8;border:1px solid #2c405c}.badge-reg-timeout{background:#3a2f12;color:#e8b93d;border:1px solid #5c4a1d}
 .ha-active{background:#173822;color:#52d273;border:1px solid #245c37}.ha-standby{background:#123047;color:#5cc0f2;border:1px solid #1d4a66}.ha-init{background:#203047;color:#8fa2b8}.ha-fault,.ha-down{background:#3a1414;color:#f2545b;border:1px solid #5c1d1d}a.ha-hdr{text-decoration:none;font-size:11px}
 </style><script>
-// HA role badge in every page header (only when [ha] is enabled).
+// Admin login/logout, shared by every page header. The dashboard can be
+// read-only to anonymous visitors (open mode); logging in only unlocks
+// config editing and Basestation control. doLogin() navigates to the
+// admin-gated /login, which makes the browser prompt and then bounces back
+// here; doLogout() is a best-effort HTTP-Basic "logout" (there's no
+// server-side session to end) that reloads the current page unauthenticated.
+function doLogin(){location.href='/login?next='+encodeURIComponent(location.pathname+location.search);}
+function doLogout(){location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}
 document.addEventListener('DOMContentLoaded',()=>{const h=document.querySelector('.hdr-status');if(!h)return;
+// Start read-only (CSS hides .admin-only controls) so nothing privileged
+// flashes before /api/whoami answers; reveal only once confirmed admin.
+document.body.classList.add('not-admin');
+// Then populate login state everywhere: hide the Settings link from
+// non-admins and show the username + Logout when signed in, or a Login
+// button when the dashboard is open and nobody's signed in. Server-side
+// guards are the real enforcement; this is just the UI.
+fetch('/api/whoami').then(r=>r.json()).then(w=>{
+  if(w.admin){document.body.classList.remove('not-admin');document.body.classList.add('is-admin');}
+  const sl=document.getElementById('settings-link');if(sl&&!w.admin)sl.style.display='none';
+  const who=document.getElementById('whoami'),lin=document.getElementById('login-btn'),lout=document.getElementById('logout-btn');
+  if(w.username){if(who)who.textContent=w.username;if(lout)lout.style.display='inline-block';}
+  else if(w.can_login){if(lin)lin.style.display='inline-block';}
+}).catch(()=>{});
+// HA role badge in every page header (only when [ha] is enabled).
 const tick=()=>fetch('/api/ha').then(r=>r.json()).then(d=>{let a=document.getElementById('ha-hdr');if(!d.enabled){if(a)a.remove();return;}
 if(!a){a=document.createElement('a');a.id='ha-hdr';a.href='/ha';h.insertBefore(a,h.querySelector('.ver'));}
 a.className='badge ha-hdr ha-'+d.role;a.textContent='HA '+d.node+': '+d.role.toUpperCase();}).catch(()=>{});
 tick();setInterval(tick,5000);});
 </script>"#;
 
-const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
+const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <div class=banner id=emergency-banner></div>
 <section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sms-center">SMS Center<span class=sub>Messages stored for offline radios</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/ha">High Availability<span class=sub>Active/standby role, VIP &amp; failover</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class="bts-grid wide" id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
-<section class=panel><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
+<section class="panel admin-only"><h2>Basestation Control</h2><div class=bts-grid id=control-stations></div></section>
 </main><script>
 let snap=null;let tsnap=null;let brssi={};const $=id=>document.getElementById(id);const dt=x=>new Date(x).toLocaleTimeString();const dur=(a,b)=>Math.max(0,Math.floor(((b||Date.now())-a)/1000))+'s';const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function render(s){snap=s;$('bs').textContent=s.connected_basestations;$('subs').textContent=s.subscribers;$('groups').textContent=s.groups;$('active').textContent=s.active_calls.length;$('calls').textContent=s.total_calls;$('sds').textContent=s.total_sds;
@@ -1141,8 +1188,6 @@ function connectLive(){
   ws.onerror=()=>{try{ws.close();}catch(e){}};
 }
 connectLive();
-function doLogout(){location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{if(!w.admin)$('settings-link').style.display='none';if(w.username){$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}}).catch(()=>{});
 </script></body></html>"#;
 
 // ---------------------------------------------------------------------------
@@ -1268,7 +1313,7 @@ pub async fn ha_page() -> Html<&'static str> { Html(HA_HTML.as_str()) }
 static HA_HTML: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| HA_PAGE.replace("__STYLE__", STYLE).replace("__VERSION__", VERSION));
 
-const HA_PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>High Availability - TETRA Network</title>__STYLE__</head><body><header><h1>HIGH AVAILABILITY</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
+const HA_PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>High Availability - TETRA Network</title>__STYLE__</head><body><header><h1>HIGH AVAILABILITY</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <div class=banner id=ha-banner></div>
 <div id=ha-off class=panel style="display:none"><p class=muted>HA is not enabled on this node. Fill in the form below and set <b>enabled</b> to turn it on (the node restarts to apply it).</p></div>
@@ -1374,8 +1419,7 @@ async function saveCfg(){
   for(const f of fields){const el=$('f-'+f);c[f]=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value.trim();}
   await post('/api/config/ha',c,'cfg-result');load();
 }
-function doLogout(){location.href=location.protocol+'//logout:'+Date.now()+'@'+location.host+location.pathname;}
-fetch('/api/whoami').then(r=>r.json()).then(w=>{admin=!!w.admin;if(admin){$('ha-form').style.display='block';loadCfg();}if(w.username){$('whoami').textContent=w.username;$('logout-btn').style.display='inline-block';}load();}).catch(()=>load());
+fetch('/api/whoami').then(r=>r.json()).then(w=>{admin=!!w.admin;if(admin){$('ha-form').style.display='block';loadCfg();}load();}).catch(()=>load());
 setInterval(load,2000);
 </script></body></html>"#;
 
@@ -1543,6 +1587,58 @@ mod tests {
         let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
         let Json(alice) = whoami(State(std::sync::Arc::new(state)), basic_auth_header("alice", "secret")).await;
         assert_eq!(alice["admin"], serde_json::json!(true));
+    }
+
+    /// Open (read-only) mode: an anonymous visitor is not an admin but is
+    /// offered a Login button, while a signed-in admin is an admin and isn't.
+    #[tokio::test]
+    async fn whoami_open_mode_offers_login_to_anonymous_only() {
+        let mut config = crate::config::Config::default();
+        config.dashboard.ui.open = true;
+        config.dashboard.users.insert("alice".into(), "secret".into());
+        config.dashboard.admins = vec!["alice".into()];
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let state = std::sync::Arc::new(state);
+
+        let Json(anon) = whoami(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(anon["admin"], serde_json::json!(false));
+        assert_eq!(anon["open"], serde_json::json!(true));
+        assert_eq!(anon["can_login"], serde_json::json!(true));
+
+        let Json(alice) = whoami(State(state), basic_auth_header("alice", "secret")).await;
+        assert_eq!(alice["admin"], serde_json::json!(true));
+        assert_eq!(alice["can_login"], serde_json::json!(false));
+    }
+
+    /// Closed mode (the default) never advertises a Login button -- viewing
+    /// already requires a credential, so the browser's own prompt handles it.
+    #[tokio::test]
+    async fn whoami_closed_mode_hides_login_button() {
+        let mut config = crate::config::Config::default();
+        config.dashboard.users.insert("alice".into(), "secret".into());
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let Json(anon) = whoami(State(std::sync::Arc::new(state)), HeaderMap::new()).await;
+        assert_eq!(anon["open"], serde_json::json!(false));
+        assert_eq!(anon["can_login"], serde_json::json!(false));
+    }
+
+    /// `/login` returns to a local `next`, but refuses an off-site one so the
+    /// Login button can't be bent into an open redirect.
+    #[tokio::test]
+    async fn login_redirects_only_to_local_paths() {
+        let loc = |m: &HeaderMap| m[header::LOCATION].to_str().unwrap().to_string();
+
+        let local = login(Query(HashMap::from([("next".into(), "/ha".into())]))).await.into_response();
+        assert_eq!(loc(local.headers()), "/ha");
+
+        let protocol_relative = login(Query(HashMap::from([("next".into(), "//evil.example/".into())]))).await.into_response();
+        assert_eq!(loc(protocol_relative.headers()), "/");
+
+        let absolute = login(Query(HashMap::from([("next".into(), "https://evil.example/".into())]))).await.into_response();
+        assert_eq!(loc(absolute.headers()), "/");
+
+        let missing = login(Query(HashMap::new())).await.into_response();
+        assert_eq!(loc(missing.headers()), "/");
     }
 }
 
