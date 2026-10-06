@@ -29,6 +29,16 @@ pub enum ControlCommand {
     ClearEmergency { issi: u32 },
     CommandA { #[serde(default)] handle: u32, parameter: u32 },
     TestCmdB { #[serde(default)] handle: u32, source_ssi: u32, is_group: bool, payload: Vec<u8> },
+    /// Ambience listening (SS-AL): command the Basestation to set up a
+    /// one-way speech call to `issi` in which the target radio auto-answers
+    /// and keys its transmitter, so the dispatcher hears its surroundings.
+    /// `enable` false releases an active ambience-listening call. The target
+    /// radio indicates the call like any other (not covert).
+    ///
+    /// PROVISIONAL: the Basestation must implement this command and the
+    /// over-the-air AL service for it to take effect; the exact wire shape may
+    /// need to match the Basestation's own codec.
+    AmbienceListen { issi: u32, enable: bool },
 }
 
 impl ControlCommand {
@@ -63,12 +73,14 @@ pub enum ControlResponse {
     CommandAResponse { handle: u32, result: u32 },
     SendSdsResponse { handle: u32, success: bool },
     KickMsResponse { issi: u32, success: bool },
+    AmbienceListenResponse { issi: u32, success: bool },
 }
 
 struct ControlSession {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_handle: HashMap<u32, oneshot::Sender<ControlResponse>>,
     pending_kick: HashMap<u32, oneshot::Sender<ControlResponse>>,
+    pending_ambience: HashMap<u32, oneshot::Sender<ControlResponse>>,
 }
 
 #[derive(Default)]
@@ -120,6 +132,11 @@ pub async fn send_command(state: &Arc<AppState>, bts_id: &str, mut command: Cont
             session.pending_kick.insert(*issi, tx);
             Some(rx)
         }
+        ControlCommand::AmbienceListen { issi, .. } => {
+            let (tx, rx) = oneshot::channel();
+            session.pending_ambience.insert(*issi, tx);
+            Some(rx)
+        }
         _ if matches!(command, ControlCommand::SendSds { .. } | ControlCommand::CommandA { .. }) => {
             let handle = assigned_handle.or_else(|| command.handle()).expect("assigned above");
             let (tx, rx) = oneshot::channel();
@@ -167,7 +184,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
 
     {
         let mut ctl = state.control.write().await;
-        ctl.sessions.insert(id.clone(), ControlSession { tx, pending_handle: HashMap::new(), pending_kick: HashMap::new() });
+        ctl.sessions.insert(id.clone(), ControlSession { tx, pending_handle: HashMap::new(), pending_kick: HashMap::new(), pending_ambience: HashMap::new() });
     }
     info!(bts = %id, "Basestation control connected");
     state.monitor.emit("control_connected", serde_json::json!({"id": id}));
@@ -209,8 +226,30 @@ async fn handle_response(state: &Arc<AppState>, id: &str, data: &[u8]) {
         ControlResponse::KickMsResponse { issi, .. } => {
             if let Some(tx) = session.pending_kick.remove(issi) { let _ = tx.send(response); }
         }
+        ControlResponse::AmbienceListenResponse { issi, .. } => {
+            if let Some(tx) = session.pending_ambience.remove(issi) { let _ = tx.send(response); }
+        }
         ControlResponse::CommandAResponse { handle, .. } | ControlResponse::SendSdsResponse { handle, .. } => {
             if let Some(tx) = session.pending_handle.remove(handle) { let _ = tx.send(response); }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambience_listen_wire_shape() {
+        // Externally-tagged, matching the Basestation's derive-based codec.
+        let json = ControlCommand::AmbienceListen { issi: 2001, enable: true }.to_wire_json();
+        assert_eq!(json, serde_json::json!({"AmbienceListen": {"issi": 2001, "enable": true}}));
+    }
+
+    #[test]
+    fn ambience_listen_response_parses() {
+        let r: ControlResponse =
+            serde_json::from_value(serde_json::json!({"AmbienceListenResponse": {"issi": 2001, "success": true}})).unwrap();
+        assert!(matches!(r, ControlResponse::AmbienceListenResponse { issi: 2001, success: true }));
     }
 }
