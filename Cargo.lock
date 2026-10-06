@@ -170,9 +170,10 @@ dependencies = [
 
 [[package]]
 name = "brew-server"
-version = "1.13.0"
+version = "1.15.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "axum",
  "axum-server",
  "base64",
@@ -180,9 +181,11 @@ dependencies = [
  "cc",
  "futures-util",
  "md5",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml",
  "tracing",
