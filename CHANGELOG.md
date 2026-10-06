@@ -2,6 +2,23 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.15.2 adds:
+
+- **Open/read-only dashboard mode with admin Login button.** A new
+  `[dashboard.ui]` `open` flag (default `false`). When `ui.open = true`, the
+  monitoring dashboard is viewable by anyone without logging in and is
+  read-only for anonymous visitors: the Settings link and the Basestation
+  Control panel are hidden and their endpoints refuse non-admins. A **Login**
+  button in the top-right of every page header lets an admin authenticate
+  (and a **Logout** button replaces it once signed in), unlocking editing and
+  control for that browser. With `ui.open = false` the previous behavior is
+  unchanged -- configured `[dashboard.users]` must log in just to view.
+- **Basestation control is now admin-gated.** Issuing control commands
+  (`POST /api/control/{id}` -- Ambience Listen, DGNA, kick, restart, etc.)
+  now requires an admin credential, the same gate as `/settings`, so the
+  control panel is a privileged action rather than available to every
+  dashboard viewer.
+
 Version 1.15.0 adds:
 
 - **Ambience listening (experimental).** A new `AmbienceListen { issi, enable }`

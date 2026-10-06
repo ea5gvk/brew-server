@@ -357,6 +357,8 @@ pub struct DashboardConfig {
     /// Has no effect when `users` itself is empty (auth disabled entirely).
     pub admins: Vec<String>,
     pub realm: String,
+    /// UI behavior toggles (currently just read-only/open mode).
+    pub ui: DashboardUiConfig,
     pub tls: TlsConfig,
 }
 
@@ -368,8 +370,30 @@ impl Default for DashboardConfig {
             users: HashMap::new(),
             admins: Vec::new(),
             realm: "brew-server-dashboard".into(),
+            ui: DashboardUiConfig::default(),
             tls: TlsConfig::default(),
         }
+    }
+}
+
+/// `[dashboard.ui]` -- how the dashboard presents itself to visitors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DashboardUiConfig {
+    /// When `true` (`ui.open = true`), the dashboard is viewable by anyone
+    /// without logging in and is read-only for visitors who aren't signed in
+    /// as an admin: a Login button in the header lets an admin authenticate
+    /// and unlock the Settings page and Basestation control. When `false`
+    /// (the default), the configured `users` must log in just to view, the
+    /// original all-or-nothing behavior. Independent of `users`/`admins`:
+    /// those still define *who* the admins are; this only decides whether
+    /// unauthenticated viewing is allowed.
+    pub open: bool,
+}
+
+impl Default for DashboardUiConfig {
+    fn default() -> Self {
+        Self { open: false }
     }
 }
 
