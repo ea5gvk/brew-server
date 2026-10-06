@@ -2,6 +2,23 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.15.0 adds:
+
+- **Ambience listening (experimental).** A new `AmbienceListen { issi, enable }`
+  Basestation Control command, with a Start/Stop control on each Basestation
+  card in the dashboard. It tells the Basestation to set up an SS-AL call so
+  the target radio auto-keys its microphone (with indication on the radio);
+  `enable: false` releases it. The wire shape is provisional and only takes
+  effect on a Basestation that implements the command and the over-the-air AL
+  service.
+- **Dispatch-console AL wiring.** A private-call `SETUP_REQUEST` whose service
+  byte is the ambience-listening value (as tetra-dispatch's "Ambience listen"
+  sends) is now relayed as usual *and* fires the `AmbienceListen` control
+  command to the Basestation that hosts the target ISSI (resolved via its Brew
+  username), so the console button drives the correct forced-key path. The
+  call shows as `ambience` on the dashboard. Best-effort: if the target's
+  Basestation has no control session, it stays an ordinary relayed call.
+
 Version 1.14.0 adds:
 
 - **Active/standby high availability.** New `[ha]` section (off by

@@ -12,6 +12,11 @@ use std::{collections::{HashMap, HashSet}, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// TETRA basic-service byte a dispatch console sets in a private-call
+/// SETUP_REQUEST to ask for ambience listening. Matches tetra-dispatch's
+/// `SERVICE_AMBIENCE_LISTENING`. Provisional — adjust per deployment.
+const AMBIENCE_LISTENING_SERVICE: u8 = 9;
+
 /// Wire shape of a `SERVICE_RSSI` message's JSON payload.
 #[derive(serde::Deserialize)]
 struct RssiReport {
@@ -442,16 +447,17 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     // Prefer the structured CircularCall payload (parsed per Brew v1). Fall back
     // to the conservative raw source/destination pair for any peer that sends a
     // payload we could not fully structure.
-    let (source_issi, destination, number, mnemonic) = match &payload {
-        CallPayload::CircularCall(c) => (c.source, c.destination, c.number.clone(), c.mnemonic.clone()),
+    let (source_issi, destination, number, mnemonic, service) = match &payload {
+        CallPayload::CircularCall(c) => (c.source, c.destination, c.number.clone(), c.mnemonic.clone(), c.service),
         other => match protocol::raw_peer_pair(other) {
-            Some((s, d)) => (s, d, String::new(), None),
+            Some((s, d)) => (s, d, String::new(), None, 0),
             None => {
                 warn!(%source, uuid=%id, "private SETUP_REQUEST has no routable source/destination pair");
                 return;
             }
         },
     };
+    let ambience = service == AMBIENCE_LISTENING_SERVICE;
     let mut inner = state.inner.write().await;
     // A copy of a setup already accepted over another peer link: dropped
     // silently -- never rejected, never offered to SIP a second time.
@@ -519,10 +525,39 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     let peers = HashSet::from([target_client]);
     inner.calls.insert(id, ActiveCall { kind: CallKind::Private, owner: source, source_issi, destination, priority: 0, peers: peers.clone(), started_at: std::time::Instant::now(), last_activity_ms: ActiveCall::new_activity() });
     let target = inner.clients.get(&target_client).map(|c| (c.tx.clone(), c.forward_version()));
+    // For an ambience-listening setup, also learn the Brew username the target's
+    // Basestation authenticated as, so we can send it the control-channel
+    // AmbienceListen command that actually forces the radio to key its mic.
+    let bts_username = ambience.then(|| inner.clients.get(&target_client).and_then(|c| c.username.clone())).flatten();
     drop(inner);
     if let Some((tx, version)) = target { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
-    state.monitor.call_started(id, "private", source_issi, destination, 0).await;
-    info!(%source, uuid=%id, source_issi, destination, mnemonic=?mnemonic, "routed private SETUP_REQUEST");
+    let kind = if ambience { "ambience" } else { "private" };
+    state.monitor.call_started(id, kind, source_issi, destination, 0).await;
+    if ambience {
+        trigger_ambience_listen(state, bts_username, destination).await;
+    }
+    info!(%source, uuid=%id, source_issi, destination, ambience, mnemonic=?mnemonic, "routed private SETUP_REQUEST");
+}
+
+/// Fires the Basestation Control `AmbienceListen` command for a relayed
+/// ambience-listening private setup, so the target radio auto-keys its mic
+/// while the normal call plumbing carries the speech path. Best-effort: if the
+/// target's Basestation has no control session (or none could be resolved), the
+/// call still proceeds as an ordinary relayed private call. Spawned so the
+/// command's response wait never blocks routing.
+async fn trigger_ambience_listen(state: &Arc<AppState>, bts_username: Option<String>, issi: u32) {
+    let Some(bts) = bts_username else {
+        warn!(destination = issi, "ambience-listen setup: target Basestation has no known control identity; relayed as an ordinary private call only");
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let cmd = crate::control::ControlCommand::AmbienceListen { issi, enable: true };
+        match crate::control::send_command(&state, &bts, cmd).await {
+            Ok(resp) => info!(bts = %bts, destination = issi, ?resp, "sent AmbienceListen to Basestation control"),
+            Err(e) => warn!(bts = %bts, destination = issi, ?e, "AmbienceListen control command not delivered (Basestation may not support it)"),
+        }
+    });
 }
 
 /// Answers a private SETUP_REQUEST this server cannot route with

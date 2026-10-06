@@ -116,6 +116,9 @@ pub struct CircularCall {
     pub destination: u32,
     pub number: String,
     pub priority: u8,
+    /// TETRA basic service byte. Relayed untouched; the router reads it only
+    /// to recognise an ambience-listening call setup (see `router`).
+    pub service: u8,
     pub mnemonic: Option<String>,
 }
 
@@ -434,6 +437,7 @@ fn parse_call_control(data: &[u8], version: ConnVersion) -> Result<(BrewMessage,
                 destination: u32le(payload, 4),
                 number: ascii_field(&payload[8..40]),
                 priority: payload[40],
+                service: payload[41],
                 mnemonic,
             })
         }
@@ -448,6 +452,7 @@ fn parse_call_control(data: &[u8], version: ConnVersion) -> Result<(BrewMessage,
                 destination: u32le(payload, 4),
                 number: ascii_field(&payload[8..40]),
                 priority: payload[40],
+                service: payload[41],
                 mnemonic: None,
             })
         }
@@ -839,6 +844,23 @@ mod tests {
         let wire = build_call_connect_confirm(&id, 1, 2);
         assert_eq!(wire.len(), 20, "18-byte header + 2-byte grant/permission");
         assert_eq!(&wire[18..20], &[1, 2]);
+    }
+
+    #[test]
+    fn setup_request_parses_the_service_byte() {
+        // Header: CLASS_CALL_CONTROL, CALL_SETUP_REQUEST, uuid[16]; then the
+        // circular payload with service=9 (ambience listening) at offset 41.
+        let mut wire = vec![CLASS_CALL_CONTROL, CALL_SETUP_REQUEST];
+        wire.extend_from_slice(Uuid::new_v4().as_bytes());
+        let mut payload = vec![0u8; CIRCULAR_CALL_BASE_LEN];
+        payload[0..4].copy_from_slice(&1001u32.to_le_bytes()); // source
+        payload[4..8].copy_from_slice(&2002u32.to_le_bytes()); // destination
+        payload[40] = 3; // priority
+        payload[41] = 9; // service
+        wire.extend_from_slice(&payload);
+        let BrewMessage::CallControl(cc) = parse(&wire).unwrap() else { panic!() };
+        let CallPayload::CircularCall(c) = cc.payload else { panic!() };
+        assert_eq!((c.source, c.destination, c.priority, c.service), (1001, 2002, 3, 9));
     }
 
     #[test]
