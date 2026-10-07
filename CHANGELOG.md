@@ -17,6 +17,12 @@ Unreleased adds:
   minute in case the server missed it. Relaying needs `loop_safe = true` on
   both servers; see the Basestation-Locations wiki page
   (`docs/Basestation-Locations.md`) for setup and troubleshooting.
+- **Mobile terminal positions relayed between servers.** The same loop-safe
+  links carry each terminal's decoded position (`FED_MS_POS`; the newest fix
+  per ISSI wins), so every server's `/map` shows terminals seen by any peer.
+  Sent only to peers that announce support (hello version 2); 0/0 is never
+  relayed or plotted. Needs `loop_safe = true` on both servers; see the
+  Basestation-Locations wiki page.
 - **Map icons.** Basestations are drawn as a radio mast (grey when offline)
   and mobile terminals as a handheld radio, instead of the default pin.
 - **MCC / MNC in the cell block.** The cell header now reads

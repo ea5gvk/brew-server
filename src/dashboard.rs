@@ -643,7 +643,25 @@ pub async fn registration_log(State(state): State<Arc<AppState>>) -> Json<Vec<cr
 }
 
 pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<crate::telemetry::PositionFix>> {
-    Json(state.telemetry.read().await.positions())
+    let mut fixes = state.telemetry.read().await.positions();
+    // Positions other servers relayed, merged by newest fix per ISSI.
+    let inner = state.inner.read().await;
+    for (issi, e) in inner.fed.ms_pos.iter().filter(|(_, e)| !e.path.is_empty()) {
+        if !crate::fedroute::valid_position(e.lat, e.lon) { continue; }
+        let origin = e.path.last().map(|o| crate::fedroute::format_server_id(*o)).unwrap_or_default();
+        let fix = crate::telemetry::PositionFix {
+            issi: *issi, lat: e.lat, lon: e.lon, at_ms: e.at_ms,
+            bts: format!("{} @ {}", e.station, &origin[..origin.len().min(8)]),
+            source_text: format!("relayed by federation from server {origin}"),
+        };
+        match fixes.iter_mut().find(|f| f.issi == *issi) {
+            Some(f) if f.at_ms >= fix.at_ms => {}
+            Some(f) => *f = fix,
+            None => fixes.push(fix),
+        }
+    }
+    fixes.sort_unstable_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    Json(fixes)
 }
 
 pub async fn map_page() -> Html<&'static str> { Html(MAP_HTML.as_str()) }
@@ -1583,6 +1601,24 @@ mod tests {
         assert_eq!(by("1000002").source, "config");
         let Json(cfg) = bts_locations_snapshot(State(state), axum::extract::Query(HashMap::from([("config_only".into(), "1".into())]))).await;
         assert_eq!(cfg.len(), 2, "settings table lists every static entry");
+    }
+
+    #[tokio::test]
+    async fn positions_include_relayed_fixes_newest_wins() {
+        let (state, _rx) = crate::state::AppState::new(crate::config::Config::default(), std::path::PathBuf::from("test.toml"));
+        let state = std::sync::Arc::new(state);
+        state.telemetry.write().await.record_sds_position(4013, 1.0, 2.0, 100, "local".into());
+        {
+            let mut inner = state.inner.write().await;
+            let e = |lat, at_ms| crate::fedroute::MsEntry { lat, lon: 5.0, at_ms, station: "bts9".into(), path: vec![7] };
+            inner.fed.ms_pos.insert(4013, e(3.0, 200)); // newer than the local one
+            inner.fed.ms_pos.insert(4014, e(4.0, 50));  // only known remotely
+            inner.fed.ms_pos.insert(4015, crate::fedroute::MsEntry { lat: 9.0, lon: 9.0, at_ms: 1, station: "x".into(), path: vec![] }); // local origin: already in telemetry
+        }
+        let Json(fixes) = positions_snapshot(State(state)).await;
+        assert_eq!(fixes.len(), 2);
+        assert_eq!((fixes[0].issi, fixes[0].lat), (4013, 3.0));
+        assert!(fixes[1].issi == 4014 && fixes[1].bts.starts_with("bts9 @ "));
     }
 
     #[test]

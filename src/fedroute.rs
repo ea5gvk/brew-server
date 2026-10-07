@@ -41,7 +41,7 @@
 //! answers `FED_PRUNE`, and the sender stops feeding that link the call's
 //! voice: one stream per server, not one per redundant link.
 
-use crate::protocol::{self, CLASS_FEDERATION, FED_BTS, FED_BTS_HELLO, FED_PRUNE, FED_ROUTE, FED_WITHDRAW};
+use crate::protocol::{self, CLASS_FEDERATION, FED_BTS, FED_BTS_HELLO, FED_MS_POS, FED_PRUNE, FED_ROUTE, FED_WITHDRAW};
 use crate::state::{AppState, CallKind, ClientId, ClientMode, Inner, Subscriber};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -101,6 +101,11 @@ pub struct FedState {
     /// Negotiated links whose far end announced `FED_BTS` support
     /// (`FED_BTS_HELLO`): the only ones Basestation positions are sent to.
     pub bts_links: HashSet<ClientId>,
+    /// Links that also announced mobile station position support (hello version >= 2).
+    pub ms_links: HashSet<ClientId>,
+    /// Latest position per mobile station ISSI seen by this server's own
+    /// decoding (empty `path`) or relayed by another (`path` set).
+    pub ms_pos: HashMap<u32, MsEntry>,
     /// Positions of this server's own Basestations (from telemetry), by
     /// telemetry identity, as last advertised.
     pub bts_local: HashMap<String, LocalBts>,
@@ -115,6 +120,21 @@ pub const BTS_REFRESH_MS: u64 = 30_000;
 /// ... and a learned one not refreshed for this long is dropped (origin or
 /// the path to it is gone; there is no explicit withdrawal on a lost link).
 pub const BTS_STALE_MS: u64 = 120_000;
+
+/// Hello version that adds mobile station positions to Basestation ones.
+pub const HELLO_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsEntry {
+    pub lat: f64,
+    pub lon: f64,
+    /// When the fix was made at the origin (ms); only a newer one replaces it.
+    pub at_ms: u64,
+    /// Reporting station label at the origin.
+    pub station: String,
+    /// Servers crossed, next hop first and origin last; empty when decoded here.
+    pub path: Vec<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalBts {
@@ -147,7 +167,7 @@ impl Default for FedState {
         };
         Self {
             self_id, clock: 0, links: HashMap::new(), rib_in: HashMap::new(),
-            bts_links: HashSet::new(), bts_local: HashMap::new(), bts_remote: HashMap::new(),
+            bts_links: HashSet::new(), ms_links: HashSet::new(), ms_pos: HashMap::new(), bts_local: HashMap::new(), bts_remote: HashMap::new(),
         }
     }
 }
@@ -205,8 +225,9 @@ pub enum FedMessage {
     Route { issi: u32, advert: Advert },
     Prune { id: Uuid, source_issi: u32 },
     /// The sender understands `FED_BTS`.
-    BtsHello,
+    BtsHello { version: u8 },
     Bts(BtsAdvert),
+    MsPos(MsAdvert),
     /// A type this version does not know (from a newer peer): ignored.
     Unknown(u8),
 }
@@ -239,7 +260,64 @@ fn clip(s: &str) -> &str {
 }
 
 pub fn build_bts_hello() -> Vec<u8> {
-    vec![CLASS_FEDERATION, FED_BTS_HELLO, 1]
+    vec![CLASS_FEDERATION, FED_BTS_HELLO, HELLO_VERSION]
+}
+
+/// One mobile station position advert. Wire, little-endian:
+/// `0xfe 0x05 at_ms:u64 issi:u32 lat:f64 lon:f64 n:u8 path:u64[n] slen:u8 station`
+/// -- `path[0]` is the sender and `path[n-1]` the origin, `1 <= n <= MAX_PATH`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsAdvert {
+    pub issi: u32,
+    pub lat: f64,
+    pub lon: f64,
+    pub at_ms: u64,
+    pub station: String,
+    pub path: Vec<u64>,
+}
+
+pub fn build_ms_pos(a: &MsAdvert) -> Vec<u8> {
+    let station = clip(&a.station);
+    let mut out = Vec::with_capacity(32 + 8 * a.path.len() + station.len());
+    out.extend_from_slice(&[CLASS_FEDERATION, FED_MS_POS]);
+    out.extend_from_slice(&a.at_ms.to_le_bytes());
+    out.extend_from_slice(&a.issi.to_le_bytes());
+    out.extend_from_slice(&a.lat.to_le_bytes());
+    out.extend_from_slice(&a.lon.to_le_bytes());
+    out.push(a.path.len() as u8);
+    for id in &a.path { out.extend_from_slice(&id.to_le_bytes()); }
+    out.push(station.len() as u8);
+    out.extend_from_slice(station.as_bytes());
+    out
+}
+
+fn parse_ms_pos(raw: &[u8], nbr_id: u64) -> Result<MsAdvert, &'static str> {
+    if raw.len() < 32 {
+        return Err("FED_MS_POS too short");
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(raw[o..o + 8].try_into().expect("checked length"));
+    let f64_at = |o: usize| f64::from_le_bytes(raw[o..o + 8].try_into().expect("checked length"));
+    let n = raw[30] as usize;
+    if n == 0 || n > MAX_PATH {
+        return Err("FED_MS_POS path length out of range");
+    }
+    let at = 31 + 8 * n;
+    let slen = *raw.get(at).ok_or("FED_MS_POS of wrong length")? as usize;
+    if slen > MAX_BTS_TEXT || raw.len() != at + 1 + slen {
+        return Err("FED_MS_POS of wrong length");
+    }
+    let path: Vec<u64> = (0..n).map(|i| u64_at(31 + 8 * i)).collect();
+    if path[0] != nbr_id {
+        return Err("FED_MS_POS path does not start at the server that sent it");
+    }
+    if path.iter().enumerate().any(|(i, id)| path[..i].contains(id)) {
+        return Err("FED_MS_POS path crosses a server twice");
+    }
+    let station = String::from_utf8(raw[at + 1..].to_vec()).map_err(|_| "FED_MS_POS text is not UTF-8")?;
+    Ok(MsAdvert {
+        issi: u32::from_le_bytes(raw[10..14].try_into().expect("checked length")),
+        lat: f64_at(14), lon: f64_at(22), at_ms: u64_at(2), station, path,
+    })
 }
 
 pub fn build_bts(a: &BtsAdvert) -> Vec<u8> {
@@ -356,7 +434,8 @@ pub fn parse(raw: &[u8], nbr_id: u64) -> Result<FedMessage, &'static str> {
                 .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect();
             Ok(FedMessage::Route { issi: u32_at(2), advert: Advert { reg: u64_at(6), path, groups } })
         }
-        Some(FED_BTS_HELLO) => Ok(FedMessage::BtsHello),
+        Some(FED_BTS_HELLO) => Ok(FedMessage::BtsHello { version: raw.get(2).copied().unwrap_or(1) }),
+        Some(FED_MS_POS) => parse_ms_pos(raw, nbr_id).map(FedMessage::MsPos),
         Some(FED_BTS) => parse_bts(raw, nbr_id).map(FedMessage::Bts),
         Some(other) => Ok(FedMessage::Unknown(other)),
     }
@@ -635,6 +714,57 @@ pub async fn advertise_bts(state: &Arc<AppState>, key: &str, name: &str, lat: f6
     relay_bts(&inner, None, &advert);
 }
 
+/// Sends a mobile station advert (path as received, sender first) to every
+/// link that announced support except `except`, this server in front; same
+/// skip rules as `relay_bts`.
+fn relay_ms(inner: &Inner, except: Option<ClientId>, advert: &MsAdvert) {
+    if advert.path.len() >= MAX_PATH { return; }
+    let path: Vec<u64> = std::iter::once(inner.fed.self_id).chain(advert.path.iter().copied()).collect();
+    let msg = build_ms_pos(&MsAdvert { path, ..advert.clone() });
+    for link in &inner.fed.ms_links {
+        if Some(*link) == except { continue; }
+        let Some(nbr_id) = inner.fed.links.get(link) else { continue };
+        if advert.path.contains(nbr_id) { continue; }
+        if let Some(client) = inner.clients.get(link) { let _ = client.tx.send(msg.clone()); }
+    }
+}
+
+/// Every position held, for a link that just announced support.
+fn ms_sync(inner: &Inner, nbr_id: u64) -> Vec<Vec<u8>> {
+    inner.fed.ms_pos.iter()
+        .filter(|(_, e)| !e.path.contains(&nbr_id) && e.path.len() < MAX_PATH)
+        .map(|(issi, e)| build_ms_pos(&MsAdvert {
+            issi: *issi, lat: e.lat, lon: e.lon, at_ms: e.at_ms, station: e.station.clone(),
+            path: std::iter::once(inner.fed.self_id).chain(e.path.iter().copied()).collect(),
+        }))
+        .collect()
+}
+
+/// Stores a relayed position when it is newer than the one held for the ISSI
+/// and passes it on; ignored when it went through us, is from us, or is no
+/// real fix. `at_ms` ordering makes each server forward each fix at most once.
+fn accept_ms(inner: &mut Inner, source: ClientId, a: MsAdvert) {
+    let Some(&origin) = a.path.last() else { return };
+    if origin == inner.fed.self_id || a.path.contains(&inner.fed.self_id) { return; }
+    if !valid_position(a.lat, a.lon) { return; }
+    if inner.fed.ms_pos.get(&a.issi).is_some_and(|old| old.at_ms >= a.at_ms) { return; }
+    inner.fed.ms_pos.insert(a.issi, MsEntry {
+        lat: a.lat, lon: a.lon, at_ms: a.at_ms, station: a.station.clone(), path: a.path.clone(),
+    });
+    relay_ms(inner, Some(source), &a);
+}
+
+/// Advertises a mobile station position this server decoded itself. Not for
+/// one decoded from an SDS relayed by a peer: its origin advertises that.
+pub async fn advertise_ms(state: &Arc<AppState>, issi: u32, lat: f64, lon: f64, at_ms: u64, station: &str) {
+    if !valid_position(lat, lon) { return; }
+    let mut inner = state.inner.write().await;
+    if inner.fed.ms_pos.get(&issi).is_some_and(|old| old.at_ms >= at_ms) { return; }
+    inner.fed.ms_pos.insert(issi, MsEntry { lat, lon, at_ms, station: station.to_string(), path: Vec::new() });
+    let advert = MsAdvert { issi, lat, lon, at_ms, station: station.to_string(), path: Vec::new() };
+    relay_ms(&inner, None, &advert);
+}
+
 /// Drops learned positions not refreshed for `BTS_STALE_MS`.
 pub fn purge_bts(inner: &mut Inner) {
     let now = crate::telemetry::now_ms();
@@ -701,13 +831,21 @@ pub async fn handle(state: &Arc<AppState>, source: ClientId, raw: &[u8]) {
                 }
                 None
             }
-            FedMessage::BtsHello => {
+            FedMessage::BtsHello { version } => {
                 inner.fed.bts_links.insert(source);
-                let msgs = bts_sync(&inner, nbr_id);
+                let mut msgs = bts_sync(&inner, nbr_id);
+                if version >= 2 {
+                    inner.fed.ms_links.insert(source);
+                    msgs.extend(ms_sync(&inner, nbr_id));
+                }
                 info!(%source, neighbour = %format_server_id(nbr_id), positions = msgs.len(), "federation: peer supports Basestation positions; synced");
                 if let Some(client) = inner.clients.get(&source) {
                     for m in msgs { let _ = client.tx.send(m); }
                 }
+                None
+            }
+            FedMessage::MsPos(advert) => {
+                accept_ms(&mut inner, source, advert);
                 None
             }
             FedMessage::Bts(advert) => {
@@ -779,7 +917,20 @@ mod tests {
         let mut short = build_bts(&a);
         short.pop();
         assert!(parse(&short, 7).is_err());
-        assert_eq!(parse(&build_bts_hello(), 7), Ok(FedMessage::BtsHello));
+        assert_eq!(parse(&build_bts_hello(), 7), Ok(FedMessage::BtsHello { version: HELLO_VERSION }));
+        // A version-1 hello (no mobile station support) has no version byte beyond 1.
+        assert_eq!(parse(&[CLASS_FEDERATION, FED_BTS_HELLO, 1], 7), Ok(FedMessage::BtsHello { version: 1 }));
+    }
+
+    #[test]
+    fn ms_advert_round_trips_and_rejects_bad_input() {
+        let a = MsAdvert { issi: 4013, lat: 37.99, lon: 23.76, at_ms: 1_700_000_000_000, station: "bts2".into(), path: vec![7, 8] };
+        assert_eq!(parse(&build_ms_pos(&a), 7), Ok(FedMessage::MsPos(a.clone())));
+        assert!(parse(&build_ms_pos(&a), 9).is_err());
+        let mut long = build_ms_pos(&a);
+        long.push(0);
+        assert!(parse(&long, 7).is_err());
+        assert!(parse(&build_ms_pos(&MsAdvert { path: vec![7, 8, 7], ..a }), 7).is_err());
     }
 
     #[test]
@@ -1221,6 +1372,38 @@ mod mesh_tests {
         for n in [1, 2] {
             let inner = net.nodes[n].state.inner.read().await;
             assert!(!inner.fed.bts_remote[&(origin, "bts1".to_string())].online);
+        }
+    }
+
+    #[tokio::test]
+    async fn ms_positions_flood_a_ring_once_newest_wins_and_skip_legacy_links() {
+        let mut net = Net::new(4, true).await;
+        net.link(0, 1, true).await;
+        net.link(1, 2, true).await;
+        net.link(2, 0, true).await;
+        net.link(2, 3, false).await;
+
+        advertise_ms(&net.nodes[0].state.clone(), 4013, 37.99, 23.76, 1000, "bts2").await;
+        let crossed = net.pump().await;
+        assert!(crossed <= 4, "each server forwards a fix at most once, saw {crossed}");
+        for n in [1, 2] {
+            let inner = net.nodes[n].state.inner.read().await;
+            let e = &inner.fed.ms_pos[&4013];
+            assert!(e.at_ms == 1000 && e.station == "bts2" && !e.path.is_empty());
+        }
+        assert!(net.nodes[3].state.inner.read().await.fed.ms_pos.is_empty());
+
+        // 0/0 is never advertised; an older fix never replaces a newer one.
+        advertise_ms(&net.nodes[0].state.clone(), 4014, 0.0, 0.0, 1100, "bts2").await;
+        advertise_ms(&net.nodes[1].state.clone(), 4013, 38.0, 23.8, 900, "bts3").await;
+        assert_eq!(net.pump().await, 0);
+        assert_eq!(net.nodes[2].state.inner.read().await.fed.ms_pos[&4013].lat, 37.99);
+
+        // A newer fix from another server wins everywhere.
+        advertise_ms(&net.nodes[1].state.clone(), 4013, 38.0, 23.8, 2000, "bts3").await;
+        net.pump().await;
+        for n in [0, 2] {
+            assert_eq!(net.nodes[n].state.inner.read().await.fed.ms_pos[&4013].at_ms, 2000);
         }
     }
 

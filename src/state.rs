@@ -441,6 +441,7 @@ impl AppState {
         inner.clients.remove(&id);
         let negotiated = inner.fed.links.remove(&id).is_some();
         inner.fed.bts_links.remove(&id);
+        inner.fed.ms_links.remove(&id);
 
         // Registrations: every ISSI routed over this connection, and for a
         // loop-safe link every one it offered, gets a new effective route --

@@ -100,4 +100,23 @@ A Basestation position shows on the server it reports to but not on its peer:
      announced support`.
 4. **The Basestation must report a position** (`latitude` / `longitude` in its
    `[telemetry]`, not 0 / 0) and its telemetry must be connected.
-5. **Mobile terminal positions are not relayed**, only Basestation ones.
+5. **Mobile terminal positions** need both servers on a build that relays them
+   (hello version 2). A server on the earlier build still gets Basestation
+   positions but no mobile ones.
+
+## Mobile terminal positions
+
+The same loop-safe links also relay the position of each mobile terminal
+(ISSI) that a server decodes -- LIP reports and textual beacons -- so the
+`/map` page on every server shows terminals seen by any of them. A relayed
+marker's popup shows the reporting station and the origin server.
+
+- Needs `loop_safe = true` on both servers, like Basestation positions.
+- The newest fix per ISSI wins network-wide, so keep the servers on NTP. Each
+  server forwards a fix at most once; rings and meshes cannot loop.
+- A 0 / 0 position is never relayed or plotted.
+- A position decoded from an SDS that another server forwarded is not
+  re-advertised: the server that received it from the radio already did.
+- A newly connected peer is sent every position currently known.
+- Relayed terminal positions are kept in memory only and are not replicated to
+  an HA Standby; they rebuild as terminals beacon and peers reconnect.

@@ -890,10 +890,19 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         }
         _ => {}
     }
+    let mut ms_advert: Option<(u32, f64, f64, u64)> = None;
     if let Some(entry) = sds_entry {
         t.record_sds_telemetry(id, &entry);
+        // A textual position just decoded for this subscriber, to relay to peers.
+        ms_advert = t.stations.get(id)
+            .and_then(|b| b.positions.get(&entry.source_issi))
+            .filter(|p| p.at_ms == entry.at_ms)
+            .map(|p| (p.issi, p.lat, p.lon, p.at_ms));
     }
     drop(t);
+    if let Some((issi, lat, lon, at_ms)) = ms_advert {
+        crate::fedroute::advertise_ms(state, issi, lat, lon, at_ms, id).await;
+    }
     if let Some((name, lat, lon)) = advertise {
         crate::fedroute::advertise_bts(state, id, &name, lat, lon, true).await;
     }
