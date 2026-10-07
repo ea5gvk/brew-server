@@ -42,7 +42,9 @@ fn with_emergency_priority(raw: &[u8]) -> Vec<u8> {
 /// voice and end reach them from here on.
 pub async fn emergency_raised(state: &Arc<AppState>, issi: u32) {
     let mut inner = state.inner.write().await;
-    let consoles: Vec<ClientId> = inner.consoles.iter().copied().collect();
+    // Consoles and every peer link: the emergency goes to all servers.
+    let consoles: Vec<ClientId> = inner.consoles.iter().copied()
+        .chain(inner.clients.iter().filter(|(_, c)| c.mode == ClientMode::Peer).map(|(id, _)| *id)).collect();
     let calls: Vec<uuid::Uuid> = inner.calls.iter()
         .filter(|(_, c)| c.kind == CallKind::Group && c.source_issi == issi && c.priority < EMERGENCY_PRIORITY)
         .map(|(id, _)| *id).collect();
@@ -55,8 +57,8 @@ pub async fn emergency_raised(state: &Arc<AppState>, issi: u32) {
         let new: Vec<ClientId> = consoles.iter().copied().filter(|c| *c != owner && !call.peers.contains(c)).collect();
         call.peers.extend(new.iter().copied());
         let msg = protocol::build_group_tx(&id, issi, dest, EMERGENCY_PRIORITY);
-        // Consoles already in the call and peers get the raised header too; the new
-        // consoles hear the call for the first time.
+        // Consoles and peers already in the call get the raised header too; the new
+        // ones hear the call for the first time.
         for cid in existing.into_iter().chain(new) {
             if inner.consoles.contains(&cid) || is_peer(&inner, cid) {
                 if let Some(c) = inner.clients.get(&cid) { sends.push((c.tx.clone(), msg.clone())); }
@@ -269,8 +271,12 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     // An emergency call is pushed to every connected dispatch console, whatever
     // groups it listens to, so the operator can hear and see it. They join the
     // call's peers, so its voice and its end reach them too.
+    // Likewise to every federation peer, so the emergency reaches all servers (and their
+    // consoles) however the groups are routed; a peer that hears it twice over a ring or
+    // mesh prunes the duplicate as for any call.
     if emergency {
         targets.extend(inner.consoles.iter().copied());
+        targets.extend(inner.clients.iter().filter(|(_, c)| c.mode == ClientMode::Peer).map(|(id, _)| *id));
     }
     targets.remove(&source);
     inner.group_floor.insert(gt.destination, id);
@@ -1189,6 +1195,40 @@ mod forwarding_tests {
     }
 
     #[tokio::test]
+    async fn emergency_group_calls_go_to_every_peer_even_one_not_routing_the_group() {
+        let mut config = crate::config::Config::default();
+        config.storage.enabled = false;
+        config.sms_center.enabled = false;
+        config.fallback_broadcast_when_no_affiliations = false;
+        let state = Arc::new(AppState::new(config, "test.toml".into()).0);
+        let (bs, _bs_rx) = connect(&state, ConnVersion::V0).await;
+        let (listener, mut listener_rx) = connect(&state, ConnVersion::V0).await;
+        let (_peer_a, mut peer_a_rx) = connect_as(&state, ClientMode::Peer).await;
+        let (_peer_b, mut peer_b_rx) = connect_as(&state, ClientMode::Peer).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_AFFILIATE, 6001, &[91])).await;
+        drain(&mut peer_a_rx);
+        drain(&mut peer_b_rx);
+
+        // An ordinary call stays off peers that do not route the group.
+        let ordinary = protocol::build_group_tx(&uuid::Uuid::new_v4(), 4013, 91, 0);
+        handle_packet(state.clone(), bs, ordinary).await;
+        assert!(drain(&mut peer_a_rx).is_empty() && drain(&mut peer_b_rx).is_empty());
+        drain(&mut listener_rx);
+
+        // An emergency call goes to all of them, at priority 15, with its voice and its end.
+        let id = uuid::Uuid::new_v4();
+        let em = protocol::build_group_tx(&id, 4014, 91, EMERGENCY_PRIORITY);
+        handle_packet(state.clone(), bs, em.clone()).await;
+        assert_eq!(drain(&mut peer_a_rx).last(), Some(&em));
+        assert_eq!(drain(&mut peer_b_rx).last(), Some(&em));
+        let voice = protocol::build_traffic_frame(&id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES]);
+        handle_packet(state.clone(), bs, voice.clone()).await;
+        assert_eq!(drain(&mut peer_a_rx), vec![voice.clone()]);
+        assert_eq!(drain(&mut peer_b_rx), vec![voice]);
+    }
+
+    #[tokio::test]
     async fn an_alarm_raised_during_a_call_upgrades_it_for_consoles() {
         let mut config = crate::config::Config::default();
         config.storage.enabled = false;
@@ -1210,8 +1250,11 @@ mod forwarding_tests {
         drain(&mut listener_rx);
 
         // The alarm arrives: the console joins the call, with the raised header first, then its voice.
+        let (_peer, mut peer_rx) = connect_as(&state, ClientMode::Peer).await;
+        drain(&mut peer_rx);
         emergency_raised(&state, 4013).await;
         assert_eq!(drain(&mut console_rx), vec![protocol::build_group_tx(&id, 4013, 91, EMERGENCY_PRIORITY)]);
+        assert_eq!(drain(&mut peer_rx), vec![protocol::build_group_tx(&id, 4013, 91, EMERGENCY_PRIORITY)], "a peer joins too");
         assert!(drain(&mut listener_rx).is_empty(), "ordinary Basestations are not told again");
         let voice = protocol::build_traffic_frame(&id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES]);
         handle_packet(state.clone(), bs, voice.clone()).await;

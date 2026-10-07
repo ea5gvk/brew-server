@@ -1495,6 +1495,51 @@ mod mesh_tests {
         net.check_tables().await;
     }
 
+    /// An emergency group call reaches the dispatch consoles of every server --
+    /// even where nobody is in the group -- at priority 15, exactly once, and
+    /// settles in a ring and in a mesh. An ordinary call stays on its route.
+    #[tokio::test]
+    async fn emergency_group_call_reaches_every_servers_consoles_once_in_a_ring_and_a_mesh() {
+        for ring in [true, false] {
+            let mut net = Net::new(5, true).await;
+            for a in 0..5 {
+                if ring {
+                    net.link(a, (a + 1) % 5, true).await;
+                } else {
+                    for b in a + 1..5 { net.link(a, b, true).await; }
+                }
+            }
+            // Group 91 has a member on node 0 only; each server has a console listening to nothing.
+            net.register(0, 2000, &[91]).await;
+            let mut consoles = Vec::new();
+            for node in 0..5 {
+                let (client, rx) = connection(ClientMode::Basestation);
+                let id = Uuid::new_v4();
+                let mut inner = net.nodes[node].state.inner.write().await;
+                inner.clients.insert(id, client);
+                inner.consoles.insert(id);
+                consoles.push(rx);
+            }
+            for node in 0..5 { net.heard(node); }
+
+            let group_tx = |rx: &mut mpsc::UnboundedReceiver<Vec<u8>>| -> Vec<Vec<u8>> {
+                std::iter::from_fn(|| rx.try_recv().ok()).filter(|m| m.get(..2) == Some(&[CLASS_CALL_CONTROL, CALL_GROUP_TX])).collect()
+            };
+            let id = Uuid::new_v4();
+            net.bs_send(2, build_group_tx(&id, 2002, 91, 15)).await;
+            for (node, rx) in consoles.iter_mut().enumerate() {
+                let heard = group_tx(rx);
+                assert_eq!(heard.len(), 1, "ring={ring} node {node}");
+                assert_eq!(heard[0][26], 15, "priority 15, ring={ring} node {node}");
+            }
+            // An ordinary call reaches no console.
+            net.bs_send(2, build_group_tx(&Uuid::new_v4(), 2002, 91, 0)).await;
+            for (node, rx) in consoles.iter_mut().enumerate() {
+                assert!(group_tx(rx).is_empty(), "ring={ring} node {node}");
+            }
+        }
+    }
+
     /// A full mesh of 5 with one member of group 91 behind each server.
     async fn mesh() -> Net {
         let mut net = Net::new(5, true).await;

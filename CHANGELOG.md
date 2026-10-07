@@ -4,8 +4,11 @@ All notable changes to brew-server, newest first.
 
 Unreleased adds:
 
-- **Emergency calls reach dispatch consoles.** An emergency group call is now
-  also pushed to every connected Tetra Dispatch console (recognised by its
+- **Emergency calls reach dispatch consoles and every server.** An emergency
+  group call is now also pushed to every federation peer, even one that does
+  not route the group, so it reaches all brew-servers (loop-safe and plain
+  links alike; a ring or mesh prunes the duplicate copies), and to every
+  connected Tetra Dispatch console (recognised by its
   `TetraDispatch/` User-Agent), whatever groups it listens to, with its voice
   and end. A call is an emergency when it is at priority 15 *or* its radio has
   an emergency alarm active on a Basestation: FlowStation forwards its radios'
