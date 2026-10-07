@@ -2,7 +2,7 @@
 
 All notable changes to brew-server, newest first.
 
-Unreleased adds:
+Version 1.16.0 adds:
 
 - **Basestation positions over telemetry, relayed between servers.** A
   Basestation (Bost FlowStation) with `latitude`/`longitude` (and optional
