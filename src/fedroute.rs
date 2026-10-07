@@ -629,6 +629,9 @@ pub async fn advertise_bts(state: &Arc<AppState>, key: &str, name: &str, lat: f6
         return;
     }
     let advert = BtsAdvert { key: key.to_string(), name: name.to_string(), lat, lon, online, seq, path: Vec::new() };
+    if inner.fed.bts_links.is_empty() {
+        debug!(key, "Basestation position not relayed: no peer link announced support (needs loop_safe on both servers)");
+    }
     relay_bts(&inner, None, &advert);
 }
 
@@ -701,6 +704,7 @@ pub async fn handle(state: &Arc<AppState>, source: ClientId, raw: &[u8]) {
             FedMessage::BtsHello => {
                 inner.fed.bts_links.insert(source);
                 let msgs = bts_sync(&inner, nbr_id);
+                info!(%source, neighbour = %format_server_id(nbr_id), positions = msgs.len(), "federation: peer supports Basestation positions; synced");
                 if let Some(client) = inner.clients.get(&source) {
                     for m in msgs { let _ = client.tx.send(m); }
                 }

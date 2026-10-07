@@ -44,6 +44,10 @@ so for the fallback to be replaced cleanly it must equal the Brew username.
 With `[federation] loop_safe = true`, a brew-server passes the positions of its
 own Basestations, and those it learned, on to its federation peers:
 
+- **Both servers must set `loop_safe = true`** in `[federation]`, including a
+  server that only accepts the link (it may keep `enabled = false`) -- see
+  [Troubleshooting](#troubleshooting-positions-not-relayed). With it set on
+  only one end the link stays a plain one and no positions cross it.
 - Positions travel as `FED_BTS` messages. A link first sends `FED_BTS_HELLO`;
   positions go **only to peers that announced support**. Older peers and
   legacy (non loop-safe) links receive nothing.
@@ -69,3 +73,31 @@ lon = 23.7640
 
 Also editable under Settings. A `0` / `0` entry is treated as not configured
 and is not plotted.
+
+## Troubleshooting: positions not relayed
+
+A Basestation position shows on the server it reports to but not on its peer:
+
+1. **`loop_safe` on both servers.** The dialling server (`[[federation.peers]]`)
+   and the accepting one both need:
+
+   ```toml
+   [federation]
+   loop_safe = true
+   ```
+
+   The accepting side can keep `enabled = false`. Restart after changing it.
+   Switching a link to loop-safe also changes how subscriber registrations
+   are exchanged (route adverts instead of plain subscriber messages), so
+   check calls between the sites afterwards.
+2. **Same build on both.** A server without this feature ignores the messages.
+3. **Check the logs.**
+   - `federation: peer link established` with an empty `loop_safe_neighbour`
+     means a plain link (see 1).
+   - `federation: peer supports Basestation positions; synced` on each side
+     means the relay is active.
+   - Debug log on the origin: `Basestation position not relayed: no peer link
+     announced support`.
+4. **The Basestation must report a position** (`latitude` / `longitude` in its
+   `[telemetry]`, not 0 / 0) and its telemetry must be connected.
+5. **Mobile terminal positions are not relayed**, only Basestation ones.

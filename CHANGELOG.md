@@ -14,8 +14,9 @@ Unreleased adds:
   links. Relayed positions expire after 2 minutes without a refresh. The
   static `[bts_locations]` table stays as a fallback for any Basestation
   that reports no position. The Basestation re-sends its position every
-  minute in case the server missed it. See the Basestation-Locations wiki
-  page (`docs/Basestation-Locations.md`).
+  minute in case the server missed it. Relaying needs `loop_safe = true` on
+  both servers; see the Basestation-Locations wiki page
+  (`docs/Basestation-Locations.md`) for setup and troubleshooting.
 - **Map icons.** Basestations are drawn as a radio mast (grey when offline)
   and mobile terminals as a handheld radio, instead of the default pin.
 - **MCC / MNC in the cell block.** The cell header now reads

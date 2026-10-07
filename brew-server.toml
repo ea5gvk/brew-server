@@ -201,6 +201,8 @@ enabled = true
 # of an ISSI wins network-wide, so keep the servers' clocks on NTP.
 [federation]
 enabled = false
+# loop_safe = true on BOTH servers also relays Basestation positions between them;
+# see the Basestation-Locations wiki page.
 loop_safe = false
 # WebSocket pings on every federation link -- the peers we dial below and
 # any peer that dials in to us (this applies even with enabled = false). A
