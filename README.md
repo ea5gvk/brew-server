@@ -13,7 +13,7 @@ Requires a Rust toolchain and a C compiler (the vendored ACELP codec in
 `third_party/tetra-codec/` is compiled by `build.rs`).
 
 ```bash
-cargo run --release -- brew-server.toml
+cargo run --release -- sample/brew-server.toml   # the example; copy and edit it for your own
 ```
 
 ## Run via Docker
