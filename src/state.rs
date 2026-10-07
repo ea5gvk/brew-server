@@ -144,6 +144,11 @@ pub struct SdsRoute {
     /// Nobody could receive this SDS and the SMS Center wants to keep it: the
     /// following `SDS_TRANSFER` payload is stored for later delivery.
     pub store_offline: bool,
+    /// An ISSI on the blacklist is a party: the SDS is passed on only if its
+    /// payload turns out to be LIP (the header carries no protocol id), so the
+    /// header is held until the `SDS_TRANSFER` arrives.
+    pub lip_only: bool,
+    pub held_header: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -189,6 +194,28 @@ impl Inner {
     /// instead by `ms_registration_count`).
     pub fn basestation_count(&self) -> usize {
         self.clients.values().filter(|c| c.mode == ClientMode::Basestation).count()
+    }
+}
+
+#[cfg(test)]
+mod blacklist_tests {
+    use super::*;
+
+    #[test]
+    fn blacklist_starts_from_config_and_is_edited_live() {
+        let mut c = Config::default();
+        c.storage.enabled = false;
+        c.sms_center.enabled = false;
+        c.blacklist.issis = vec![4013, 7];
+        let state = AppState::new(c, "test.toml".into()).0;
+        assert!(state.is_blocked(4013) && state.is_blocked(7) && !state.is_blocked(8));
+        assert!(state.set_blocked(8, true) && !state.set_blocked(8, true));
+        assert!(state.set_blocked(7, false));
+        assert_eq!(state.blocked_list(), vec![8, 4013]);
+        // What a settings edit saves carries the live list, not the startup one.
+        assert_eq!(state.config_snapshot().blacklist.issis, vec![8, 4013]);
+        let text = state.config_snapshot().to_toml_pretty().unwrap();
+        assert_eq!(Config::parse(&text).unwrap().blacklist.issis, vec![8, 4013]);
     }
 }
 
@@ -288,6 +315,37 @@ pub struct AppState {
     /// The history log, shared with `monitor` and `telemetry`; HA replication
     /// reads and extends it. `None` with `[storage]` disabled.
     pub store: Option<std::sync::Arc<crate::store::Store>>,
+    /// The ISSI blacklist as enforced right now: starts as `[blacklist]` and is
+    /// edited live from the dashboard, which also writes the config file
+    /// without restarting (`config` itself is a startup snapshot).
+    pub blocked: std::sync::RwLock<HashSet<u32>>,
+}
+
+impl AppState {
+    pub fn is_blocked(&self, issi: u32) -> bool {
+        self.blocked.read().is_ok_and(|b| b.contains(&issi))
+    }
+
+    /// Sorted copy of the blacklist.
+    pub fn blocked_list(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.blocked.read().map(|b| b.iter().copied().collect()).unwrap_or_default();
+        v.sort_unstable();
+        v
+    }
+
+    /// Adds (`true`) or removes an ISSI; whether the set changed.
+    pub fn set_blocked(&self, issi: u32, blocked: bool) -> bool {
+        let Ok(mut set) = self.blocked.write() else { return false };
+        if blocked { set.insert(issi) } else { set.remove(&issi) }
+    }
+
+    /// The startup config with the live blacklist applied: what is saved when
+    /// a settings edit rewrites the file, so it never reverts blacklist edits.
+    pub fn config_snapshot(&self) -> Config {
+        let mut cfg = self.config.clone();
+        cfg.blacklist.issis = self.blocked_list();
+        cfg
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +391,7 @@ impl AppState {
         };
         let (aprs_tx, aprs_rx) = mpsc::unbounded_channel();
         let sms_center = crate::sms_center::SmsCenter::open(config.sms_center.clone());
+        let blocked: HashSet<u32> = config.blacklist.issis.iter().copied().collect();
         let config_hash = crate::ha::config_hash(&config);
         let ha = crate::ha::HaHandle::new(&config.ha, config_hash, crate::ha::config_sections(&config, false));
         (
@@ -348,6 +407,7 @@ impl AppState {
                 sms_center,
                 ha,
                 store,
+                blocked: std::sync::RwLock::new(blocked),
             },
             aprs_rx,
         )

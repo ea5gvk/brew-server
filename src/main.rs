@@ -84,6 +84,11 @@ async fn services(
     Ok(())
 }
 
+/// Set by a settings write whose change is already applied live (the ISSI
+/// blacklist), so `config_watcher` leaves that one file change alone instead of
+/// restarting the process and dropping every call.
+pub static CONFIG_WRITE_APPLIED_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Polls the config file's modification time; on any change, restarts the
 /// process by re-executing the same binary with the same arguments. This is a
 /// deliberately blunt "drop everything and start again" reload: the OS reclaims
@@ -100,6 +105,10 @@ async fn config_watcher(path: String) {
             continue;
         }
         last_mtime = current;
+        if CONFIG_WRITE_APPLIED_LIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(config = %path, "configuration written by the dashboard and already applied; not restarting");
+            continue;
+        }
 
         // Validate the new file first: a broken edit should not restart into a
         // crash loop. If it doesn't parse, keep running and wait for a fix.

@@ -50,6 +50,8 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/config/sip/routes", axum::routing::post(upsert_sip_route))
         .route("/api/config/sip/routes/{name}", axum::routing::delete(delete_sip_route))
         .route("/api/config/bts-locations/{username}", axum::routing::post(upsert_bts_location).delete(delete_bts_location))
+        .route("/api/config/blacklist", get(blacklist_get))
+        .route("/api/config/blacklist/{issi}", axum::routing::post(blacklist_add).delete(blacklist_remove))
         .route("/api/sms-center/{id}", axum::routing::delete(sms_center_delete))
         .route("/api/ha/active", axum::routing::post(ha_make_active))
         .route("/api/ha/standby", axum::routing::post(ha_make_standby))
@@ -69,6 +71,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/api/status", get(snapshot))
         .route("/api/live", get(live))
         .route("/api/telemetry", get(telemetry_snapshot))
+        .route("/api/emergencies", get(emergencies_snapshot))
         .route("/api/rssi", get(brew_rssi_snapshot))
         .route("/api/registrations", get(registration_log))
         .route("/api/connections", get(connections_snapshot))
@@ -519,6 +522,8 @@ static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
 <p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Matching runs against the full dialled string (e.g. a PSTN call from a mobile terminal dialling "9" + 10 digits arrives as dialled string "9XXXXXXXXXX"); <code>strip_prefix</code> removes a leading literal (e.g. "9") only from what's handed to an empty-number <code>trunk:NAME</code> destination, so the trunk dials the bare 10 digits. Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
 </section>
 
+<section class=panel><h2>ISSI Blacklist</h2><p class=muted>A blacklisted ISSI cannot transmit to groups, make or receive private calls, or send or receive SDS through this server. Dispatch ambience listening (SS-AL) to it and LIP position traffic still work. It can still register. Changes apply immediately, without a restart.</p><table><thead><tr><th>ISSI</th><th></th></tr></thead><tbody id=blk-list></tbody></table>
+<div class=ctl-row><input id=blk-issi placeholder="ISSI to block, e.g. 4013" type=number min=1><button onclick="blockIssi()">Block</button></div></section>
 <section class=panel><h2>Basestation Locations (static fallback)</h2><p class=muted>Positions reported by Basestations over telemetry, or relayed by other servers, take precedence. This table lists the configured entries.</p><table><thead><tr><th>Username (auth)</th><th>Name</th><th>Latitude</th><th>Longitude</th><th></th></tr></thead><tbody id=bts-locs></tbody></table>
 <div class=ctl-row><input id=bl-user placeholder="Brew username, e.g. 1000001"><input id=bl-name placeholder="Basestation name"><input id=bl-lat placeholder="latitude" type=number step=any><input id=bl-lon placeholder="longitude" type=number step=any><button onclick="saveBtsLoc()">Add / Update</button></div>
 <p class=map-note style="color:#8fa2b8;font-size:12px">Keyed by the same numeric username the Basestation authenticates with under <code>[auth.users]</code>, so it's matched automatically to whichever live connection logs in as that identity. Shown on the <a class=backlink href="/map">MS Map</a> alongside mobile-station positions.</p>
@@ -593,6 +598,19 @@ async function saveRoute(){{
   loadSip();
 }}
 async function delRoute(name){{ await api('DELETE',`/api/config/sip/routes/${{encodeURIComponent(name)}}`); loadSip(); }}
+async function loadBlk(){{
+  const d=await(await fetch('/api/config/blacklist')).json();
+  $('blk-list').innerHTML=d.map(i=>`<tr><td>${{i}}</td><td><button onclick="unblockIssi(${{i}})">Unblock</button></td></tr>`).join('')||'<tr><td colspan=2 class=muted>No ISSI is blacklisted</td></tr>';
+}}
+async function blkApi(method,issi){{
+  const r=await fetch(`/api/config/blacklist/${{issi}}`,{{method}});
+  const t=await r.text();
+  if(!r.ok){{banner(false,'Failed: '+t);return;}}
+  banner(true,'Applied immediately.');
+  loadBlk();
+}}
+function blockIssi(){{const v=parseInt($('blk-issi').value,10); if(!v)return; $('blk-issi').value=''; blkApi('POST',v);}}
+function unblockIssi(i){{blkApi('DELETE',i);}}
 async function loadBtsLocs(){{
   const d=(await(await fetch('/api/bts-locations?config_only=1')).json());
   $('bts-locs').innerHTML=d.map(b=>`<tr><td>${{esc(b.username)}}</td><td>${{esc(b.name)}}</td><td>${{b.lat}}</td><td>${{b.lon}}</td><td><button onclick="delBtsLoc('${{esc(b.username)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=5 class=muted>No Basestation locations configured</td></tr>';
@@ -612,7 +630,7 @@ async function saveRaw(){{
   if(!r.ok){{banner(false,'Failed: '+t);return;}}
   banner(true,'Saved. Restarting to apply…');
 }}
-loadSip();loadRaw();loadBtsLocs();
+loadSip();loadRaw();loadBtsLocs();loadBlk();
 </script></body></html>"#, style = STYLE, ver = VERSION));
 
 pub async fn calls_page() -> Html<&'static str> { Html(CALLS_HTML.as_str()) }
@@ -623,6 +641,41 @@ pub async fn connections_page() -> Html<&'static str> { Html(CONNECTIONS_HTML.as
 pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor::Snapshot> { let i=state.inner.read().await; let counts=(i.basestation_count(),i.ms_registration_count(),i.group_clients.len()); drop(i); Json(state.monitor.snapshot(counts.0,counts.1,counts.2).await) }
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
+
+/// One active emergency, for the red ribbon on the dashboard.
+#[derive(serde::Serialize)]
+pub struct Emergency {
+    pub issi: u32,
+    /// Group or called ISSI of an emergency call; `None` for a Basestation alarm.
+    pub destination: Option<u32>,
+    /// Basestation that reported the alarm (telemetry); `None` for a call.
+    pub bts: Option<String>,
+    /// "alarm" (Basestation telemetry) or "call" (priority-15 call on the Brew channel).
+    pub kind: &'static str,
+    pub blacklisted: bool,
+}
+
+/// Active emergencies: Basestation emergency alarms from telemetry, and live
+/// emergency calls (priority 15) seen on the Brew channel. The blacklist never
+/// holds an emergency call back.
+pub async fn emergencies_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<Emergency>> {
+    let mut out: Vec<Emergency> = Vec::new();
+    for s in state.telemetry.read().await.stations.values() {
+        for issi in &s.emergencies {
+            out.push(Emergency { issi: *issi, destination: None, bts: Some(s.id.clone()), kind: "alarm", blacklisted: state.is_blocked(*issi) });
+        }
+    }
+    let inner = state.inner.read().await;
+    for call in inner.calls.values().filter(|c| c.priority >= crate::router::EMERGENCY_PRIORITY) {
+        out.push(Emergency {
+            issi: call.source_issi, destination: Some(call.destination), bts: None, kind: "call",
+            blacklisted: state.is_blocked(call.source_issi),
+        });
+    }
+    out.sort_by_key(|e| (e.issi, e.kind));
+    out.dedup_by(|a, b| a.issi == b.issi && a.kind == b.kind && a.destination == b.destination && a.bts == b.bts);
+    Json(out)
+}
 
 pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<TelemetryBts>> {
     Json(state.telemetry.read().await.snapshot())
@@ -901,7 +954,7 @@ async fn mutate_and_save(
     state: &Arc<AppState>,
     edit: impl FnOnce(&mut config::Config),
 ) -> Response {
-    let mut cfg = state.config.clone();
+    let mut cfg = state.config_snapshot();
     edit(&mut cfg);
     match save_config(state, &cfg).await {
         Ok(()) => Json(saved_note(state)).into_response(),
@@ -924,7 +977,7 @@ pub async fn sip_config_full(State(state): State<Arc<AppState>>) -> Json<crate::
 /// router already sits behind `require_basic`, the same gate protecting the
 /// rest of the admin surface.
 pub async fn config_raw_get(State(state): State<Arc<AppState>>) -> Response {
-    match state.config.to_toml_pretty() {
+    match state.config_snapshot().to_toml_pretty() {
         Ok(text) => (StatusCode::OK, text).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -967,6 +1020,38 @@ pub async fn upsert_sip_trunk(
 
 pub async fn delete_sip_trunk(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     mutate_and_save(&state, |cfg| { cfg.sip.trunks.remove(&name); }).await
+}
+
+/// The ISSI blacklist as enforced now.
+pub async fn blacklist_get(State(state): State<Arc<AppState>>) -> Json<Vec<u32>> {
+    Json(state.blocked_list())
+}
+
+/// Blocks an ISSI. Applied to the running server at once and written to the
+/// config file without a restart (a restart would drop every call).
+pub async fn blacklist_add(State(state): State<Arc<AppState>>, Path(issi): Path<u32>) -> Response {
+    set_blacklisted(&state, issi, true).await
+}
+
+pub async fn blacklist_remove(State(state): State<Arc<AppState>>, Path(issi): Path<u32>) -> Response {
+    set_blacklisted(&state, issi, false).await
+}
+
+async fn set_blacklisted(state: &Arc<AppState>, issi: u32, blocked: bool) -> Response {
+    if issi == 0 {
+        return (StatusCode::BAD_REQUEST, "ISSI must be 1-16777215").into_response();
+    }
+    state.set_blocked(issi, blocked);
+    tracing::warn!(issi, blocked, "ISSI blacklist changed from the dashboard");
+    let cfg = state.config_snapshot();
+    crate::CONFIG_WRITE_APPLIED_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    match save_config(state, &cfg).await {
+        Ok(()) => Json(serde_json::json!({ "saved": true, "note": "applied immediately; saved to the config file without a restart" })).into_response(),
+        Err(e) => {
+            crate::CONFIG_WRITE_APPLIED_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("applied, but saving the config file failed: {e}")).into_response()
+        }
+    }
 }
 
 /// Adds or replaces a `[bts_locations]` entry, keyed by the same numeric Brew
@@ -1025,6 +1110,7 @@ const STYLE: &str = r#"<style>
 :root{font-family:Inter,system-ui,sans-serif;color:#e7edf5;background:#09111c}*{box-sizing:border-box}body{margin:0}header{padding:22px 28px;border-bottom:1px solid #203047;display:flex;justify-content:space-between;align-items:center}h1{font-size:20px;margin:0}.muted{color:#8fa2b8}.wrap{padding:24px;max-width:1500px;margin:auto}.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}.card,.panel{background:#101b2a;border:1px solid #203047;border-radius:12px}.card{padding:16px}.n{font-size:28px;font-weight:700;margin-top:6px}.panel{margin-top:16px;padding:18px}h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#8fa2b8;margin:0 0 14px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px;border-bottom:1px solid #1c2a3c;font-size:13px}th{color:#8fa2b8}.pill{padding:3px 8px;border-radius:99px;background:#203047}.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52d273;margin-right:7px}.hdr-status{display:flex;flex-direction:column;align-items:flex-end;gap:2px}.ver{font-size:11px;color:#8fa2b8}.hdr-user{display:flex;align-items:center;gap:8px;font-size:12px;color:#cfe0f2}#logout-btn,#login-btn{display:none;background:#203047;color:#e7edf5;border:1px solid #2c405c;border-radius:6px;padding:3px 9px;font-size:11px;cursor:pointer}#logout-btn:hover,#login-btn:hover{background:#2c405c}body.not-admin .admin-only{display:none!important}@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
 .health-ok{background:#173822;color:#52d273}.health-degraded{background:#3a2f12;color:#e8b93d}.health-critical{background:#3a1414;color:#f2545b}.health-unknown{background:#203047;color:#8fa2b8}
 .bts-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}.bts-grid.wide{grid-template-columns:repeat(auto-fill,minmax(min(480px,100%),1fr))}.bts-card{min-width:0}.bts-card{background:#0d1826;border:1px solid #203047;border-radius:10px;padding:14px}.bts-card h3{margin:0;font-size:15px}.bts-meta{font-size:12px;margin-top:4px}.bts-card table{margin-top:10px}.bts-card th,.bts-card td{padding:6px;font-size:12px}
+.emg-ribbon{display:none;position:sticky;top:0;z-index:50;align-items:center;gap:10px;flex-wrap:wrap;background:#c62828;color:#fff;padding:10px 24px;font-weight:700;border-bottom:2px solid #ff8a80}.emg-ribbon.on{display:flex}.emg-dot{width:10px;height:10px;border-radius:50%;background:#fff;animation:emgb 1.6s ease-in-out infinite}.emg-chip{background:rgba(255,255,255,.2);border-radius:4px;padding:2px 8px;font-weight:600;font-size:13px}@keyframes emgb{50%{opacity:.3}}
 .banner{display:none;background:#3a1414;border:1px solid #f2545b;color:#ffb4b8;padding:12px 18px;border-radius:10px;margin-bottom:16px;font-weight:600}
 .ctl-row{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}.ctl-row input{background:#0d1826;border:1px solid #203047;color:#e7edf5;border-radius:6px;padding:5px 8px;font-size:12px;width:auto}.ctl-row label{font-size:12px;display:flex;align-items:center;gap:4px}.ctl-row button{background:#203047;color:#e7edf5;border:1px solid #2c405c;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer}.ctl-row button:hover{background:#2c405c}.ctl-result{font-size:12px;margin-top:8px;word-break:break-all}
 .pager{display:flex;align-items:center;gap:10px;margin-top:12px;font-size:12px;color:#8fa2b8}.pager button{background:#203047;color:#e7edf5;border:1px solid #2c405c;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}.pager button:hover:not(:disabled){background:#2c405c}.pager button:disabled{opacity:.4;cursor:default}.pager .pginfo{min-width:120px}
@@ -1068,8 +1154,7 @@ a.className='badge ha-hdr ha-'+d.role;a.textContent='HA '+d.node+': '+d.role.toU
 tick();setInterval(tick,5000);});
 </script>"#;
 
-const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
-<div class=banner id=emergency-banner></div>
+const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>TETRA Network</title>__STYLE__</head><body><div class=emg-ribbon id=emergency-banner role=alert><span class=emg-dot></span><span>EMERGENCY ACTIVE</span><span id=emergency-list style="display:flex;flex-wrap:wrap;gap:8px"></span></div><header><h1>TETRA NETWORK MONITOR</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v__VERSION__</div></div></header><main class=wrap>
 <section class=cards><div class=card><div class=muted>Basestations</div><div class=n id=bs>-</div></div><div class=card><div class=muted>Subscribers</div><div class=n id=subs>-</div></div><div class=card><div class=muted>Groups</div><div class=n id=groups>-</div></div><div class=card><div class=muted>Active calls</div><div class=n id=active>-</div></div><div class=card><div class=muted>Total calls</div><div class=n id=calls>-</div></div><div class=card><div class=muted>SDS</div><div class=n id=sds>-</div></div></section><section class=panel><h2>Live calls</h2><table><thead><tr><th>Type</th><th>From</th><th>To</th><th>Priority</th><th>Duration</th><th>Voice frames</th><th>MS RSSI</th><th>UUID</th></tr></thead><tbody id=livecalls></tbody></table></section><section class=panel><h2>Menu</h2><div class=navlinks><a class=navlink href="/calls">Recent calls<span class=sub>Completed call history</span></a><a class=navlink href="/sds">Recent SDS<span class=sub>Short data messages</span></a><a class=navlink href="/telemetry-sds">Telemetry SDS Log<span class=sub>Per-Basestation SDS stream</span></a><a class=navlink href="/map">MS Map<span class=sub>Plot positioned mobiles</span></a><a class=navlink href="/sms-center">SMS Center<span class=sub>Messages stored for offline radios</span></a><a class=navlink href="/connections">Live Connections<span class=sub>Who's connected now: Brew, MS &amp; SIP</span></a><a class=navlink href="/sip">SIP / VoIP<span class=sub>Registrations, trunks &amp; calls</span></a><a class=navlink href="/sip-config">SIP Config<span class=sub>Extensions, trunks &amp; routes</span></a><a class=navlink href="/ha">High Availability<span class=sub>Active/standby role, VIP &amp; failover</span></a><a class=navlink id=settings-link href="/settings">Settings<span class=sub>Edit &amp; save server configuration</span></a></div></section>
 <section class=panel><h2>Basestation Telemetry</h2><div class="bts-grid wide" id=telemetry-stations></div></section>
 <section class=panel><h2>Registered Subscribers <a class=backlink href="/registrations">(view registration log &rarr;)</a></h2><div class=bts-grid id=registrations></div></section>
@@ -1141,9 +1226,6 @@ function cellsTable(s){
 }
 function renderTelemetry(stations){
   tsnap=stations;
-  const emergencies=stations.flatMap(s=>(s.emergencies||[]).map(issi=>({bts:s.id,issi})));
-  const banner=$('emergency-banner');
-  if(emergencies.length){banner.style.display='block';banner.textContent='EMERGENCY ACTIVE: '+emergencies.map(e=>`ISSI ${e.issi} on ${e.bts}`).join(', ');}else{banner.style.display='none';}
   $('telemetry-stations').innerHTML=stations.length?stations.map(s=>{
     const calls=Object.values(s.active_calls||{});
     const cellOfCarrier={};(s.cells||[]).forEach(c=>(c.carriers||[]).forEach(k=>{cellOfCarrier[k.carrier_num]=c.id;}));
@@ -1171,6 +1253,14 @@ function renderTelemetry(stations){
     const chips=issis.length?`<div class=reg-list>${issis.map(i=>`<span class=reg-issi>${esc(String(i))}${cellOf[i]!=null?` <span class=muted>cell ${cellOf[i]}</span>`:''}</span>`).join('')}</div>`:'<div class="bts-meta muted" style="margin-top:8px">No subscribers registered</div>';
     return `<div class=bts-card><div style="display:flex;justify-content:space-between;align-items:center"><h3>${esc(s.id)}</h3><span class=reg-count>${issis.length} registered</span></div>${chips}</div>`;
   }).join(''):'<div class=muted>No Basestation telemetry connections</div>';
+}
+async function refreshEmergencies(){
+  try{
+    const list=await(await fetch('/api/emergencies')).json();
+    const b=$('emergency-banner');
+    b.classList.toggle('on',list.length>0);
+    $('emergency-list').innerHTML=list.map(e=>`<span class=emg-chip>ISSI ${e.issi}${e.kind==='call'?' &rarr; '+e.destination+' &middot; emergency call':' &middot; '+esc(e.bts)}${e.blacklisted?' &middot; blacklisted':''}</span>`).join('');
+  }catch(e){}
 }
 async function refreshTelemetry(){try{renderTelemetry(await(await fetch('/api/telemetry')).json())}catch(e){}}
 async function refreshBrewRssi(){try{const pairs=await(await fetch('/api/rssi')).json();brssi={};pairs.forEach(([issi,dbfs])=>{brssi[issi]=dbfs;});if(snap)render(snap);}catch(e){}}
@@ -1231,14 +1321,14 @@ function ctlSendSds(id,s){const payload=hexToBytes($(s+'_raw_hex').value);ctlSen
 function ctlAmbience(id,s,enable){const issi=Number($(s+'_al_issi').value||0);if(!issi){$(s+'_result').textContent='Enter an ISSI';return;}ctlSend(id,{action:'AmbienceListen',issi,enable},s+'_result');}
 function ctlRestart(id){if(confirm('Restart Basestation service on '+id+'? This disconnects it.'))ctlSend(id,{action:'RestartService'},null);}
 function ctlShutdown(id){if(confirm('Shutdown Basestation service on '+id+'? This stops the BTS process.'))ctlSend(id,{action:'ShutdownService'},null);}
-refresh();refreshTelemetry();refreshControl();refreshBrewRssi();setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);setInterval(refreshBrewRssi,5000);
+refresh();refreshTelemetry();refreshEmergencies();refreshControl();refreshBrewRssi();setInterval(refreshEmergencies,2000);setInterval(refresh,2000);setInterval(refreshTelemetry,2000);setInterval(refreshControl,3000);setInterval(refreshBrewRssi,5000);
 // Keep a live WebSocket for push updates, but never reload the page on drop:
 // a reload would wipe anything the operator is typing in the control panel.
 // Instead we reconnect in the background and fall back to the polling above.
 function connectLive(){
   let ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/live');
   ws.onopen=()=>{$('status').textContent='Live';};
-  ws.onmessage=()=>{refresh();refreshTelemetry();refreshControl();};
+  ws.onmessage=()=>{refresh();refreshTelemetry();refreshEmergencies();refreshControl();};
   ws.onclose=()=>{$('status').textContent='Reconnecting';setTimeout(connectLive,3000);};
   ws.onerror=()=>{try{ws.close();}catch(e){}};
 }
@@ -1619,6 +1709,35 @@ mod tests {
         assert_eq!(fixes.len(), 2);
         assert_eq!((fixes[0].issi, fixes[0].lat), (4013, 3.0));
         assert!(fixes[1].issi == 4014 && fixes[1].bts.starts_with("bts9 @ "));
+    }
+
+    #[tokio::test]
+    async fn blacklist_api_applies_live_and_writes_the_config_without_restart() {
+        let path = std::env::temp_dir().join(format!("brew-blacklist-{}.toml", uuid::Uuid::new_v4()));
+        let mut config = crate::config::Config::default();
+        config.storage.enabled = false;
+        config.sms_center.enabled = false;
+        let (state, _rx) = crate::state::AppState::new(config, path.clone());
+        let state = std::sync::Arc::new(state);
+
+        let resp = blacklist_add(State(state.clone()), Path(4013)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.is_blocked(4013), "applied to the running server at once");
+        assert!(crate::CONFIG_WRITE_APPLIED_LIVE.swap(false, std::sync::atomic::Ordering::SeqCst), "watcher told not to restart");
+        let saved = crate::config::Config::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(saved.blacklist.issis, vec![4013]);
+        assert_eq!(blacklist_get(State(state.clone())).await.0, vec![4013]);
+
+        // Another settings edit keeps the live list instead of reverting it.
+        let resp = upsert_bts_location(State(state.clone()), Path("1".into()), Json(crate::config::BtsLocationConfig { name: "x".into(), lat: 1.0, lon: 2.0 })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(crate::config::Config::load(path.to_str().unwrap()).unwrap().blacklist.issis, vec![4013]);
+
+        assert_eq!(blacklist_remove(State(state.clone()), Path(4013)).await.status(), StatusCode::OK);
+        assert!(!state.is_blocked(4013));
+        assert_eq!(blacklist_add(State(state), Path(0)).await.status(), StatusCode::BAD_REQUEST);
+        crate::CONFIG_WRITE_APPLIED_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
