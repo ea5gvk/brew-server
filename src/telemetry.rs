@@ -576,6 +576,14 @@ pub struct TelemetryState {
 }
 
 impl TelemetryState {
+    /// Whether any Basestation currently reports an emergency alarm for `issi`
+    /// (set by `EmergencyAlarm`, cleared by `EmergencyCancel` or an operator).
+    /// FlowStation forwards a radio's group call to Brew at priority 0, so the
+    /// alarm is how the server learns the call is an emergency.
+    pub fn is_emergency(&self, issi: u32) -> bool {
+        self.stations.values().any(|s| s.emergencies.contains(&issi))
+    }
+
     #[cfg(test)]
     pub fn add_test_station(&mut self, id: &str, location: Option<(f64, f64)>, name: &str) {
         let mut bts = TelemetryBts::new(id.to_string(), None);
@@ -804,6 +812,8 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
     let mut sds_entry: Option<SdsLogEntry> = None;
     // Set when a (changed or due) station position must go out to federation peers.
     let mut advertise: Option<(String, f64, f64)> = None;
+    // Set when an emergency alarm just came up for an ISSI.
+    let mut alarm_raised: Option<u32> = None;
     match event {
         TelemetryEvent::SiteLocation { name, lat, lon } => {
             if crate::fedroute::valid_position(lat, lon) {
@@ -873,7 +883,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         }
         TelemetryEvent::SysHealth(h) => bts.last_sys_health = Some(h),
         TelemetryEvent::HealthSnapshot(h) => bts.health = Some(h),
-        TelemetryEvent::EmergencyAlarm { source_issi, .. } => { bts.emergencies.insert(source_issi); }
+        TelemetryEvent::EmergencyAlarm { source_issi, .. } => {
+            if bts.emergencies.insert(source_issi) { alarm_raised = Some(source_issi); }
+        }
         TelemetryEvent::EmergencyCancel { source_issi } => { bts.emergencies.remove(&source_issi); }
         TelemetryEvent::BrewConnected { connected, .. } => bts.backhaul_connected = Some(connected),
         TelemetryEvent::StationVersion { version, build, .. } => {
@@ -900,6 +912,10 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
             .map(|p| (p.issi, p.lat, p.lon, p.at_ms));
     }
     drop(t);
+    if let Some(issi) = alarm_raised {
+        // A call this ISSI already has running becomes an emergency call too.
+        crate::router::emergency_raised(state, issi).await;
+    }
     if let Some((issi, lat, lon, at_ms)) = ms_advert {
         crate::fedroute::advertise_ms(state, issi, lat, lon, at_ms, id).await;
     }

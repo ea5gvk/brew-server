@@ -26,8 +26,10 @@ other config change does.
 
 ## What still works
 
-- **Emergency calls.** A group or private call at priority 15 (what a
-  terminal's emergency button sends) is never held back, from or to a
+- **Emergency calls.** A group or private call that is an emergency -- at
+  priority 15, or from an ISSI that has an emergency alarm active on a
+  Basestation (FlowStation forwards its radios' calls to Brew at priority 0, so
+  the telemetry alarm is what marks them) -- is never held back, from or to a
   blacklisted ISSI. It shows in the red **EMERGENCY ACTIVE** ribbon at the top of
   the dashboard with the ISSI, the called group and a "blacklisted" tag, for as
   long as the call lasts. Basestation emergency alarms from telemetry appear

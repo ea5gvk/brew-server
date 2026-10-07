@@ -672,6 +672,14 @@ pub async fn emergencies_snapshot(State(state): State<Arc<AppState>>) -> Json<Ve
             blacklisted: state.is_blocked(call.source_issi),
         });
     }
+    // A Basestation alarm whose radio has a live call is one emergency, not two:
+    // the alarm entry takes the called group and the call entry is dropped.
+    let calls: Vec<(u32, Option<u32>)> = out.iter().filter(|e| e.kind == "call").map(|e| (e.issi, e.destination)).collect();
+    for e in out.iter_mut().filter(|e| e.kind == "alarm") {
+        if let Some((_, dest)) = calls.iter().find(|(issi, _)| *issi == e.issi) { e.destination = *dest; }
+    }
+    let alarmed: std::collections::HashSet<u32> = out.iter().filter(|e| e.kind == "alarm").map(|e| e.issi).collect();
+    out.retain(|e| e.kind != "call" || !alarmed.contains(&e.issi));
     out.sort_by_key(|e| (e.issi, e.kind));
     out.dedup_by(|a, b| a.issi == b.issi && a.kind == b.kind && a.destination == b.destination && a.bts == b.bts);
     Json(out)
@@ -1259,7 +1267,7 @@ async function refreshEmergencies(){
     const list=await(await fetch('/api/emergencies')).json();
     const b=$('emergency-banner');
     b.classList.toggle('on',list.length>0);
-    $('emergency-list').innerHTML=list.map(e=>`<span class=emg-chip>ISSI ${e.issi}${e.kind==='call'?' &rarr; '+e.destination+' &middot; emergency call':' &middot; '+esc(e.bts)}${e.blacklisted?' &middot; blacklisted':''}</span>`).join('');
+    $('emergency-list').innerHTML=list.map(e=>`<span class=emg-chip>ISSI ${e.issi}${e.destination!=null?' &rarr; '+e.destination+' &middot; emergency call':''}${e.bts?' &middot; '+esc(e.bts):''}${e.blacklisted?' &middot; blacklisted':''}</span>`).join('');
   }catch(e){}
 }
 async function refreshTelemetry(){try{renderTelemetry(await(await fetch('/api/telemetry')).json())}catch(e){}}

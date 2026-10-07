@@ -4,24 +4,30 @@ All notable changes to brew-server, newest first.
 
 Unreleased adds:
 
-- **Emergency calls reach dispatch consoles.** An emergency group call
-  (priority 15) is now also pushed to every connected Tetra Dispatch console
-  (recognised by its `TetraDispatch/` User-Agent), whatever groups it
-  listens to, with its voice and end. Ordinary calls still follow
-  affiliations. Needs a Tetra Dispatch that handles it (see its changelog).
+- **Emergency calls reach dispatch consoles.** An emergency group call is now
+  also pushed to every connected Tetra Dispatch console (recognised by its
+  `TetraDispatch/` User-Agent), whatever groups it listens to, with its voice
+  and end. A call is an emergency when it is at priority 15 *or* its radio has
+  an emergency alarm active on a Basestation: FlowStation forwards its radios'
+  calls at priority 0, so the alarm is what marks them. For consoles and
+  federation peers such a call is forwarded with priority 15, and one already
+  running when the alarm arrives is upgraded mid-call. Ordinary calls still
+  follow affiliations. Needs a Tetra Dispatch that handles it (see its
+  changelog).
 
 - **Red emergency ribbon.** Like FlowStation's: a sticky red "EMERGENCY ACTIVE"
   ribbon at the top of the dashboard lists each active emergency -- a
-  Basestation emergency alarm, or a live priority-15 call seen on the Brew
-  channel (with the called group) -- and tags a blacklisted ISSI.
+  Basestation emergency alarm (with the called group once its radio is in a
+  call), or a live priority-15 call seen on the Brew channel -- and tags a
+  blacklisted ISSI.
 - **ISSI blacklist.** A new `[blacklist] issis = [...]` list and a Settings
   panel bar an ISSI from communicating through the server: its group
   transmissions are dropped, private calls from or to it are rejected, SDS
   from or to it is dropped and SIP calls to it are refused. Dispatch
   ambience listening (SS-AL) to it and LIP position traffic in both
   directions still work, and it can still register. Edits in Settings apply
-  immediately with no process restart. Emergency calls (priority 15) are
-  never blocked. See the ISSI-Blacklist wiki page
+  immediately with no process restart. Emergency calls (priority 15, or from
+  an ISSI with an active emergency alarm) are never blocked. See the ISSI-Blacklist wiki page
   (`docs/ISSI-Blacklist.md`).
 
 Version 1.16.0 adds:

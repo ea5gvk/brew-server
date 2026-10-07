@@ -17,6 +17,57 @@ use tracing::{debug, info, warn};
 /// `SERVICE_AMBIENCE_LISTENING`. Provisional — adjust per deployment.
 const AMBIENCE_LISTENING_SERVICE: u8 = 9;
 
+/// Offset of the priority byte in a `CALL_GROUP_TX`: class, call state, uuid(16),
+/// source(4), destination(4).
+const GROUP_TX_PRIORITY_AT: usize = 2 + 16 + 4 + 4;
+
+/// Whether a call is an emergency call: priority 15 on the wire, or its
+/// originating ISSI has an emergency alarm active on some Basestation (a
+/// FlowStation forwards its radios' calls to Brew at priority 0).
+async fn is_emergency_call(state: &Arc<AppState>, source_issi: u32, priority: u8) -> bool {
+    priority >= EMERGENCY_PRIORITY || state.telemetry.read().await.is_emergency(source_issi)
+}
+
+/// `raw` (a `CALL_GROUP_TX`) with its priority raised to the emergency level,
+/// for recipients that tell emergencies by it -- dispatch consoles and peers.
+fn with_emergency_priority(raw: &[u8]) -> Vec<u8> {
+    let mut out = raw.to_vec();
+    if let Some(p) = out.get_mut(GROUP_TX_PRIORITY_AT) { *p = EMERGENCY_PRIORITY; }
+    out
+}
+
+/// An emergency alarm just came up for `issi`: a group call it has running
+/// becomes an emergency call -- raised priority, and the dispatch consoles and
+/// peers that were not part of it are brought in with a raised GROUP_TX, so its
+/// voice and end reach them from here on.
+pub async fn emergency_raised(state: &Arc<AppState>, issi: u32) {
+    let mut inner = state.inner.write().await;
+    let consoles: Vec<ClientId> = inner.consoles.iter().copied().collect();
+    let calls: Vec<uuid::Uuid> = inner.calls.iter()
+        .filter(|(_, c)| c.kind == CallKind::Group && c.source_issi == issi && c.priority < EMERGENCY_PRIORITY)
+        .map(|(id, _)| *id).collect();
+    let mut sends = Vec::new();
+    for id in calls {
+        let Some(call) = inner.calls.get_mut(&id) else { continue };
+        call.priority = EMERGENCY_PRIORITY;
+        let (dest, owner) = (call.destination, call.owner);
+        let existing: Vec<ClientId> = call.peers.iter().copied().collect();
+        let new: Vec<ClientId> = consoles.iter().copied().filter(|c| *c != owner && !call.peers.contains(c)).collect();
+        call.peers.extend(new.iter().copied());
+        let msg = protocol::build_group_tx(&id, issi, dest, EMERGENCY_PRIORITY);
+        // Consoles already in the call and peers get the raised header too; the new
+        // consoles hear the call for the first time.
+        for cid in existing.into_iter().chain(new) {
+            if inner.consoles.contains(&cid) || is_peer(&inner, cid) {
+                if let Some(c) = inner.clients.get(&cid) { sends.push((c.tx.clone(), msg.clone())); }
+            }
+        }
+        info!(uuid=%id, issi, gssi=dest, "group call became an emergency call (alarm raised)");
+    }
+    drop(inner);
+    for (tx, msg) in sends { let _ = tx.send(msg); }
+}
+
 /// Call priority of an emergency call (ETSI EN 300 392-2 clause 14.8: 15, what
 /// a terminal's emergency button generates). Emergency calls are never held back
 /// by the ISSI blacklist, from or to a blacklisted terminal.
@@ -132,7 +183,8 @@ pub async fn handle_packet(state: Arc<AppState>, source: ClientId, raw: Vec<u8>)
 
 async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::GroupTransmission(gt) = payload else { return };
-    if state.is_blocked(gt.source) && gt.priority < EMERGENCY_PRIORITY {
+    let emergency = is_emergency_call(state, gt.source, gt.priority).await;
+    if state.is_blocked(gt.source) && !emergency {
         info!(%source, uuid=%id, src_issi=gt.source, gssi=gt.destination, "GROUP_TX from a blacklisted ISSI dropped");
         return;
     }
@@ -217,7 +269,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     // An emergency call is pushed to every connected dispatch console, whatever
     // groups it listens to, so the operator can hear and see it. They join the
     // call's peers, so its voice and its end reach them too.
-    if gt.priority >= EMERGENCY_PRIORITY {
+    if emergency {
         targets.extend(inner.consoles.iter().copied());
     }
     targets.remove(&source);
@@ -227,7 +279,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         owner: source,
         source_issi: gt.source,
         destination: gt.destination,
-        priority: gt.priority,
+        priority: if emergency { gt.priority.max(EMERGENCY_PRIORITY) } else { gt.priority },
         peers: targets.clone(),
         started_at: std::time::Instant::now(),
         last_activity_ms: ActiveCall::new_activity(),
@@ -236,9 +288,18 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     // Each recipient gets the GROUP_TX in its own layout: a connection that
     // announced v0 is not handed the v1 talker-name tail (see
     // `Client::forward_version`).
-    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| (c.tx.clone(), c.forward_version()))).collect::<Vec<_>>();
+    // An emergency the wire does not say so about (priority 0 from FlowStation) is
+    // raised for consoles and peers, which tell it by the priority.
+    let raised = (emergency && gt.priority < EMERGENCY_PRIORITY).then(|| with_emergency_priority(&raw));
+    let txs = targets.iter().filter_map(|cid| inner.clients.get(cid).map(|c| {
+        let raise = raised.is_some() && (inner.consoles.contains(cid) || c.mode == ClientMode::Peer);
+        (c.tx.clone(), c.forward_version(), raise)
+    })).collect::<Vec<_>>();
     drop(inner);
-    for (tx, version) in txs { let _ = tx.send(protocol::adapt_to_version(&raw, version).into_owned()); }
+    for (tx, version, raise) in txs {
+        let packet = if raise { raised.as_deref().unwrap_or(&raw) } else { &raw };
+        let _ = tx.send(protocol::adapt_to_version(packet, version).into_owned());
+    }
     if let Some(old) = preempted {
         state.monitor.call_ended(old).await;
         if let Some(h) = state.sip.read().await.as_ref() {
@@ -247,7 +308,7 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
             }
         }
     }
-    state.monitor.call_started(id, "group", gt.source, gt.destination, gt.priority).await;
+    state.monitor.call_started(id, "group", gt.source, gt.destination, if emergency { gt.priority.max(EMERGENCY_PRIORITY) } else { gt.priority }).await;
     info!(%source, uuid=%id, src_issi=gt.source, gssi=gt.destination, priority=gt.priority,
         target_count=targets.len(), "routed GROUP_TX");
 }
@@ -523,7 +584,7 @@ async fn handle_private_setup(state: &Arc<AppState>, source: ClientId, id: uuid:
     // accepts dispatch's ambience-listening (SS-AL) call -- except an emergency
     // call, which always goes through.
     let barred = state.is_blocked(source_issi) || (state.is_blocked(destination) && !ambience);
-    if barred && priority < EMERGENCY_PRIORITY {
+    if barred && !is_emergency_call(state, source_issi, priority).await {
         drop(inner);
         info!(%source, uuid=%id, source_issi, destination, "private SETUP_REQUEST involving a blacklisted ISSI rejected");
         reject_setup(state, source, id).await;
@@ -1081,6 +1142,81 @@ mod forwarding_tests {
         let idle = protocol::build_call_cause(CALL_GROUP_IDLE, &id, 0);
         handle_packet(state.clone(), bs, idle.clone()).await;
         assert_eq!(drain(&mut console_rx), vec![idle]);
+    }
+
+    /// FlowStation forwards a radio's emergency call to Brew at priority 0; the
+    /// emergency alarm over telemetry is what marks it.
+    #[tokio::test]
+    async fn an_alarmed_issis_priority_0_call_is_an_emergency_call() {
+        let mut config = crate::config::Config::default();
+        config.storage.enabled = false;
+        config.sms_center.enabled = false;
+        config.fallback_broadcast_when_no_affiliations = false;
+        let state = Arc::new(AppState::new(config, "test.toml".into()).0);
+        let (bs, _bs_rx) = connect(&state, ConnVersion::V0).await;
+        let (listener, mut listener_rx) = connect(&state, ConnVersion::V0).await;
+        let (console, mut console_rx) = connect(&state, ConnVersion::V0).await;
+        let (peer, mut peer_rx) = connect_as(&state, ClientMode::Peer).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_AFFILIATE, 6001, &[91])).await;
+        {
+            let mut inner = state.inner.write().await;
+            inner.consoles.insert(console);
+            // A legacy peer link that joined group 91.
+            inner.group_clients.entry(91).or_default().insert(peer);
+        }
+        state.set_blocked(4013, true);
+        drain(&mut peer_rx); // the registration messages a legacy peer link was sent
+        let mut t = state.telemetry.write().await;
+        t.add_test_station("bts2", None, "bts2");
+        t.stations.get_mut("bts2").unwrap().emergencies.insert(4013);
+        drop(t);
+
+        let id = uuid::Uuid::new_v4();
+        let wire = protocol::build_group_tx(&id, 4013, 91, 0);
+        handle_packet(state.clone(), bs, wire.clone()).await;
+        // Blacklisted, yet it goes through: the console and the peer see it raised to priority 15,
+        // the ordinary Basestation as sent.
+        let raised = with_emergency_priority(&wire);
+        assert_eq!(drain(&mut console_rx), vec![raised.clone()]);
+        assert_eq!(drain(&mut peer_rx), vec![raised]);
+        assert_eq!(drain(&mut listener_rx), vec![wire]);
+        assert_eq!(state.inner.read().await.calls[&id].priority, EMERGENCY_PRIORITY);
+        // The ribbon lists it once, with the called group.
+        let axum::Json(list) = crate::dashboard::emergencies_snapshot(axum::extract::State(state.clone())).await;
+        assert_eq!(list.len(), 1);
+        assert!(list[0].issi == 4013 && list[0].destination == Some(91) && list[0].bts.as_deref() == Some("bts2"));
+    }
+
+    #[tokio::test]
+    async fn an_alarm_raised_during_a_call_upgrades_it_for_consoles() {
+        let mut config = crate::config::Config::default();
+        config.storage.enabled = false;
+        config.sms_center.enabled = false;
+        config.fallback_broadcast_when_no_affiliations = false;
+        let state = Arc::new(AppState::new(config, "test.toml".into()).0);
+        let (bs, _bs_rx) = connect(&state, ConnVersion::V0).await;
+        let (listener, mut listener_rx) = connect(&state, ConnVersion::V0).await;
+        let (console, mut console_rx) = connect(&state, ConnVersion::V0).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_AFFILIATE, 6001, &[91])).await;
+        state.inner.write().await.consoles.insert(console);
+
+        // The call starts before the alarm reaches us: an ordinary call.
+        let id = uuid::Uuid::new_v4();
+        let wire = protocol::build_group_tx(&id, 4013, 91, 0);
+        handle_packet(state.clone(), bs, wire.clone()).await;
+        assert!(drain(&mut console_rx).is_empty());
+        drain(&mut listener_rx);
+
+        // The alarm arrives: the console joins the call, with the raised header first, then its voice.
+        emergency_raised(&state, 4013).await;
+        assert_eq!(drain(&mut console_rx), vec![protocol::build_group_tx(&id, 4013, 91, EMERGENCY_PRIORITY)]);
+        assert!(drain(&mut listener_rx).is_empty(), "ordinary Basestations are not told again");
+        let voice = protocol::build_traffic_frame(&id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES]);
+        handle_packet(state.clone(), bs, voice.clone()).await;
+        assert_eq!(drain(&mut console_rx), vec![voice]);
+        assert_eq!(state.inner.read().await.calls[&id].priority, EMERGENCY_PRIORITY);
     }
 
     #[tokio::test]
