@@ -23,6 +23,13 @@ pub const CLASS_FEDERATION: u8 = 0xfe;
 pub const FED_WITHDRAW: u8 = 0;
 pub const FED_ROUTE: u8 = 1;
 pub const FED_PRUNE: u8 = 2;
+/// Capability announcement: the sender understands `FED_BTS`. Sent once per
+/// negotiated link; `FED_BTS` goes only to links that announced it.
+pub const FED_BTS_HELLO: u8 = 3;
+/// A Basestation position advert, flooded loop-safely (see `fedroute`).
+pub const FED_BTS: u8 = 4;
+/// A mobile station position advert (needs a `FED_BTS_HELLO` of version >= 2).
+pub const FED_MS_POS: u8 = 5;
 
 pub const SUB_DEREGISTER: u8 = 0;
 pub const SUB_REGISTER: u8 = 1;

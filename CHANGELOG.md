@@ -2,6 +2,33 @@
 
 All notable changes to brew-server, newest first.
 
+Unreleased adds:
+
+- **Basestation positions over telemetry, relayed between servers.** A
+  Basestation (Bost FlowStation) with `latitude`/`longitude` (and optional
+  `site_name`) in its `[telemetry]` section reports a `SiteLocation`
+  telemetry event; an unset or 0/0 position is never sent. The `/map` page
+  plots it, and loop-safe federation relays it to other brew-servers
+  (`FED_BTS`, flooded with path-vector loop protection) -- only to peers
+  that announced support (`FED_BTS_HELLO`), never to older or legacy
+  links. Relayed positions expire after 2 minutes without a refresh. The
+  static `[bts_locations]` table stays as a fallback for any Basestation
+  that reports no position. The Basestation re-sends its position every
+  minute in case the server missed it. Relaying needs `loop_safe = true` on
+  both servers; see the Basestation-Locations wiki page
+  (`docs/Basestation-Locations.md`) for setup and troubleshooting.
+- **Mobile terminal positions relayed between servers.** The same loop-safe
+  links carry each terminal's decoded position (`FED_MS_POS`; the newest fix
+  per ISSI wins), so every server's `/map` shows terminals seen by any peer.
+  Sent only to peers that announce support (hello version 2); 0/0 is never
+  relayed or plotted. Needs `loop_safe = true` on both servers; see the
+  Basestation-Locations wiki page.
+- **Map icons.** Basestations are drawn as a radio mast (grey when offline)
+  and mobile terminals as a handheld radio, instead of the default pin.
+- **MCC / MNC in the cell block.** The cell header now reads
+  `MCC / MNC / CC / LA`. Needs a FlowStation that sends the new fields;
+  older ones show CC / LA only.
+
 Version 1.15.2 adds:
 
 - **Open/read-only dashboard mode with admin Login button.** A new

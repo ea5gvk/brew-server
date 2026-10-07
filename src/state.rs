@@ -433,12 +433,15 @@ impl AppState {
         inner.discovery_hints.retain(|_, (at, _, _, _)| now.duration_since(*at) < session_ttl);
         inner.sds_routes.retain(|_, route| now.duration_since(route.created_at) < Duration::from_secs(60));
         inner.recent_calls.retain(|_, (_, at)| now.duration_since(*at) < crate::fedroute::CALL_DEDUP_WINDOW);
+        crate::fedroute::purge_bts(&mut inner);
     }
 
     pub async fn cleanup_client(&self, id: ClientId) {
         let mut inner = self.inner.write().await;
         inner.clients.remove(&id);
         let negotiated = inner.fed.links.remove(&id).is_some();
+        inner.fed.bts_links.remove(&id);
+        inner.fed.ms_links.remove(&id);
 
         // Registrations: every ISSI routed over this connection, and for a
         // loop-safe link every one it offered, gets a new effective route --

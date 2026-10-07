@@ -19,7 +19,10 @@ pub struct LatLon {
 
 impl LatLon {
     fn new(lat: f64, lon: f64) -> Option<Self> {
-        if lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) {
+        // Exactly 0/0 (Null Island) is the "no fix" value every beacon format uses; never a position.
+        if lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+            && (lat != 0.0 || lon != 0.0)
+        {
             Some(LatLon { lat, lon })
         } else {
             None
@@ -401,6 +404,14 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn zero_zero_is_never_a_position() {
+        assert_eq!(parse_position("0.0, 0.0"), None);
+        assert_eq!(parse_position("LIP position: 0.000000, 0.000000"), None);
+        assert_eq!(parse_position("0000.00N 00000.00E"), None);
+        assert!(parse_position("0.0, 23.7").is_some());
     }
 
     #[test]

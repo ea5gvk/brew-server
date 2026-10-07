@@ -237,6 +237,13 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
         target_count=targets.len(), "routed GROUP_TX");
 }
 
+/// Relays a position decoded here to the peers -- unless it came out of an SDS
+/// a peer forwarded: its origin server decoded it too and advertises it.
+async fn advertise_if_local(state: &Arc<AppState>, source: ClientId, issi: u32, lat: f64, lon: f64, at_ms: u64) {
+    if is_peer(&*state.inner.read().await, source) { return; }
+    crate::fedroute::advertise_ms(state, issi, lat, lon, at_ms, "brew-sds").await;
+}
+
 async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid, payload: CallPayload, raw: Vec<u8>) {
     let CallPayload::ShortTransfer { source: source_issi, destination } = payload else { return };
     // A copy of an SDS already accepted over another peer link: dropped
@@ -259,6 +266,7 @@ async fn handle_sds_header(state: &Arc<AppState>, source: ClientId, id: uuid::Uu
     if let Some((lat, lon, note)) = extract_sds_position(&raw) {
         let now = crate::telemetry::now_ms();
         state.telemetry.write().await.record_sds_position(source_issi, lat, lon, now, note);
+        advertise_if_local(state, source, source_issi, lat, lon, now).await;
         crate::aprs::report_position(state, source_issi, lat, lon);
         info!(uuid=%id, source_issi, lat, lon, "decoded MS position from SDS header");
     }
@@ -347,6 +355,7 @@ async fn handle_sds_transfer(state: &Arc<AppState>, source: ClientId, id: uuid::
     if let Some((lat, lon, note)) = extract_sds_position(&raw) {
         let now = crate::telemetry::now_ms();
         state.telemetry.write().await.record_sds_position(source_issi, lat, lon, now, note);
+        advertise_if_local(state, source, source_issi, lat, lon, now).await;
         crate::aprs::report_position(state, source_issi, lat, lon);
         info!(uuid=%id, source_issi, lat, lon, "decoded MS position from SDS");
     }
