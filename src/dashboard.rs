@@ -349,7 +349,7 @@ async function loadBts(){{
 }}
 async function load(){{
   try{{
-    const fixes=await(await fetch('/api/positions')).json();
+    const fixes=(await(await fetch('/api/positions')).json()).filter(f=>f.lat!==0||f.lon!==0);
     $('status').textContent='Live';
     const seen=new Set();
     fixes.forEach(f=>{{

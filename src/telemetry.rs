@@ -655,6 +655,10 @@ impl TelemetryState {
 
     /// Records a position decoded from the Brew SDS channel for `issi`.
     pub fn record_sds_position(&mut self, issi: u32, lat: f64, lon: f64, at_ms: u64, source_text: String) {
+        // 0/0 is "no fix": keep any earlier real position and plot nothing new.
+        if lat == 0.0 && lon == 0.0 {
+            return;
+        }
         self.sds_positions.insert(issi, PositionFix {
             issi, lat, lon, at_ms, bts: "brew-sds".to_string(), source_text,
         });
