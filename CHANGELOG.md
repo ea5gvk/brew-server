@@ -4,6 +4,17 @@ All notable changes to brew-server, newest first.
 
 Unreleased adds:
 
+- **Red marker for a radio in an emergency.** On the MS Map a radio with an
+  active emergency (alarm or emergency call) turns red, pulses and its popup
+  says EMERGENCY; the map note names it too.
+- **Emergency list pushed to dispatch consoles.** Every second brew-server
+  checks the active emergencies (Basestation alarms plus live emergency
+  calls, relayed ones included) and pushes the list to every connected Tetra
+  Dispatch console as a `CLASS_SERVICE` message (type `0x11`) whenever it
+  changes, and every 5 s while any is active. A console shows the red ribbon
+  and marker even for an alarm with no call running. Needs the matching
+  Tetra Dispatch.
+
 - **Emergency calls reach dispatch consoles and every server.** An emergency
   group call is now also pushed to every federation peer, even one that does
   not route the group, so it reaches all brew-servers (loop-safe and plain

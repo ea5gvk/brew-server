@@ -313,7 +313,7 @@ static SMS_CENTER_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|
 static MAP_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(r#"<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>MS Map - TETRA Network</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 {style}
-<style>#map{{height:70vh;border:1px solid #203047;border-radius:12px}}.map-note{{font-size:12px;color:#8fa2b8;margin-top:10px}}.leaflet-popup-content{{color:#0d1826}}</style>
+<style>#map{{height:70vh;border:1px solid #203047;border-radius:12px}}.map-note{{font-size:12px;color:#8fa2b8;margin-top:10px}}.leaflet-popup-content{{color:#0d1826}}.emg-pin{{animation:emgpulse 1.2s ease-in-out infinite}}@keyframes emgpulse{{0%,100%{{box-shadow:0 0 0 0 rgba(229,57,53,.8)}}50%{{box-shadow:0 0 0 14px rgba(229,57,53,0)}}}}.emg-pop{{color:#c62828;font-weight:700}}</style>
 </head><body><header><h1>MS MAP</h1><div class=hdr-status><span class=live></span><span id=status>Live</span><div class=hdr-user><span id=whoami></span><button id=login-btn onclick="doLogin()">Login</button><button id=logout-btn onclick="doLogout()">Logout</button></div><div class=ver>v{ver}</div></div></header><main class=wrap>
 <p><a class=backlink href="/">&larr; Back to dashboard</a></p>
 <section class=panel><h2>Mobile station positions</h2><div id=map></div>
@@ -336,7 +336,7 @@ const pin=(bg,svg)=>`<div style="width:34px;height:34px;border-radius:50%;backgr
 const btsSvg='<svg width=22 height=22 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M12 11v10M8 21h8M9.5 21l2.5-10 2.5 10"/><circle cx=12 cy=9 r=1.6 fill=#fff /><path d="M7.8 5.8a6 6 0 0 0 0 6.4M16.2 5.8a6 6 0 0 1 0 6.4M5 3.5a10 10 0 0 0 0 11M19 3.5a10 10 0 0 1 0 11"/></svg>';
 const msSvg='<svg width=20 height=20 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M9 2v4M7 6h10a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z"/><rect x=8.5 y=8.5 width=7 height=4 rx=0.5 /><circle cx=9.5 cy=16 r=0.8 fill=#fff /><circle cx=12 cy=16 r=0.8 fill=#fff /><circle cx=14.5 cy=16 r=0.8 fill=#fff /><circle cx=9.5 cy=19 r=0.8 fill=#fff /><circle cx=12 cy=19 r=0.8 fill=#fff /><circle cx=14.5 cy=19 r=0.8 fill=#fff /></svg>';
 const mkIcon=(bg,svg)=>L.divIcon({{html:pin(bg,svg),className:'',iconSize:[34,34],iconAnchor:[17,17],popupAnchor:[0,-18]}});
-const btsIcon=mkIcon('#1f6feb',btsSvg),btsIconOff=mkIcon('#7a8696',btsSvg),msIcon=mkIcon('#d9822b',msSvg);
+const btsIcon=mkIcon('#1f6feb',btsSvg),btsIconOff=mkIcon('#7a8696',btsSvg),msIcon=mkIcon('#d9822b',msSvg),msIconEmg=L.divIcon({{html:pin('#e53935',msSvg).replace('<div ','<div class=emg-pin '),className:'',iconSize:[34,34],iconAnchor:[17,17],popupAnchor:[0,-18]}});
 async function loadBts(){{
   try{{
     const bts=await(await fetch('/api/bts-locations')).json();
@@ -358,12 +358,15 @@ async function load(){{
     fixes.forEach(f=>{{
       seen.add(f.issi);
       const when=new Date(f.at_ms).toLocaleString();
-      const html=`<b>ISSI ${{f.issi}}</b><br>${{f.lat.toFixed(5)}}, ${{f.lon.toFixed(5)}}<br>Station: ${{f.bts}}<br>${{when}}<br><span style="color:#555">${{(f.source_text||'').replace(/[<>&]/g,'')}}</span>`;
-      if(markers[f.issi]){{markers[f.issi].setLatLng([f.lat,f.lon]).setPopupContent(html);}}
-      else{{markers[f.issi]=L.marker([f.lat,f.lon],{{icon:msIcon}}).addTo(map).bindPopup(html);}}
+      const html=`${{f.emergency?'<div class=emg-pop>&#128680; EMERGENCY</div>':''}}<b>ISSI ${{f.issi}}</b><br>${{f.lat.toFixed(5)}}, ${{f.lon.toFixed(5)}}<br>Station: ${{f.bts}}<br>${{when}}<br><span style="color:#555">${{(f.source_text||'').replace(/[<>&]/g,'')}}</span>`;
+      const icon=f.emergency?msIconEmg:msIcon,z=f.emergency?10000:0;
+      if(markers[f.issi]){{markers[f.issi].setLatLng([f.lat,f.lon]).setIcon(icon).setZIndexOffset(z).setPopupContent(html);}}
+      else{{markers[f.issi]=L.marker([f.lat,f.lon],{{icon,zIndexOffset:z}}).addTo(map).bindPopup(html);}}
     }});
     Object.keys(markers).forEach(k=>{{if(!seen.has(Number(k))){{map.removeLayer(markers[k]);delete markers[k];}}}});
-    $('note').textContent=fixes.length?`${{fixes.length}} station(s) positioned.`:'No decodable position beacons received yet.';
+    const emg=fixes.filter(f=>f.emergency).map(f=>f.issi);
+    $('note').textContent=(fixes.length?`${{fixes.length}} station(s) positioned.`:'No decodable position beacons received yet.')+(emg.length?' EMERGENCY: ISSI '+emg.join(', ')+'.':'');
+    $('note').style.color=emg.length?'#ff6b6b':'';
     if(!fitted&&fixes.length){{fitted=true;map.fitBounds(fixes.map(f=>[f.lat,f.lon]),{{padding:[40,40],maxZoom:13}});}}
   }}catch(e){{$('status').textContent='Disconnected';}}
   loadBts();
@@ -642,47 +645,11 @@ pub async fn snapshot(State(state): State<Arc<AppState>>) -> Json<crate::monitor
 pub async fn live(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse { ws.on_upgrade(move |s| live_socket(state,s)) }
 async fn live_socket(state: Arc<AppState>, mut socket: WebSocket) { let mut rx=state.monitor.subscribe(); while let Ok(ev)=rx.recv().await { if socket.send(Message::Text(serde_json::to_string(&ev).unwrap().into())).await.is_err(){break;} } }
 
-/// One active emergency, for the red ribbon on the dashboard.
-#[derive(serde::Serialize)]
-pub struct Emergency {
-    pub issi: u32,
-    /// Group or called ISSI of an emergency call; `None` for a Basestation alarm.
-    pub destination: Option<u32>,
-    /// Basestation that reported the alarm (telemetry); `None` for a call.
-    pub bts: Option<String>,
-    /// "alarm" (Basestation telemetry) or "call" (priority-15 call on the Brew channel).
-    pub kind: &'static str,
-    pub blacklisted: bool,
-}
-
-/// Active emergencies: Basestation emergency alarms from telemetry, and live
-/// emergency calls (priority 15) seen on the Brew channel. The blacklist never
-/// holds an emergency call back.
-pub async fn emergencies_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<Emergency>> {
-    let mut out: Vec<Emergency> = Vec::new();
-    for s in state.telemetry.read().await.stations.values() {
-        for issi in &s.emergencies {
-            out.push(Emergency { issi: *issi, destination: None, bts: Some(s.id.clone()), kind: "alarm", blacklisted: state.is_blocked(*issi) });
-        }
-    }
-    let inner = state.inner.read().await;
-    for call in inner.calls.values().filter(|c| c.priority >= crate::router::EMERGENCY_PRIORITY) {
-        out.push(Emergency {
-            issi: call.source_issi, destination: Some(call.destination), bts: None, kind: "call",
-            blacklisted: state.is_blocked(call.source_issi),
-        });
-    }
-    // A Basestation alarm whose radio has a live call is one emergency, not two:
-    // the alarm entry takes the called group and the call entry is dropped.
-    let calls: Vec<(u32, Option<u32>)> = out.iter().filter(|e| e.kind == "call").map(|e| (e.issi, e.destination)).collect();
-    for e in out.iter_mut().filter(|e| e.kind == "alarm") {
-        if let Some((_, dest)) = calls.iter().find(|(issi, _)| *issi == e.issi) { e.destination = *dest; }
-    }
-    let alarmed: std::collections::HashSet<u32> = out.iter().filter(|e| e.kind == "alarm").map(|e| e.issi).collect();
-    out.retain(|e| e.kind != "call" || !alarmed.contains(&e.issi));
-    out.sort_by_key(|e| (e.issi, e.kind));
-    out.dedup_by(|a, b| a.issi == b.issi && a.kind == b.kind && a.destination == b.destination && a.bts == b.bts);
-    Json(out)
+/// Active emergencies for the red ribbon: Basestation alarms from telemetry and
+/// live emergency calls seen on the Brew channel (see `emergency`). The
+/// blacklist never holds an emergency call back.
+pub async fn emergencies_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<crate::emergency::Emergency>> {
+    Json(crate::emergency::snapshot(&state).await)
 }
 
 pub async fn telemetry_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<TelemetryBts>> {
@@ -713,7 +680,7 @@ pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
         let fix = crate::telemetry::PositionFix {
             issi: *issi, lat: e.lat, lon: e.lon, at_ms: e.at_ms,
             bts: format!("{} @ {}", e.station, &origin[..origin.len().min(8)]),
-            source_text: format!("relayed by federation from server {origin}"),
+            source_text: format!("relayed by federation from server {origin}"), emergency: false,
         };
         match fixes.iter_mut().find(|f| f.issi == *issi) {
             Some(f) if f.at_ms >= fix.at_ms => {}
@@ -722,6 +689,10 @@ pub async fn positions_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<
         }
     }
     fixes.sort_unstable_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    drop(inner);
+    // Radios with an active emergency are drawn red on the map.
+    let emergencies: std::collections::HashSet<u32> = crate::emergency::snapshot(&state).await.iter().map(|e| e.issi).collect();
+    for f in &mut fixes { f.emergency = emergencies.contains(&f.issi); }
     Json(fixes)
 }
 
@@ -1748,10 +1719,26 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn positions_of_radios_in_an_emergency_are_flagged() {
+        let (state, _rx) = crate::state::AppState::new(crate::config::Config::default(), std::path::PathBuf::from("test.toml"));
+        let state = std::sync::Arc::new(state);
+        {
+            let mut t = state.telemetry.write().await;
+            t.record_sds_position(4013, 1.0, 2.0, 100, "a".into());
+            t.record_sds_position(4014, 3.0, 4.0, 100, "b".into());
+            t.add_test_station("bts2", None, "bts2");
+            t.stations.get_mut("bts2").unwrap().emergencies.insert(4013);
+        }
+        let Json(fixes) = positions_snapshot(State(state)).await;
+        let by = |i: u32| fixes.iter().find(|f| f.issi == i).unwrap();
+        assert!(by(4013).emergency && !by(4014).emergency);
+    }
+
     #[test]
     fn map_page_renders_with_marker_icons() {
         let html = MAP_HTML.as_str();
-        assert!(html.contains("const btsIcon=") && html.contains("icon:msIcon") && !html.contains("{{"));
+        assert!(html.contains("const btsIcon=") && html.contains("msIconEmg") && html.contains("f.emergency") && !html.contains("{{"));
     }
 
     fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {

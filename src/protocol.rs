@@ -75,6 +75,20 @@ pub const FRAME_DTMF: u8 = 3;
 /// was built against, but sent by at least one real client (nexus-bs).
 pub const SERVICE_RSSI: u8 = 0x10;
 
+/// `CLASS_SERVICE` type this server pushes to dispatch consoles: the active
+/// emergencies, `{"emergencies":[{"issi":N,"dest":G|null}]}` (see `emergency`).
+pub const SERVICE_EMERGENCY: u8 = 0x11;
+
+/// Builds a `CLASS_SERVICE` message: class, type, NUL-terminated JSON.
+pub fn build_service(service_type: u8, json: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + json.len());
+    out.push(CLASS_SERVICE);
+    out.push(service_type);
+    out.extend_from_slice(json.as_bytes());
+    out.push(0);
+    out
+}
+
 #[derive(Debug, Clone)]
 pub enum BrewMessage {
     Subscriber(SubscriberMessage),

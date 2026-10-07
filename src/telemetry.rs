@@ -649,7 +649,7 @@ impl TelemetryState {
             for p in s.positions.values() {
                 let fix = PositionFix {
                     issi: p.issi, lat: p.lat, lon: p.lon, at_ms: p.at_ms,
-                    bts: s.id.clone(), source_text: p.source_text.clone(),
+                    bts: s.id.clone(), source_text: p.source_text.clone(), emergency: false,
                 };
                 by_issi.entry(p.issi)
                     .and_modify(|e| if fix.at_ms >= e.at_ms { *e = fix.clone(); })
@@ -668,7 +668,7 @@ impl TelemetryState {
             return;
         }
         self.sds_positions.insert(issi, PositionFix {
-            issi, lat, lon, at_ms, bts: "brew-sds".to_string(), source_text,
+            issi, lat, lon, at_ms, bts: "brew-sds".to_string(), source_text, emergency: false,
         });
         // This ISSI now has a real fix, so clear any "beaconing but not
         // plottable" markers for it across all stations.
@@ -733,6 +733,9 @@ pub struct PositionFix {
     pub at_ms: u64,
     pub bts: String,
     pub source_text: String,
+    /// The radio has an active emergency (alarm or emergency call): the map draws it red.
+    /// Set when served (`dashboard::positions_snapshot`), false here.
+    pub emergency: bool,
 }
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {

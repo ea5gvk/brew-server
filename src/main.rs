@@ -2,6 +2,7 @@ mod aprs;
 mod config;
 mod control;
 mod dashboard;
+mod emergency;
 mod federation;
 mod fedroute;
 mod fsnet;
@@ -74,6 +75,7 @@ async fn services(
     tokio::spawn(federation::run(state.clone()));
     tokio::spawn(aprs::run(state.clone(), aprs_rx));
     tokio::spawn(sms_center::run(state.clone()));
+    tokio::spawn(emergency::run(state.clone()));
 
     tokio::try_join!(
         server::run(state.clone()),
