@@ -176,6 +176,10 @@ pub struct Inner {
     pub recent_calls: HashMap<(Uuid, u32), (ClientId, Instant)>,
     /// Loop-safe federation: this server's id and its negotiated peer links.
     pub fed: crate::fedroute::FedState,
+    /// Connections that identified as a Tetra Dispatch console (its
+    /// `User-Agent`): they are pushed every emergency group call, affiliated
+    /// to its group or not (see `router::handle_group_tx`).
+    pub consoles: HashSet<ClientId>,
 }
 
 impl Inner {
@@ -501,6 +505,7 @@ impl AppState {
         inner.clients.remove(&id);
         let negotiated = inner.fed.links.remove(&id).is_some();
         inner.fed.bts_links.remove(&id);
+        inner.consoles.remove(&id);
         inner.fed.ms_links.remove(&id);
 
         // Registrations: every ISSI routed over this connection, and for a

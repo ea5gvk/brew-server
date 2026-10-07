@@ -214,6 +214,12 @@ async fn handle_group_tx(state: &Arc<AppState>, source: ClientId, id: uuid::Uuid
     if let Some(existing) = inner.calls.get(&id).filter(|c| c.owner == source && c.source_issi == gt.source) {
         targets.extend(existing.peers.iter().copied().filter(|p| is_peer(&inner, *p)));
     }
+    // An emergency call is pushed to every connected dispatch console, whatever
+    // groups it listens to, so the operator can hear and see it. They join the
+    // call's peers, so its voice and its end reach them too.
+    if gt.priority >= EMERGENCY_PRIORITY {
+        targets.extend(inner.consoles.iter().copied());
+    }
     targets.remove(&source);
     inner.group_floor.insert(gt.destination, id);
     inner.calls.insert(id, ActiveCall {
@@ -1037,6 +1043,44 @@ mod forwarding_tests {
         let id3 = uuid::Uuid::new_v4();
         handle_packet(state.clone(), talker, protocol::build_group_tx(&id3, 1001, 92, 0)).await;
         assert_eq!(drain(&mut listener_rx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_group_calls_are_pushed_to_dispatch_consoles_only() {
+        let mut config = crate::config::Config::default();
+        config.storage.enabled = false;
+        config.sms_center.enabled = false;
+        config.fallback_broadcast_when_no_affiliations = false;
+        let state = Arc::new(AppState::new(config, "test.toml".into()).0);
+        let (bs, _bs_rx) = connect(&state, ConnVersion::V0).await;
+        let (listener, mut listener_rx) = connect(&state, ConnVersion::V0).await;
+        let (console, mut console_rx) = connect(&state, ConnVersion::V0).await;
+        let (_other, mut other_rx) = connect(&state, ConnVersion::V0).await;
+        // Only `listener` is affiliated to group 91; `console` is a dispatch console listening to nothing.
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_REGISTER, 6001, &[])).await;
+        handle_packet(state.clone(), listener, protocol::build_subscriber_message(SUB_AFFILIATE, 6001, &[91])).await;
+        state.inner.write().await.consoles.insert(console);
+
+        // An ordinary call reaches only the affiliated Basestation.
+        let normal = protocol::build_group_tx(&uuid::Uuid::new_v4(), 4013, 91, 0);
+        handle_packet(state.clone(), bs, normal.clone()).await;
+        assert_eq!(drain(&mut listener_rx), vec![normal]);
+        assert!(drain(&mut console_rx).is_empty());
+
+        // An emergency call also reaches the console, and its voice and end follow.
+        let id = uuid::Uuid::new_v4();
+        let emergency = protocol::build_group_tx(&id, 4013, 91, EMERGENCY_PRIORITY);
+        handle_packet(state.clone(), bs, emergency.clone()).await;
+        assert_eq!(drain(&mut console_rx), vec![emergency.clone()]);
+        // The listener first hears the ordinary call being pre-empted, then the emergency call.
+        assert_eq!(drain(&mut listener_rx).last(), Some(&emergency));
+        assert!(drain(&mut other_rx).is_empty(), "not pushed to ordinary Basestations");
+        let voice = protocol::build_traffic_frame(&id, &[0x11; protocol::ACELP_CODED_FRAME_BYTES], &[0x22; protocol::ACELP_CODED_FRAME_BYTES]);
+        handle_packet(state.clone(), bs, voice.clone()).await;
+        assert_eq!(drain(&mut console_rx), vec![voice]);
+        let idle = protocol::build_call_cause(CALL_GROUP_IDLE, &id, 0);
+        handle_packet(state.clone(), bs, idle.clone()).await;
+        assert_eq!(drain(&mut console_rx), vec![idle]);
     }
 
     #[tokio::test]

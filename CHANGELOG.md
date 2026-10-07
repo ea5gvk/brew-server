@@ -4,6 +4,12 @@ All notable changes to brew-server, newest first.
 
 Unreleased adds:
 
+- **Emergency calls reach dispatch consoles.** An emergency group call
+  (priority 15) is now also pushed to every connected Tetra Dispatch console
+  (recognised by its `TetraDispatch/` User-Agent), whatever groups it
+  listens to, with its voice and end. Ordinary calls still follow
+  affiliations. Needs a Tetra Dispatch that handles it (see its changelog).
+
 - **Red emergency ribbon.** Like FlowStation's: a sticky red "EMERGENCY ACTIVE"
   ribbon at the top of the dashboard lists each active emergency -- a
   Basestation emergency alarm, or a live priority-15 call seen on the Brew
