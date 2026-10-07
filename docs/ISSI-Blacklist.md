@@ -13,6 +13,25 @@ Changes made in the Settings page apply **immediately and without a restart**
 Editing the file by hand, or saving the raw config, restarts the server as any
 other config change does.
 
+## From a Tetra Dispatch console
+
+A Tetra Dispatch console connected to this server can block and unblock ISSIs
+from its own **Blocked ISSIs** card (and from a radio's map popup). The console
+sends the request over its Brew link and brew-server decides: it is obeyed only
+for a console whose Brew username is listed in `console_users`.
+
+```toml
+[blacklist]
+console_users = ["9990001"]   # the username the console logs in with ([auth.users])
+```
+
+- With `console_users` empty (the default) a console sees the list but cannot
+  change it; its card says so.
+- The change applies at once, is written to the config file without a restart,
+  and is pushed to every connected console and shown on the Settings page.
+- Every change is logged on the server (`ISSI blacklist changed`, with the
+  console's username).
+
 ## What a blacklisted ISSI cannot do
 
 | Traffic | Result |
@@ -58,3 +77,13 @@ other config change does.
   Standby too (or use the HA page's Config default / Apply), or a failover brings
   back the Standby's older list. The HA page names `blacklist.issis` as a
   difference.
+
+## Emergencies across servers
+
+An emergency alarm raised on one brew-server is relayed to every other server
+over loop-safe federation (`FED_EMERGENCY`, the same hello negotiation as
+positions, version 3), so each server's dashboard shows the red ribbon, its MS
+Map the red marker and its dispatch consoles the emergency for as long as the
+alarm lasts -- not only while the radio's call is running. The origin refreshes
+an active alarm every 10 seconds and clears it when it clears; a relayed alarm
+not refreshed for 30 seconds is dropped (origin or link gone).

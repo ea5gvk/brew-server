@@ -4,6 +4,19 @@ All notable changes to brew-server, newest first.
 
 Unreleased adds:
 
+- **Emergency alarms relayed across federation.** An emergency alarm now
+  crosses loop-safe federation links (`FED_EMERGENCY`, negotiated with the
+  position hello, version 3) and stays on every server -- ribbon, red map
+  marker and dispatch consoles -- until it is cleared at its origin, instead
+  of vanishing from a federated server when the call ends. Refreshed every
+  10 s, dropped after 30 s without one.
+- **Block ISSIs from Tetra Dispatch.** A console can block and unblock ISSIs
+  over its Brew link (service messages `0x12` / `0x13`). brew-server obeys
+  only a console whose Brew username is in the new `[blacklist] console_users`
+  (empty by default = view only), applies it live, saves the config without a
+  restart, and pushes the list to every console. Needs the matching Tetra
+  Dispatch.
+
 - **Red marker for a radio in an emergency.** On the MS Map a radio with an
   active emergency (alarm or emergency call) turns red, pulses and its popup
   says EMERGENCY; the map note names it too.

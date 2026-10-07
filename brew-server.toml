@@ -287,6 +287,9 @@ reconnect_interval_seconds = 15
 # ISSI-Blacklist wiki page.
 [blacklist]
 issis = []
+# Brew usernames (as in [auth.users]) of Tetra Dispatch consoles allowed to block and
+# unblock ISSIs from their own UI. Empty = consoles can see the list but not edit it.
+console_users = []
 
 # Static FALLBACK Basestation locations for the /map dashboard page. A Basestation that
 # reports its own latitude/longitude over telemetry (and positions relayed by peer

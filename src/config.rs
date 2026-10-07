@@ -166,6 +166,10 @@ impl HaConfig {
 #[serde(default)]
 pub struct BlacklistConfig {
     pub issis: Vec<u32>,
+    /// Brew usernames of Tetra Dispatch consoles allowed to edit the blacklist
+    /// over their Brew link. Empty (the default): consoles can see the list
+    /// but not change it.
+    pub console_users: Vec<String>,
 }
 
 /// One Basestation's fixed location, for the dashboard MS map. Keyed by Brew

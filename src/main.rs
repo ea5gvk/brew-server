@@ -1,4 +1,5 @@
 mod aprs;
+mod blacklist;
 mod config;
 mod control;
 mod dashboard;

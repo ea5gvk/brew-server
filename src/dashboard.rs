@@ -908,7 +908,7 @@ pub async fn settings_page() -> Html<&'static str> { Html(SETTINGS_HTML.as_str()
 /// `config_watcher` picks up the mtime change within ~2s and restarts the
 /// process so the new config takes effect; this function does not restart
 /// anything itself.
-async fn save_config(state: &Arc<AppState>, cfg: &config::Config) -> anyhow::Result<()> {
+pub(crate) async fn save_config(state: &Arc<AppState>, cfg: &config::Config) -> anyhow::Result<()> {
     let text = cfg.to_toml_pretty()?;
     config::Config::parse(&text)?;
     config::Config::save_atomic(&state.config_path, &text)?;
@@ -1017,19 +1017,10 @@ pub async fn blacklist_remove(State(state): State<Arc<AppState>>, Path(issi): Pa
 }
 
 async fn set_blacklisted(state: &Arc<AppState>, issi: u32, blocked: bool) -> Response {
-    if issi == 0 {
-        return (StatusCode::BAD_REQUEST, "ISSI must be 1-16777215").into_response();
-    }
-    state.set_blocked(issi, blocked);
-    tracing::warn!(issi, blocked, "ISSI blacklist changed from the dashboard");
-    let cfg = state.config_snapshot();
-    crate::CONFIG_WRITE_APPLIED_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-    match save_config(state, &cfg).await {
+    match crate::blacklist::apply(state, issi, blocked, "the dashboard").await {
         Ok(()) => Json(serde_json::json!({ "saved": true, "note": "applied immediately; saved to the config file without a restart" })).into_response(),
-        Err(e) => {
-            crate::CONFIG_WRITE_APPLIED_LIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("applied, but saving the config file failed: {e}")).into_response()
-        }
+        Err(crate::blacklist::ApplyError::Invalid) => (StatusCode::BAD_REQUEST, "ISSI must be 1-16777215").into_response(),
+        Err(crate::blacklist::ApplyError::Save(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("applied, but saving the config file failed: {e}")).into_response(),
     }
 }
 

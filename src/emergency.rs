@@ -32,6 +32,16 @@ pub async fn snapshot(state: &Arc<AppState>) -> Vec<Emergency> {
         }
     }
     let inner = state.inner.read().await;
+    // Alarms relayed by other servers (kept fresh by their origin, see `fedroute`).
+    let now = crate::telemetry::now_ms();
+    for ((origin, issi), e) in &inner.fed.em_remote {
+        if !e.active || now.saturating_sub(e.seen_ms) >= crate::fedroute::EM_STALE_MS { continue; }
+        let origin = crate::fedroute::format_server_id(*origin);
+        out.push(Emergency {
+            issi: *issi, destination: e.dest, bts: Some(format!("{} @ {}", e.bts, &origin[..8])),
+            kind: "alarm", blacklisted: state.is_blocked(*issi),
+        });
+    }
     for call in inner.calls.values().filter(|c| c.priority >= crate::router::EMERGENCY_PRIORITY) {
         out.push(Emergency {
             issi: call.source_issi, destination: Some(call.destination), bts: None, kind: "call",
@@ -86,12 +96,62 @@ pub async fn push_if_due(state: &Arc<AppState>, st: &mut PushState) -> bool {
     true
 }
 
+/// Which of this server's own alarms were last advertised to federation peers, and when.
+#[derive(Default)]
+pub struct AdvertState {
+    sent: std::collections::HashMap<u32, (Instant, Option<u32>)>,
+}
+
+/// Advertises this server's own emergency alarms (telemetry) to federation
+/// peers: new or changed ones at once, active ones again every
+/// `EM_REFRESH_MS` so a peer keeps them, and a cleared one as cleared. The
+/// peers show the same red ribbon and marker as this server does.
+pub async fn advertise_if_due(state: &Arc<AppState>, st: &mut AdvertState) {
+    // Own alarms: ISSI -> reporting Basestation, and the group of its live call, if any.
+    let alarms: Vec<(u32, String)> = {
+        let t = state.telemetry.read().await;
+        let mut v: Vec<(u32, String)> = t.stations.values()
+            .flat_map(|s| s.emergencies.iter().map(|i| (*i, s.id.clone()))).collect();
+        v.sort();
+        v.dedup_by_key(|(i, _)| *i);
+        v
+    };
+    let dests: std::collections::HashMap<u32, u32> = {
+        let inner = state.inner.read().await;
+        inner.calls.values().filter(|c| c.kind == crate::state::CallKind::Group)
+            .map(|c| (c.source_issi, c.destination)).collect()
+    };
+    let refresh = Duration::from_millis(crate::fedroute::EM_REFRESH_MS);
+    for (issi, bts) in &alarms {
+        let dest = dests.get(issi).copied();
+        let due = st.sent.get(issi).is_none_or(|(at, d)| *d != dest || at.elapsed() >= refresh);
+        if due {
+            crate::fedroute::advertise_emergency(state, *issi, dest, bts, true).await;
+            st.sent.insert(*issi, (Instant::now(), dest));
+        }
+    }
+    let cleared: Vec<u32> = st.sent.keys().copied().filter(|i| !alarms.iter().any(|(a, _)| a == i)).collect();
+    for issi in cleared {
+        crate::fedroute::advertise_emergency(state, issi, None, "", false).await;
+        st.sent.remove(&issi);
+    }
+}
+
 pub async fn run(state: Arc<AppState>) {
     let mut st = PushState::default();
+    let mut adv = AdvertState::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = 0u32;
     loop {
         ticker.tick().await;
+        advertise_if_due(&state, &mut adv).await;
         push_if_due(&state, &mut st).await;
+        // The blacklist (and whether a console may edit it) is re-sent every few seconds, so a
+        // console that connects late has it and one that missed a change catches up.
+        tick = tick.wrapping_add(1);
+        if tick % 5 == 0 {
+            crate::blacklist::push_to_consoles(&state).await;
+        }
     }
 }
 
