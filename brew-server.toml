@@ -278,7 +278,9 @@ object_name_prefix = "MS"
 min_report_interval_seconds = 60
 reconnect_interval_seconds = 15
 
-# Basestation locations shown as their own markers on the /map dashboard page.
+# Static FALLBACK Basestation locations for the /map dashboard page. A Basestation that
+# reports its own latitude/longitude over telemetry (and positions relayed by peer
+# servers) take precedence; this only covers Basestations that report none.
 # Keyed by the same numeric Brew username the Basestation authenticates with
 # above under [auth.users] -- whichever live connection logs in as that
 # identity is matched automatically. See https://github.com/ysamouhos/brew-server/wiki/Basestation-Locations.

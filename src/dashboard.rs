@@ -328,16 +328,21 @@ const esc=s=>String(s??'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&g
 const map=L.map('map').setView([44.43,26.10],5);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'&copy; OpenStreetMap'}}).addTo(map);
 let markers={{}};let btsMarkers={{}};let fitted=false;
-const btsIcon=L.icon({{iconUrl:'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',iconRetinaUrl:'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',shadowUrl:'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',iconSize:[25,41],iconAnchor:[12,41],className:'bts-marker'}});
+// Inline SVG icons (no image fetches): a radio mast with signal arcs for a Basestation, a handheld radio for a mobile terminal.
+const pin=(bg,svg)=>`<div style="width:34px;height:34px;border-radius:50%;background:${{bg}};border:2px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center">${{svg}}</div>`;
+const btsSvg='<svg width=22 height=22 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M12 11v10M8 21h8M9.5 21l2.5-10 2.5 10"/><circle cx=12 cy=9 r=1.6 fill=#fff /><path d="M7.8 5.8a6 6 0 0 0 0 6.4M16.2 5.8a6 6 0 0 1 0 6.4M5 3.5a10 10 0 0 0 0 11M19 3.5a10 10 0 0 1 0 11"/></svg>';
+const msSvg='<svg width=20 height=20 viewBox="0 0 24 24" fill=none stroke=#fff stroke-width=2 stroke-linecap=round stroke-linejoin=round><path d="M9 2v4M7 6h10a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z"/><rect x=8.5 y=8.5 width=7 height=4 rx=0.5 /><circle cx=9.5 cy=16 r=0.8 fill=#fff /><circle cx=12 cy=16 r=0.8 fill=#fff /><circle cx=14.5 cy=16 r=0.8 fill=#fff /><circle cx=9.5 cy=19 r=0.8 fill=#fff /><circle cx=12 cy=19 r=0.8 fill=#fff /><circle cx=14.5 cy=19 r=0.8 fill=#fff /></svg>';
+const mkIcon=(bg,svg)=>L.divIcon({{html:pin(bg,svg),className:'',iconSize:[34,34],iconAnchor:[17,17],popupAnchor:[0,-18]}});
+const btsIcon=mkIcon('#1f6feb',btsSvg),btsIconOff=mkIcon('#7a8696',btsSvg),msIcon=mkIcon('#d9822b',msSvg);
 async function loadBts(){{
   try{{
     const bts=await(await fetch('/api/bts-locations')).json();
     const seen=new Set();
     bts.forEach(b=>{{
-      seen.add(b.username);
-      const html=`<b>${{esc(b.name||b.username)}}</b> (Basestation)<br>${{b.lat.toFixed(5)}}, ${{b.lon.toFixed(5)}}<br>IP: ${{esc(b.ip||'not connected')}}<br>${{b.connected?'<span style="color:#2a7">connected</span>':'<span style="color:#a55">offline</span>'}}`;
-      if(btsMarkers[b.username]){{btsMarkers[b.username].setLatLng([b.lat,b.lon]).setPopupContent(html);}}
-      else{{btsMarkers[b.username]=L.marker([b.lat,b.lon],{{icon:btsIcon}}).addTo(map).bindPopup(html);}}
+      seen.add(b.id);
+      const html=`<b>${{esc(b.name||b.username)}}</b> (Basestation)<br>${{b.lat.toFixed(5)}}, ${{b.lon.toFixed(5)}}<br>IP: ${{esc(b.ip||(b.origin?'via server '+b.origin.slice(0,8):'not connected'))}}<br>Source: ${{esc(b.source)}}<br>${{b.connected?'<span style="color:#2a7">connected</span>':'<span style="color:#a55">offline</span>'}}`;
+      if(btsMarkers[b.id]){{btsMarkers[b.id].setLatLng([b.lat,b.lon]).setIcon(b.connected?btsIcon:btsIconOff).setPopupContent(html);}}
+      else{{btsMarkers[b.id]=L.marker([b.lat,b.lon],{{icon:b.connected?btsIcon:btsIconOff}}).addTo(map).bindPopup(html);}}
     }});
     Object.keys(btsMarkers).forEach(k=>{{if(!seen.has(k)){{map.removeLayer(btsMarkers[k]);delete btsMarkers[k];}}}});
   }}catch(e){{}}
@@ -352,7 +357,7 @@ async function load(){{
       const when=new Date(f.at_ms).toLocaleString();
       const html=`<b>ISSI ${{f.issi}}</b><br>${{f.lat.toFixed(5)}}, ${{f.lon.toFixed(5)}}<br>Station: ${{f.bts}}<br>${{when}}<br><span style="color:#555">${{(f.source_text||'').replace(/[<>&]/g,'')}}</span>`;
       if(markers[f.issi]){{markers[f.issi].setLatLng([f.lat,f.lon]).setPopupContent(html);}}
-      else{{markers[f.issi]=L.marker([f.lat,f.lon]).addTo(map).bindPopup(html);}}
+      else{{markers[f.issi]=L.marker([f.lat,f.lon],{{icon:msIcon}}).addTo(map).bindPopup(html);}}
     }});
     Object.keys(markers).forEach(k=>{{if(!seen.has(Number(k))){{map.removeLayer(markers[k]);delete markers[k];}}}});
     $('note').textContent=fixes.length?`${{fixes.length}} station(s) positioned.`:'No decodable position beacons received yet.';
@@ -514,7 +519,7 @@ static SETTINGS_HTML: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
 <p class=map-note style="color:#8fa2b8;font-size:12px">Endpoint shorthand: <code>ext:USER</code>, <code>trunk:NAME</code> or <code>trunk:NAME/NUMBER</code>, <code>issi:N</code> (Brew private), <code>group:N</code> (Brew group). Matching runs against the full dialled string (e.g. a PSTN call from a mobile terminal dialling "9" + 10 digits arrives as dialled string "9XXXXXXXXXX"); <code>strip_prefix</code> removes a leading literal (e.g. "9") only from what's handed to an empty-number <code>trunk:NAME</code> destination, so the trunk dials the bare 10 digits. Updating a route matches by name and keeps its position; a new name appends to the end (reorder via the raw editor below).</p>
 </section>
 
-<section class=panel><h2>Basestation Locations</h2><table><thead><tr><th>Username (auth)</th><th>Name</th><th>Latitude</th><th>Longitude</th><th></th></tr></thead><tbody id=bts-locs></tbody></table>
+<section class=panel><h2>Basestation Locations (static fallback)</h2><p class=muted>Positions reported by Basestations over telemetry, or relayed by other servers, take precedence. This table lists the configured entries.</p><table><thead><tr><th>Username (auth)</th><th>Name</th><th>Latitude</th><th>Longitude</th><th></th></tr></thead><tbody id=bts-locs></tbody></table>
 <div class=ctl-row><input id=bl-user placeholder="Brew username, e.g. 1000001"><input id=bl-name placeholder="Basestation name"><input id=bl-lat placeholder="latitude" type=number step=any><input id=bl-lon placeholder="longitude" type=number step=any><button onclick="saveBtsLoc()">Add / Update</button></div>
 <p class=map-note style="color:#8fa2b8;font-size:12px">Keyed by the same numeric username the Basestation authenticates with under <code>[auth.users]</code>, so it's matched automatically to whichever live connection logs in as that identity. Shown on the <a class=backlink href="/map">MS Map</a> alongside mobile-station positions.</p>
 </section>
@@ -589,7 +594,7 @@ async function saveRoute(){{
 }}
 async function delRoute(name){{ await api('DELETE',`/api/config/sip/routes/${{encodeURIComponent(name)}}`); loadSip(); }}
 async function loadBtsLocs(){{
-  const d=await(await fetch('/api/bts-locations')).json();
+  const d=(await(await fetch('/api/bts-locations?config_only=1')).json());
   $('bts-locs').innerHTML=d.map(b=>`<tr><td>${{esc(b.username)}}</td><td>${{esc(b.name)}}</td><td>${{b.lat}}</td><td>${{b.lon}}</td><td><button onclick="delBtsLoc('${{esc(b.username)}}')">Delete</button></td></tr>`).join('')||'<tr><td colspan=5 class=muted>No Basestation locations configured</td></tr>';
 }}
 async function saveBtsLoc(){{
@@ -651,36 +656,68 @@ pub async fn sms_center_delete(State(state): State<Arc<AppState>>, Path(id): Pat
 
 #[derive(serde::Serialize)]
 pub struct BtsLocation {
+    /// Unique marker id (the identity, prefixed by the origin server for a remote one).
+    pub id: String,
     pub username: String,
     pub name: String,
     pub lat: f64,
     pub lon: f64,
     pub ip: Option<String>,
     pub connected: bool,
+    /// Where the position came from: "telemetry" (reported by the Basestation),
+    /// "federation" (relayed by another brew-server) or "config" (static fallback).
+    pub source: &'static str,
+    /// Origin server id (hex) for a "federation" entry.
+    pub origin: Option<String>,
 }
 
-/// Merges `[bts_locations]` (name + fixed lat/lon, keyed by Brew username)
-/// with the live `inner.clients` table (matched by `Client.username`, set
-/// when the connection authenticated) so each entry also carries whether
-/// that Basestation is connected right now and from which address.
-pub async fn bts_locations_snapshot(State(state): State<Arc<AppState>>) -> Json<Vec<BtsLocation>> {
+/// Basestation positions for the map, best source first: what a Basestation
+/// reports over telemetry, what other brew-servers relay, and the static
+/// `[bts_locations]` as a fallback for any identity not covered by those.
+/// (0, 0) is an unconfigured/default entry (Null Island), not a real fix --
+/// same convention the LIP decoder uses for MS positions (see position.rs) --
+/// and is never plotted.
+pub async fn bts_locations_snapshot(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> Json<Vec<BtsLocation>> {
+    // `?config_only=1`: just the static entries (the Settings table), all of them.
+    let config_only = q.contains_key("config_only");
+    let mut out: Vec<BtsLocation> = Vec::new();
+    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for st in state.telemetry.read().await.stations.values().filter(|_| !config_only) {
+        let Some((lat, lon)) = st.site_location.filter(|(la, lo)| crate::fedroute::valid_position(*la, *lo)) else { continue };
+        covered.insert(st.id.clone());
+        out.push(BtsLocation {
+            id: st.id.clone(), username: st.id.clone(),
+            name: st.site_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| st.id.clone()),
+            lat, lon, ip: st.ip.clone(), connected: true, source: "telemetry", origin: None,
+        });
+    }
+
     let inner = state.inner.read().await;
-    let out = state.config.bts_locations.iter()
-        // (0, 0) is an unconfigured/default entry (Null Island), not a real
-        // fix -- same convention the LIP decoder already uses for MS
-        // positions (see position.rs). Don't plot it.
-        .filter(|(_, loc)| loc.lat != 0.0 || loc.lon != 0.0)
-        .map(|(username, loc)| {
-            let live = inner.clients.values().find(|c| c.username.as_deref() == Some(username.as_str()));
-            BtsLocation {
-                username: username.clone(),
-                name: loc.name.clone(),
-                lat: loc.lat,
-                lon: loc.lon,
-                ip: live.and_then(|c| c.remote_addr).map(|a| a.ip().to_string()),
-                connected: live.is_some(),
-            }
-        }).collect();
+    let now = crate::telemetry::now_ms();
+    for ((origin, key), b) in inner.fed.bts_remote.iter().filter(|_| !config_only) {
+        if !b.online || now.saturating_sub(b.seen_ms) >= crate::fedroute::BTS_STALE_MS { continue; }
+        let origin = crate::fedroute::format_server_id(*origin);
+        out.push(BtsLocation {
+            id: format!("{origin}/{key}"), username: key.clone(),
+            name: if b.name.is_empty() { key.clone() } else { b.name.clone() },
+            lat: b.lat, lon: b.lon, ip: None, connected: true, source: "federation", origin: Some(origin),
+        });
+    }
+
+    for (username, loc) in &state.config.bts_locations {
+        if covered.contains(username) || !crate::fedroute::valid_position(loc.lat, loc.lon) { continue; }
+        let live = inner.clients.values().find(|c| c.username.as_deref() == Some(username.as_str()));
+        out.push(BtsLocation {
+            id: username.clone(), username: username.clone(), name: loc.name.clone(),
+            lat: loc.lat, lon: loc.lon,
+            ip: live.and_then(|c| c.remote_addr).map(|a| a.ip().to_string()),
+            connected: live.is_some(), source: "config", origin: None,
+        });
+    }
     Json(out)
 }
 
@@ -1077,7 +1114,7 @@ function cellsTable(s){
     const rfm=[rf.q?`EVM ${rf.q.evm_pct.toFixed(2)}%`:'',rf.q?`PAPR ${rf.q.papr_db.toFixed(1)}dB`:'',
       rf.h&&rf.h.temperature_c!=null?`SDR ${rf.h.temperature_c.toFixed(1)}&deg;C`:''].filter(Boolean).join(' &middot; ');
     return `<div class=cell-row>
-      <div class=cell-head><b>Cell ${c.id}</b>${c.primary?' <span class=muted>primary</span>':''} &middot; <span title="${esc(c.rf_detail||'')}">${rfPill(c.rf_state)}</span> &middot; CC ${c.colour_code} / LA ${c.location_area} &middot; ${c.neighbours} nbr &middot; ${c.registered_radios} radio(s)${dev?' &middot; '+dev:''}</div>
+      <div class=cell-head><b>Cell ${c.id}</b>${c.primary?' <span class=muted>primary</span>':''} &middot; <span title="${esc(c.rf_detail||'')}">${rfPill(c.rf_state)}</span> &middot; ${c.mcc!=null&&c.mnc!=null?'MCC '+c.mcc+' / MNC '+c.mnc+' / ':''}CC ${c.colour_code} / LA ${c.location_area} &middot; ${c.neighbours} nbr &middot; ${c.registered_radios} radio(s)${dev?' &middot; '+dev:''}</div>
       ${rfm?`<div class="bts-meta muted" title="This cell's transmit EVM / PAPR and SDR temperature">${rfm}</div>`:''}
       <div class=cell-carriers>${carriers}</div>
     </div>`;
@@ -1522,9 +1559,36 @@ mod tests {
             name: "Unconfigured".into(), lat: 0.0, lon: 0.0,
         });
         let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
-        let Json(out) = bts_locations_snapshot(State(std::sync::Arc::new(state))).await;
+        let Json(out) = bts_locations_snapshot(State(std::sync::Arc::new(state)), axum::extract::Query(HashMap::new())).await;
         assert_eq!(out.len(), 1, "the (0,0) entry must not be plotted");
         assert_eq!(out[0].username, "1000001");
+    }
+
+    #[tokio::test]
+    async fn bts_locations_prefer_telemetry_over_static_config() {
+        let mut config = crate::config::Config::default();
+        config.bts_locations.insert("1000001".into(), crate::config::BtsLocationConfig { name: "Static".into(), lat: 1.0, lon: 2.0 });
+        config.bts_locations.insert("1000002".into(), crate::config::BtsLocationConfig { name: "Fallback".into(), lat: 3.0, lon: 4.0 });
+        let (state, _rx) = crate::state::AppState::new(config, std::path::PathBuf::from("test.toml"));
+        let state = std::sync::Arc::new(state);
+        {
+            let mut t = state.telemetry.write().await;
+            t.add_test_station("1000001", Some((37.9917, 23.764)), "Reported");
+            t.add_test_station("1000003", None, "No location"); // reports none: not plotted
+        }
+        let Json(out) = bts_locations_snapshot(State(state.clone()), axum::extract::Query(HashMap::new())).await;
+        let by = |id: &str| out.iter().find(|b| b.id == id).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((by("1000001").source, by("1000001").lat), ("telemetry", 37.9917));
+        assert_eq!(by("1000002").source, "config");
+        let Json(cfg) = bts_locations_snapshot(State(state), axum::extract::Query(HashMap::from([("config_only".into(), "1".into())]))).await;
+        assert_eq!(cfg.len(), 2, "settings table lists every static entry");
+    }
+
+    #[test]
+    fn map_page_renders_with_marker_icons() {
+        let html = MAP_HTML.as_str();
+        assert!(html.contains("const btsIcon=") && html.contains("icon:msIcon") && !html.contains("{{"));
     }
 
     fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {

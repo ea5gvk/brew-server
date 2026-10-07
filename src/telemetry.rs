@@ -170,6 +170,9 @@ pub enum TelemetryEvent {
     /// Multi-cell: RF data from an additional cell's SDR (the primary's comes
     /// untagged, as `TxQuality` / `SdrHealth`).
     CellRf { cell: u8, event: CellRfEvent },
+    /// The Basestation's configured position (`[telemetry]` latitude/longitude),
+    /// sent periodically and only when it has one -- never (0, 0).
+    SiteLocation { name: Option<String>, lat: f64, lon: f64 },
 }
 
 /// The RF events an additional cell reports inside `CellRf`.
@@ -196,6 +199,11 @@ pub struct CellInfo {
     pub main_carrier: u16,
     pub secondary_carrier: Option<u16>,
     pub carriers: Vec<CellCarrierInfo>,
+    /// Mobile country / network code; absent from builds that predate the fields.
+    #[serde(default)]
+    pub mcc: Option<u16>,
+    #[serde(default)]
+    pub mnc: Option<u16>,
     pub colour_code: u8,
     pub location_area: u16,
     pub neighbours: u16,
@@ -319,6 +327,12 @@ pub struct TelemetryBts {
     pub ms_cell_out: Vec<(u32, u8)>,
     /// Latest `CellsSnapshot`: the station's cells, primary first (empty until one arrives).
     pub cells: Vec<CellInfo>,
+    /// Position the Basestation reported (`SiteLocation`), if it has one.
+    pub site_name: Option<String>,
+    pub site_location: Option<(f64, f64)>,
+    /// When that position was last advertised to federation peers (ms).
+    #[serde(skip)]
+    pub site_advertised_ms: u64,
     /// Whether the cells share the backhaul through the site switch.
     pub site_linked: Option<bool>,
     pub active_calls: HashMap<u16, TelemetryCall>,
@@ -403,6 +417,9 @@ impl TelemetryBts {
             ms_cell: HashMap::new(),
             ms_cell_out: Vec::new(),
             cells: Vec::new(),
+            site_name: None,
+            site_location: None,
+            site_advertised_ms: 0,
             site_linked: None,
             active_calls: HashMap::new(),
             emergencies: HashSet::new(),
@@ -559,6 +576,14 @@ pub struct TelemetryState {
 }
 
 impl TelemetryState {
+    #[cfg(test)]
+    pub fn add_test_station(&mut self, id: &str, location: Option<(f64, f64)>, name: &str) {
+        let mut bts = TelemetryBts::new(id.to_string(), None);
+        bts.site_location = location;
+        bts.site_name = Some(name.to_string());
+        self.stations.insert(id.to_string(), bts);
+    }
+
     /// Creates a `TelemetryState` backed by an append-only store, replaying
     /// persisted SDS telemetry history from disk.
     pub fn with_store(store: Arc<crate::store::Store>) -> Self {
@@ -736,7 +761,10 @@ async fn session(state: Arc<AppState>, socket: WebSocket, identity: Option<Strin
         }
     }
 
-    state.telemetry.write().await.stations.remove(&id);
+    let removed = state.telemetry.write().await.stations.remove(&id);
+    if removed.is_some_and(|b| b.site_location.is_some()) {
+        crate::fedroute::advertise_bts(&state, &id, "", 0.0, 0.0, false).await;
+    }
     state.monitor.emit("telemetry_disconnected", serde_json::json!({"id": id}));
     info!(bts = %id, "Basestation telemetry disconnected");
 }
@@ -770,7 +798,22 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         | TelemetryEvent::CellsSnapshot { .. } | TelemetryEvent::CellRf { .. });
 
     let mut sds_entry: Option<SdsLogEntry> = None;
+    // Set when a (changed or due) station position must go out to federation peers.
+    let mut advertise: Option<(String, f64, f64)> = None;
     match event {
+        TelemetryEvent::SiteLocation { name, lat, lon } => {
+            if crate::fedroute::valid_position(lat, lon) {
+                let name = name.unwrap_or_default();
+                let now = now_ms();
+                let changed = bts.site_location != Some((lat, lon)) || bts.site_name.as_deref() != Some(name.as_str());
+                if changed || now.saturating_sub(bts.site_advertised_ms) >= crate::fedroute::BTS_REFRESH_MS {
+                    bts.site_advertised_ms = now;
+                    advertise = Some((name.clone(), lat, lon));
+                }
+                bts.site_name = Some(name);
+                bts.site_location = Some((lat, lon));
+            }
+        }
         TelemetryEvent::MsRegistration { issi } => {
             bts.registrations.insert(issi); bts.sync_registrations();
             bts.push_reg(issi, "register");
@@ -847,6 +890,9 @@ async fn handle_event(state: &Arc<AppState>, id: &str, data: &[u8]) {
         t.record_sds_telemetry(id, &entry);
     }
     drop(t);
+    if let Some((name, lat, lon)) = advertise {
+        crate::fedroute::advertise_bts(state, id, &name, lat, lon, true).await;
+    }
     if notify {
         state.monitor.emit("telemetry", serde_json::json!({"id": id}));
     }
@@ -927,6 +973,14 @@ mod tests {
     }
 
     #[test]
+    fn site_location_event_parses() {
+        let e: TelemetryEvent = serde_json::from_str(r#"{"SiteLocation":{"name":"Hill","lat":37.9,"lon":23.7}}"#).unwrap();
+        assert!(matches!(e, TelemetryEvent::SiteLocation { lat, .. } if (lat - 37.9).abs() < 1e-9));
+        let e: TelemetryEvent = serde_json::from_str(r#"{"SiteLocation":{"name":null,"lat":1.0,"lon":2.0}}"#).unwrap();
+        assert!(matches!(e, TelemetryEvent::SiteLocation { name: None, .. }));
+    }
+
+    #[test]
     fn sync_registrations_after_removal() {
         let mut bts = TelemetryBts::new("bts-1".to_string(), None);
         for issi in [10u32, 20, 30] { bts.registrations.insert(issi); }
@@ -964,7 +1018,7 @@ mod tests {
     }
 
     fn cell(id: u8, issis: Option<Vec<u32>>) -> CellInfo {
-        CellInfo {
+        CellInfo { mcc: Some(202), mnc: Some(1),
             id, primary: id == 0, main_carrier: 1, secondary_carrier: None, carriers: Vec::new(),
             colour_code: 1, location_area: 1, neighbours: 0, device: None,
             registered_radios: issis.as_ref().map_or(0, |v| v.len() as u32),

@@ -507,6 +507,9 @@ pub async fn attach_client(state: &Arc<AppState>, id: ClientId, client: Client, 
     inner.clients.insert(id, client);
     if let Some(neighbour) = neighbour {
         inner.fed.links.insert(id, neighbour);
+        // Tell the far end we understand Basestation position adverts; it
+        // answers with its own hello, and each side then syncs what it has.
+        let _ = tx.send(fedroute::build_bts_hello());
     }
     if peer {
         for msg in fedroute::sync_messages(&inner, id) {
