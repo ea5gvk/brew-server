@@ -280,6 +280,17 @@ object_name_prefix = "MS"
 min_report_interval_seconds = 60
 reconnect_interval_seconds = 15
 
+# ISSIs barred from communicating through this server. A listed ISSI still registers
+# (so dispatch can reach it) but cannot transmit to groups, make or receive private
+# calls, or send or receive SDS. Dispatch ambience listening (SS-AL) to it and LIP
+# position traffic still work. Editable live under Settings (no restart). See the
+# ISSI-Blacklist wiki page.
+[blacklist]
+issis = []
+# Brew usernames (as in [auth.users]) of Tetra Dispatch consoles allowed to block and
+# unblock ISSIs from their own UI. Empty = consoles can see the list but not edit it.
+console_users = []
+
 # Static FALLBACK Basestation locations for the /map dashboard page. A Basestation that
 # reports its own latitude/longitude over telemetry (and positions relayed by peer
 # servers) take precedence; this only covers Basestations that report none.

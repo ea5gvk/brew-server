@@ -145,6 +145,11 @@ fn negotiate_federation(mode: ClientMode, headers: &HeaderMap, loop_safe: bool, 
     }
 }
 
+/// Whether a `User-Agent` is a Tetra Dispatch console (`TetraDispatch/<version>`).
+fn is_dispatch_console(user_agent: &str) -> bool {
+    user_agent.trim_start().to_ascii_lowercase().starts_with("tetradispatch/")
+}
+
 async fn brew_discovery(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -270,13 +275,14 @@ async fn upgrade_from_parts(state: Arc<AppState>, parts: &mut axum::http::reques
             return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "text/plain")], "Federation link to this server itself\n").into_response();
         }
     };
+    let console = parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).is_some_and(is_dispatch_console);
     match WebSocketUpgrade::from_request_parts(parts, &state).await {
         Ok(ws) => {
             let requested = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).and_then(|v| v.to_str().ok()).unwrap_or_default();
             debug!(requested_subprotocol=requested, mode=mode.as_str(), seed_version=?seed_version.map(ConnVersion::as_u8), loop_safe=fed_neighbour.is_some(), "WebSocket upgrade request");
             let protocol = state.config.websocket_subprotocol.clone();
             let mut response = ws.protocols([protocol])
-                .on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username, fed_neighbour))
+                .on_upgrade(move |socket| client_session(state, socket, mode, seed_version, remote_addr, username, fed_neighbour, console))
                 .into_response();
             if fed_neighbour.is_some() {
                 // Accepting: the dialling side only switches to loop-safe mode
@@ -366,7 +372,7 @@ async fn verify_digest(state: &Arc<AppState>, headers: &HeaderMap, method: &str,
     Some(username.clone())
 }
 
-async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>) {
+async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMode, seed_version: Option<ConnVersion>, remote_addr: SocketAddr, username: Option<String>, fed_neighbour: Option<u64>, console: bool) {
     let id = Uuid::new_v4();
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -379,7 +385,10 @@ async fn client_session(state: Arc<AppState>, socket: WebSocket, mode: ClientMod
     let version = seed_version.unwrap_or_default();
     let client = Client { tx, mode, version, version_announced: seed_version.is_some(), remote_addr: Some(remote_addr), connected_at_ms, username: username.clone() };
     crate::federation::attach_client(&state, id, client, fed_neighbour).await;
-    info!(%id, mode=mode.as_str(), version=version.as_u8(), version_announced=seed_version.is_some(), %remote_addr, username=username.as_deref().unwrap_or(""),
+    if console {
+        state.inner.write().await.consoles.insert(id);
+    }
+    info!(%id, console, mode=mode.as_str(), version=version.as_u8(), version_announced=seed_version.is_some(), %remote_addr, username=username.as_deref().unwrap_or(""),
         loop_safe_neighbour=fed_neighbour.map(fedroute::format_server_id).unwrap_or_default(), "Basestation connected");
 
     // A federation link is pinged and closed once silent (see
@@ -549,6 +558,12 @@ mod tests {
         let ours = crate::fedroute::format_server_id(own_id);
         let err = upgrade(&[("X-Brew-Federation", "1".into()), ("X-Brew-Server-Id", ours)]).await.unwrap_err();
         assert!(err.to_string().contains("409"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_console_is_recognised_by_its_user_agent() {
+        assert!(super::is_dispatch_console("TetraDispatch/1.0.0"));
+        assert!(!super::is_dispatch_console("brew-server/1.16.0") && !super::is_dispatch_console("FlowStation/0.5"));
     }
 
     #[test]

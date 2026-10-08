@@ -322,6 +322,13 @@ impl BrewBridge {
         payloads: &[u8],
         call_id: &str,
     ) {
+        if self.app.is_blocked(issi) {
+            warn!(issi, %call_id, "SIP->Brew private: ISSI is blacklisted");
+            let resp = self.transport.base_response_pub(req, 403, "Forbidden");
+            self.transport.send_to(&resp, caller).await;
+            self.transport.state.end_call(call_id).await;
+            return;
+        }
         // Is the target ISSI reachable (registered on some Basestation)?
         let target_client = {
             let inner = self.app.inner.read().await;

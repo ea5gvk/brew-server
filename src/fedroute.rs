@@ -41,7 +41,7 @@
 //! answers `FED_PRUNE`, and the sender stops feeding that link the call's
 //! voice: one stream per server, not one per redundant link.
 
-use crate::protocol::{self, CLASS_FEDERATION, FED_BTS, FED_BTS_HELLO, FED_MS_POS, FED_PRUNE, FED_ROUTE, FED_WITHDRAW};
+use crate::protocol::{self, CLASS_FEDERATION, FED_BTS, FED_BTS_HELLO, FED_EMERGENCY, FED_MS_POS, FED_PRUNE, FED_ROUTE, FED_WITHDRAW};
 use crate::state::{AppState, CallKind, ClientId, ClientMode, Inner, Subscriber};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -106,6 +106,12 @@ pub struct FedState {
     /// Latest position per mobile station ISSI seen by this server's own
     /// decoding (empty `path`) or relayed by another (`path` set).
     pub ms_pos: HashMap<u32, MsEntry>,
+    /// Links that also announced emergency alarm support (hello version >= 3).
+    pub em_links: HashSet<ClientId>,
+    /// This server's own active emergency alarms (from telemetry), by ISSI, as last advertised.
+    pub em_local: HashMap<u32, LocalEm>,
+    /// Alarms relayed by other servers, by (origin server id, ISSI).
+    pub em_remote: HashMap<(u64, u32), RemoteEm>,
     /// Positions of this server's own Basestations (from telemetry), by
     /// telemetry identity, as last advertised.
     pub bts_local: HashMap<String, LocalBts>,
@@ -122,7 +128,31 @@ pub const BTS_REFRESH_MS: u64 = 30_000;
 pub const BTS_STALE_MS: u64 = 120_000;
 
 /// Hello version that adds mobile station positions to Basestation ones.
-pub const HELLO_VERSION: u8 = 2;
+pub const HELLO_VERSION: u8 = 3;
+
+/// The origin re-advertises an active alarm this often ...
+pub const EM_REFRESH_MS: u64 = 10_000;
+/// ... and a relayed one not refreshed for this long is dropped (the origin or
+/// the path to it is gone).
+pub const EM_STALE_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalEm {
+    pub dest: Option<u32>,
+    pub bts: String,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteEm {
+    pub dest: Option<u32>,
+    pub bts: String,
+    /// False once the origin advertised the alarm cleared.
+    pub active: bool,
+    pub seq: u64,
+    pub path: Vec<u64>,
+    pub seen_ms: u64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MsEntry {
@@ -167,7 +197,7 @@ impl Default for FedState {
         };
         Self {
             self_id, clock: 0, links: HashMap::new(), rib_in: HashMap::new(),
-            bts_links: HashSet::new(), ms_links: HashSet::new(), ms_pos: HashMap::new(), bts_local: HashMap::new(), bts_remote: HashMap::new(),
+            bts_links: HashSet::new(), ms_links: HashSet::new(), ms_pos: HashMap::new(), em_links: HashSet::new(), em_local: HashMap::new(), em_remote: HashMap::new(), bts_local: HashMap::new(), bts_remote: HashMap::new(),
         }
     }
 }
@@ -228,6 +258,7 @@ pub enum FedMessage {
     BtsHello { version: u8 },
     Bts(BtsAdvert),
     MsPos(MsAdvert),
+    Emergency(EmAdvert),
     /// A type this version does not know (from a newer peer): ignored.
     Unknown(u8),
 }
@@ -274,6 +305,63 @@ pub struct MsAdvert {
     pub at_ms: u64,
     pub station: String,
     pub path: Vec<u64>,
+}
+
+/// One emergency alarm advert. Wire, little-endian:
+/// `0xfe 0x06 seq:u64 active:u8 issi:u32 dest:u32 n:u8 path:u64[n] blen:u8 bts`
+/// -- `dest` 0 means none; `path[0]` is the sender and `path[n-1]` the origin,
+/// `1 <= n <= MAX_PATH`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmAdvert {
+    pub issi: u32,
+    pub dest: Option<u32>,
+    pub bts: String,
+    pub active: bool,
+    pub seq: u64,
+    pub path: Vec<u64>,
+}
+
+pub fn build_emergency(a: &EmAdvert) -> Vec<u8> {
+    let bts = clip(&a.bts);
+    let mut out = Vec::with_capacity(28 + 8 * a.path.len() + bts.len());
+    out.extend_from_slice(&[CLASS_FEDERATION, FED_EMERGENCY]);
+    out.extend_from_slice(&a.seq.to_le_bytes());
+    out.push(a.active as u8);
+    out.extend_from_slice(&a.issi.to_le_bytes());
+    out.extend_from_slice(&a.dest.unwrap_or(0).to_le_bytes());
+    out.push(a.path.len() as u8);
+    for id in &a.path { out.extend_from_slice(&id.to_le_bytes()); }
+    out.push(bts.len() as u8);
+    out.extend_from_slice(bts.as_bytes());
+    out
+}
+
+fn parse_emergency(raw: &[u8], nbr_id: u64) -> Result<EmAdvert, &'static str> {
+    // 0xfe 0x06 | seq 2..10 | active 10 | issi 11..15 | dest 15..19 | n 19 | path 20.. | blen | bts
+    if raw.len() < 21 {
+        return Err("FED_EMERGENCY too short");
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().expect("checked length"));
+    let u64_at = |o: usize| u64::from_le_bytes(raw[o..o + 8].try_into().expect("checked length"));
+    let n = raw[19] as usize;
+    if n == 0 || n > MAX_PATH {
+        return Err("FED_EMERGENCY path length out of range");
+    }
+    let at = 20 + 8 * n;
+    let blen = *raw.get(at).ok_or("FED_EMERGENCY of wrong length")? as usize;
+    if blen > MAX_BTS_TEXT || raw.len() != at + 1 + blen {
+        return Err("FED_EMERGENCY of wrong length");
+    }
+    let path: Vec<u64> = (0..n).map(|i| u64_at(20 + 8 * i)).collect();
+    if path[0] != nbr_id {
+        return Err("FED_EMERGENCY path does not start at the server that sent it");
+    }
+    if path.iter().enumerate().any(|(i, id)| path[..i].contains(id)) {
+        return Err("FED_EMERGENCY path crosses a server twice");
+    }
+    let bts = String::from_utf8(raw[at + 1..].to_vec()).map_err(|_| "FED_EMERGENCY text is not UTF-8")?;
+    let dest = u32_at(15);
+    Ok(EmAdvert { issi: u32_at(11), dest: (dest != 0).then_some(dest), bts, active: raw[10] != 0, seq: u64_at(2), path })
 }
 
 pub fn build_ms_pos(a: &MsAdvert) -> Vec<u8> {
@@ -436,6 +524,7 @@ pub fn parse(raw: &[u8], nbr_id: u64) -> Result<FedMessage, &'static str> {
         }
         Some(FED_BTS_HELLO) => Ok(FedMessage::BtsHello { version: raw.get(2).copied().unwrap_or(1) }),
         Some(FED_MS_POS) => parse_ms_pos(raw, nbr_id).map(FedMessage::MsPos),
+        Some(FED_EMERGENCY) => parse_emergency(raw, nbr_id).map(FedMessage::Emergency),
         Some(FED_BTS) => parse_bts(raw, nbr_id).map(FedMessage::Bts),
         Some(other) => Ok(FedMessage::Unknown(other)),
     }
@@ -714,6 +803,65 @@ pub async fn advertise_bts(state: &Arc<AppState>, key: &str, name: &str, lat: f6
     relay_bts(&inner, None, &advert);
 }
 
+/// Sends an emergency advert (path as received, sender first) to every link that
+/// announced support except `except`, this server in front; skip rules as `relay_bts`.
+fn relay_em(inner: &Inner, except: Option<ClientId>, advert: &EmAdvert) {
+    if advert.path.len() >= MAX_PATH { return; }
+    let path: Vec<u64> = std::iter::once(inner.fed.self_id).chain(advert.path.iter().copied()).collect();
+    let msg = build_emergency(&EmAdvert { path, ..advert.clone() });
+    for link in &inner.fed.em_links {
+        if Some(*link) == except { continue; }
+        let Some(nbr_id) = inner.fed.links.get(link) else { continue };
+        if advert.path.contains(nbr_id) { continue; }
+        if let Some(client) = inner.clients.get(link) { let _ = client.tx.send(msg.clone()); }
+    }
+}
+
+/// Every active alarm held (own and relayed) for a link that just announced support.
+fn em_sync(inner: &Inner, nbr_id: u64) -> Vec<Vec<u8>> {
+    let now = crate::telemetry::now_ms();
+    let own = inner.fed.em_local.iter().map(|(issi, e)| EmAdvert {
+        issi: *issi, dest: e.dest, bts: e.bts.clone(), active: true, seq: e.seq, path: vec![inner.fed.self_id],
+    });
+    let learned = inner.fed.em_remote.iter()
+        .filter(|((_, _), e)| e.active && now.saturating_sub(e.seen_ms) < EM_STALE_MS)
+        .filter(|(_, e)| !e.path.contains(&nbr_id) && e.path.len() < MAX_PATH)
+        .map(|((_, issi), e)| EmAdvert {
+            issi: *issi, dest: e.dest, bts: e.bts.clone(), active: true, seq: e.seq,
+            path: std::iter::once(inner.fed.self_id).chain(e.path.iter().copied()).collect(),
+        });
+    own.chain(learned).map(|a| build_emergency(&a)).collect()
+}
+
+/// Stores a relayed alarm advert when newer than what is held for (origin, ISSI)
+/// and passes it on; ignored when it went through us or is from us.
+fn accept_em(inner: &mut Inner, source: ClientId, a: EmAdvert) {
+    let Some(&origin) = a.path.last() else { return };
+    if origin == inner.fed.self_id || a.path.contains(&inner.fed.self_id) { return; }
+    let key = (origin, a.issi);
+    if inner.fed.em_remote.get(&key).is_some_and(|old| old.seq >= a.seq) { return; }
+    inner.fed.em_remote.insert(key, RemoteEm {
+        dest: a.dest, bts: a.bts.clone(), active: a.active, seq: a.seq,
+        path: a.path.clone(), seen_ms: crate::telemetry::now_ms(),
+    });
+    relay_em(inner, Some(source), &a);
+}
+
+/// Advertises (or, with `active == false`, clears) one of this server's own
+/// emergency alarms to every link that supports it.
+pub async fn advertise_emergency(state: &Arc<AppState>, issi: u32, dest: Option<u32>, bts: &str, active: bool) {
+    let mut inner = state.inner.write().await;
+    let prev = inner.fed.em_local.get(&issi).map(|e| e.seq).unwrap_or(0);
+    let seq = crate::telemetry::now_ms().max(prev.saturating_add(1));
+    if active {
+        inner.fed.em_local.insert(issi, LocalEm { dest, bts: bts.to_string(), seq });
+    } else if inner.fed.em_local.remove(&issi).is_none() {
+        return;
+    }
+    let advert = EmAdvert { issi, dest, bts: bts.to_string(), active, seq, path: Vec::new() };
+    relay_em(&inner, None, &advert);
+}
+
 /// Sends a mobile station advert (path as received, sender first) to every
 /// link that announced support except `except`, this server in front; same
 /// skip rules as `relay_bts`.
@@ -768,6 +916,7 @@ pub async fn advertise_ms(state: &Arc<AppState>, issi: u32, lat: f64, lon: f64, 
 /// Drops learned positions not refreshed for `BTS_STALE_MS`.
 pub fn purge_bts(inner: &mut Inner) {
     let now = crate::telemetry::now_ms();
+    inner.fed.em_remote.retain(|_, e| now.saturating_sub(e.seen_ms) < EM_STALE_MS);
     inner.fed.bts_remote.retain(|_, b| now.saturating_sub(b.seen_ms) < BTS_STALE_MS);
 }
 
@@ -838,10 +987,18 @@ pub async fn handle(state: &Arc<AppState>, source: ClientId, raw: &[u8]) {
                     inner.fed.ms_links.insert(source);
                     msgs.extend(ms_sync(&inner, nbr_id));
                 }
+                if version >= 3 {
+                    inner.fed.em_links.insert(source);
+                    msgs.extend(em_sync(&inner, nbr_id));
+                }
                 info!(%source, neighbour = %format_server_id(nbr_id), positions = msgs.len(), "federation: peer supports Basestation positions; synced");
                 if let Some(client) = inner.clients.get(&source) {
                     for m in msgs { let _ = client.tx.send(m); }
                 }
+                None
+            }
+            FedMessage::Emergency(advert) => {
+                accept_em(&mut inner, source, advert);
                 None
             }
             FedMessage::MsPos(advert) => {
@@ -931,6 +1088,19 @@ mod tests {
         long.push(0);
         assert!(parse(&long, 7).is_err());
         assert!(parse(&build_ms_pos(&MsAdvert { path: vec![7, 8, 7], ..a }), 7).is_err());
+    }
+
+    #[test]
+    fn emergency_advert_round_trips_and_rejects_bad_input() {
+        let a = EmAdvert { issi: 4013, dest: Some(91), bts: "bts2".into(), active: true, seq: 1_700_000_000_000, path: vec![7, 8] };
+        assert_eq!(parse(&build_emergency(&a), 7), Ok(FedMessage::Emergency(a.clone())));
+        let none = EmAdvert { dest: None, active: false, ..a.clone() };
+        assert_eq!(parse(&build_emergency(&none), 7), Ok(FedMessage::Emergency(none)));
+        assert!(parse(&build_emergency(&a), 9).is_err());
+        let mut long = build_emergency(&a);
+        long.push(0);
+        assert!(parse(&long, 7).is_err());
+        assert!(parse(&build_emergency(&EmAdvert { path: vec![7, 8, 7], ..a }), 7).is_err());
     }
 
     #[test]
@@ -1146,7 +1316,7 @@ mod tests {
         let mut inner = Inner::default();
         inner.sds_routes.insert(id, SdsRoute {
             source_client: a, targets: HashSet::new(), source_issi: 1001, destination: 2002,
-            created_at: Instant::now(), store_offline: false,
+            created_at: Instant::now(), store_offline: false, lip_only: false, held_header: None,
         });
         assert!(is_duplicate(&inner, id, 1001, b, Instant::now()));
         assert!(!is_duplicate(&inner, id, 1001, a, Instant::now()));
@@ -1407,6 +1577,62 @@ mod mesh_tests {
         }
     }
 
+    /// An emergency alarm raised on one server is shown on every server -- kept
+    /// there until it is cleared at its origin, not only while a call runs --
+    /// and loses nothing in a ring (each server forwards each advert once).
+    #[tokio::test]
+    async fn emergency_alarms_flood_a_ring_stay_until_cleared_and_skip_older_peers() {
+        let mut net = Net::new(4, true).await;
+        net.link(0, 1, true).await;
+        net.link(1, 2, true).await;
+        net.link(2, 0, true).await;
+        net.link(2, 3, false).await; // a legacy link: nothing of class federation
+        {
+            let mut t = net.nodes[0].state.telemetry.write().await;
+            t.add_test_station("bts2", None, "bts2");
+            t.stations.get_mut("bts2").unwrap().emergencies.insert(4013);
+        }
+        let mut adv = crate::emergency::AdvertState::default();
+        crate::emergency::advertise_if_due(&net.nodes[0].state, &mut adv).await;
+        let crossed = net.pump().await;
+        assert!(crossed <= 4, "each server forwards the advert at most once, saw {crossed}");
+        for n in [1, 2] {
+            let list = crate::emergency::snapshot(&net.nodes[n].state).await;
+            assert_eq!(list.len(), 1, "node {n}");
+            assert!(list[0].issi == 4013 && list[0].bts.as_deref().is_some_and(|b| b.starts_with("bts2 @ ")));
+        }
+        assert!(crate::emergency::snapshot(&net.nodes[3].state).await.is_empty());
+
+        // Unchanged and fresh: nothing is re-sent; cleared: it goes out as cleared.
+        crate::emergency::advertise_if_due(&net.nodes[0].state, &mut adv).await;
+        assert_eq!(net.pump().await, 0);
+        net.nodes[0].state.telemetry.write().await.stations.get_mut("bts2").unwrap().emergencies.clear();
+        crate::emergency::advertise_if_due(&net.nodes[0].state, &mut adv).await;
+        net.pump().await;
+        for n in [1, 2] {
+            assert!(crate::emergency::snapshot(&net.nodes[n].state).await.is_empty(), "node {n}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relayed_alarm_expires_without_refresh_and_a_new_peer_is_synced() {
+        let mut net = Net::new(3, true).await;
+        net.link(0, 1, true).await;
+        crate::fedroute::advertise_emergency(&net.nodes[0].state.clone(), 4013, Some(91), "bts2", true).await;
+        net.pump().await;
+        // A server that links later is told what is active.
+        net.link(1, 2, true).await;
+        assert_eq!(crate::emergency::snapshot(&net.nodes[2].state).await.len(), 1);
+        // The origin goes quiet: the relayed alarm times out.
+        for n in [1, 2] {
+            let mut inner = net.nodes[n].state.inner.write().await;
+            for e in inner.fed.em_remote.values_mut() { e.seen_ms = e.seen_ms.saturating_sub(EM_STALE_MS + 1); }
+        }
+        for n in [1, 2] {
+            assert!(crate::emergency::snapshot(&net.nodes[n].state).await.is_empty(), "node {n}");
+        }
+    }
+
     #[tokio::test]
     async fn bts_sync_on_hello_gives_a_new_link_what_is_known() {
         let mut net = Net::new(3, true).await;
@@ -1493,6 +1719,51 @@ mod mesh_tests {
         net.bs_send(1, build_circular_call_setup(&call, 2001, 2004, 0)).await;
         assert_eq!(of_type(&net.heard(4), CLASS_CALL_CONTROL, CALL_SETUP_REQUEST), 1);
         net.check_tables().await;
+    }
+
+    /// An emergency group call reaches the dispatch consoles of every server --
+    /// even where nobody is in the group -- at priority 15, exactly once, and
+    /// settles in a ring and in a mesh. An ordinary call stays on its route.
+    #[tokio::test]
+    async fn emergency_group_call_reaches_every_servers_consoles_once_in_a_ring_and_a_mesh() {
+        for ring in [true, false] {
+            let mut net = Net::new(5, true).await;
+            for a in 0..5 {
+                if ring {
+                    net.link(a, (a + 1) % 5, true).await;
+                } else {
+                    for b in a + 1..5 { net.link(a, b, true).await; }
+                }
+            }
+            // Group 91 has a member on node 0 only; each server has a console listening to nothing.
+            net.register(0, 2000, &[91]).await;
+            let mut consoles = Vec::new();
+            for node in 0..5 {
+                let (client, rx) = connection(ClientMode::Basestation);
+                let id = Uuid::new_v4();
+                let mut inner = net.nodes[node].state.inner.write().await;
+                inner.clients.insert(id, client);
+                inner.consoles.insert(id);
+                consoles.push(rx);
+            }
+            for node in 0..5 { net.heard(node); }
+
+            let group_tx = |rx: &mut mpsc::UnboundedReceiver<Vec<u8>>| -> Vec<Vec<u8>> {
+                std::iter::from_fn(|| rx.try_recv().ok()).filter(|m| m.get(..2) == Some(&[CLASS_CALL_CONTROL, CALL_GROUP_TX])).collect()
+            };
+            let id = Uuid::new_v4();
+            net.bs_send(2, build_group_tx(&id, 2002, 91, 15)).await;
+            for (node, rx) in consoles.iter_mut().enumerate() {
+                let heard = group_tx(rx);
+                assert_eq!(heard.len(), 1, "ring={ring} node {node}");
+                assert_eq!(heard[0][26], 15, "priority 15, ring={ring} node {node}");
+            }
+            // An ordinary call reaches no console.
+            net.bs_send(2, build_group_tx(&Uuid::new_v4(), 2002, 91, 0)).await;
+            for (node, rx) in consoles.iter_mut().enumerate() {
+                assert!(group_tx(rx).is_empty(), "ring={ring} node {node}");
+            }
+        }
     }
 
     /// A full mesh of 5 with one member of group 91 behind each server.

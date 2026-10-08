@@ -468,6 +468,9 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// Sends an SDS originated by the SMS Center to `client`, registering an
 /// `SdsRoute` so that client's `SDS_REPORT` reaches [`SmsCenter::on_report`].
 async fn originate(state: &Arc<AppState>, client: ClientId, brew_uuid: Uuid, source_issi: u32, destination: u32, length_bits: u16, data: &[u8]) -> bool {
+    if state.is_blocked(destination) {
+        return false; // stays queued; delivered if the ISSI is taken off the blacklist
+    }
     let tx = {
         let mut inner = state.inner.write().await;
         let Some(tx) = inner.clients.get(&client).map(|c| c.tx.clone()) else { return false };
@@ -480,6 +483,8 @@ async fn originate(state: &Arc<AppState>, client: ClientId, brew_uuid: Uuid, sou
                 destination,
                 created_at: Instant::now(),
                 store_offline: false,
+                lip_only: false,
+                held_header: None,
             },
         );
         tx

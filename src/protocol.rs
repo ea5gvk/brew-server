@@ -30,6 +30,8 @@ pub const FED_BTS_HELLO: u8 = 3;
 pub const FED_BTS: u8 = 4;
 /// A mobile station position advert (needs a `FED_BTS_HELLO` of version >= 2).
 pub const FED_MS_POS: u8 = 5;
+/// An emergency alarm advert (needs a `FED_BTS_HELLO` of version >= 3).
+pub const FED_EMERGENCY: u8 = 6;
 
 pub const SUB_DEREGISTER: u8 = 0;
 pub const SUB_REGISTER: u8 = 1;
@@ -74,6 +76,28 @@ pub const FRAME_DTMF: u8 = 3;
 /// `{"issi": N, "rssi_dbfs": F}`. Not in the original Brew spec this server
 /// was built against, but sent by at least one real client (nexus-bs).
 pub const SERVICE_RSSI: u8 = 0x10;
+
+/// `CLASS_SERVICE` type this server pushes to dispatch consoles: the active
+/// emergencies, `{"emergencies":[{"issi":N,"dest":G|null}]}` (see `emergency`).
+pub const SERVICE_EMERGENCY: u8 = 0x11;
+
+/// `CLASS_SERVICE` type a dispatch console sends to edit the ISSI blacklist:
+/// `{"action":"block"|"unblock","issi":N}` (see `blacklist`).
+pub const SERVICE_BLACKLIST_CMD: u8 = 0x12;
+
+/// `CLASS_SERVICE` type this server pushes to dispatch consoles: the blacklist,
+/// `{"blacklist":[N,...],"can_edit":bool}`, or `{"error":"..."}` for a refused edit.
+pub const SERVICE_BLACKLIST: u8 = 0x13;
+
+/// Builds a `CLASS_SERVICE` message: class, type, NUL-terminated JSON.
+pub fn build_service(service_type: u8, json: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + json.len());
+    out.push(CLASS_SERVICE);
+    out.push(service_type);
+    out.extend_from_slice(json.as_bytes());
+    out.push(0);
+    out
+}
 
 #[derive(Debug, Clone)]
 pub enum BrewMessage {

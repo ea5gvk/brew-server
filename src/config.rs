@@ -44,6 +44,8 @@ pub struct Config {
     /// logs in as that Basestation, no separate ID scheme needed. Purely
     /// informational (dashboard map markers); has no effect on routing.
     pub bts_locations: HashMap<String, BtsLocationConfig>,
+    /// ISSIs barred from communicating through this server. See `BlacklistConfig`.
+    pub blacklist: BlacklistConfig,
     /// Active/standby pair: two brew-servers on one LAN sharing a virtual IP.
     /// See `ha`.
     pub ha: HaConfig,
@@ -151,6 +153,23 @@ impl HaConfig {
         }
         Ok(())
     }
+}
+
+/// ISSIs barred from communicating through this server. A listed ISSI may still
+/// register (so dispatch can reach it) but cannot transmit to a group, make or
+/// receive private calls, or send or receive SDS -- except that a dispatch
+/// ambience-listening (SS-AL) call to it, and LIP position traffic (SDS protocol
+/// 0x0A / 0x83) in either direction, still work. It cannot be silenced as a
+/// listener of a group call: group audio is delivered per Basestation, not per
+/// radio.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlacklistConfig {
+    pub issis: Vec<u32>,
+    /// Brew usernames of Tetra Dispatch consoles allowed to edit the blacklist
+    /// over their Brew link. Empty (the default): consoles can see the list
+    /// but not change it.
+    pub console_users: Vec<String>,
 }
 
 /// One Basestation's fixed location, for the dashboard MS map. Keyed by Brew
@@ -721,6 +740,7 @@ impl Default for Config {
             aprs: AprsConfig::default(),
             sms_center: SmsCenterConfig::default(),
             bts_locations: HashMap::new(),
+            blacklist: BlacklistConfig::default(),
             ha: HaConfig::default(),
         }
     }

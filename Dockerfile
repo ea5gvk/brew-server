@@ -20,13 +20,13 @@ RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/brew-server b
     && setcap cap_net_raw+ep "$(readlink -f "$(command -v ping)")"
 COPY --from=build /src/target/release/brew-server /usr/local/bin/brew-server
 COPY --from=build /src/target/release/brew-history /usr/local/bin/brew-history
-COPY brew-server.toml /etc/brew-server.toml
+COPY sample/brew-server.toml /etc/brew-server.toml
 WORKDIR /var/lib/brew-server
 RUN chown brew:brew /var/lib/brew-server
 USER brew
 # Brew (9000), Basestation Telemetry (9001), Basestation Control (9002),
 # monitoring dashboard (9003), SIP signalling (5060/udp) -- all off by
-# default except Brew/dashboard, see brew-server.toml. The RTP media port
+# default except Brew/dashboard, see sample/brew-server.toml. The RTP media port
 # range (default 16000-17000/udp, [sip] rtp_port_min/max) is not fixed-size
 # enough to EXPOSE meaningfully; publish it explicitly in the compose file
 # or `docker run -p` instead.

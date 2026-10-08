@@ -2,6 +2,61 @@
 
 All notable changes to brew-server, newest first.
 
+Version 1.16.2 adds:
+
+- **Example configs in `sample/`.** The example `brew-server.toml` moved to
+  `sample/brew-server.toml`; the Dockerfile, docker-compose and README point at
+  it. Run with your own copy, or `brew-server sample/brew-server.toml`.
+- **A 0/0 position is never plotted.** A no-fix report -- including the
+  `LIP position: 0.000000, 0.000000` text a FlowStation sends -- no longer
+  puts a radio on the map at Null Island (parser, store and map page).
+- **Emergency alarms relayed across federation.** An emergency alarm now
+  crosses loop-safe federation links (`FED_EMERGENCY`, negotiated with the
+  position hello, version 3) and stays on every server -- ribbon, red map
+  marker and dispatch consoles -- until it is cleared at its origin, instead
+  of vanishing from a federated server when the call ends. Refreshed every
+  10 s, dropped after 30 s without one.
+- **Block ISSIs from Tetra Dispatch.** A console can block and unblock ISSIs
+  over its Brew link (service messages `0x12` / `0x13`). brew-server obeys
+  only a console whose Brew username is in the new `[blacklist] console_users`
+  (empty by default = view only), applies it live, saves the config without a
+  restart, and pushes the list to every console. Needs Tetra Dispatch 1.2.0.
+- **Red marker for a radio in an emergency.** On the MS Map a radio with an
+  active emergency (alarm or emergency call) turns red, pulses and its popup
+  says EMERGENCY; the map note names it too.
+- **Emergency list pushed to dispatch consoles.** Every second brew-server
+  checks the active emergencies (Basestation alarms plus live emergency
+  calls, relayed ones included) and pushes the list to every connected Tetra
+  Dispatch console as a `CLASS_SERVICE` message (type `0x11`) whenever it
+  changes, and every 5 s while any is active. A console shows the red ribbon
+  and marker even for an alarm with no call running. Needs Tetra Dispatch 1.2.0.
+- **Emergency calls reach dispatch consoles and every server.** An emergency
+  group call is now also pushed to every federation peer, even one that does
+  not route the group, so it reaches all brew-servers (loop-safe and plain
+  links alike; a ring or mesh prunes the duplicate copies), and to every
+  connected Tetra Dispatch console (recognised by its
+  `TetraDispatch/` User-Agent), whatever groups it listens to, with its voice
+  and end. A call is an emergency when it is at priority 15 *or* its radio has
+  an emergency alarm active on a Basestation: FlowStation forwards its radios'
+  calls at priority 0, so the alarm is what marks them. For consoles and
+  federation peers such a call is forwarded with priority 15, and one already
+  running when the alarm arrives is upgraded mid-call. Ordinary calls still
+  follow affiliations. Needs Tetra Dispatch 1.2.0.
+- **Red emergency ribbon.** Like FlowStation's: a sticky red "EMERGENCY ACTIVE"
+  ribbon at the top of the dashboard lists each active emergency -- a
+  Basestation emergency alarm (with the called group once its radio is in a
+  call), or a live priority-15 call seen on the Brew channel -- and tags a
+  blacklisted ISSI.
+- **ISSI blacklist.** A new `[blacklist] issis = [...]` list and a Settings
+  panel bar an ISSI from communicating through the server: its group
+  transmissions are dropped, private calls from or to it are rejected, SDS
+  from or to it is dropped and SIP calls to it are refused. Dispatch
+  ambience listening (SS-AL) to it and LIP position traffic in both
+  directions still work, and it can still register. Edits in Settings apply
+  immediately with no process restart. Emergency calls (priority 15, or from
+  an ISSI with an active emergency alarm) are never blocked. See the ISSI-Blacklist wiki page
+  (`docs/ISSI-Blacklist.md`).
+
 Version 1.16.0 adds:
 
 - **Basestation positions over telemetry, relayed between servers.** A

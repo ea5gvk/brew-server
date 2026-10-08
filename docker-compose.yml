@@ -10,7 +10,8 @@ services:
       - "5060:5060/udp"   # SIP signalling (optional, [sip] enabled)
       - "16000-17000:16000-17000/udp" # SIP RTP media (must match [sip] rtp_port_min/max)
     volumes:
-      - ./brew-server.toml:/etc/brew-server.toml:ro
+      # The shipped example; copy it, edit it and point this at your copy for a real deployment.
+      - ./sample/brew-server.toml:/etc/brew-server.toml:ro
       # Mount TLS cert/key when [tls]/[telemetry.tls]/[control.tls] enabled =
       # true (paths must match brew-server.toml; the shipped example uses
       # absolute /etc/ssl/brew/... paths for these three). [dashboard.tls] in
