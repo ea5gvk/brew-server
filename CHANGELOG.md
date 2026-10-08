@@ -2,8 +2,14 @@
 
 All notable changes to brew-server, newest first.
 
-Unreleased adds:
+Version 1.16.2 adds:
 
+- **Example configs in `sample/`.** The example `brew-server.toml` moved to
+  `sample/brew-server.toml`; the Dockerfile, docker-compose and README point at
+  it. Run with your own copy, or `brew-server sample/brew-server.toml`.
+- **A 0/0 position is never plotted.** A no-fix report -- including the
+  `LIP position: 0.000000, 0.000000` text a FlowStation sends -- no longer
+  puts a radio on the map at Null Island (parser, store and map page).
 - **Emergency alarms relayed across federation.** An emergency alarm now
   crosses loop-safe federation links (`FED_EMERGENCY`, negotiated with the
   position hello, version 3) and stays on every server -- ribbon, red map
@@ -14,9 +20,7 @@ Unreleased adds:
   over its Brew link (service messages `0x12` / `0x13`). brew-server obeys
   only a console whose Brew username is in the new `[blacklist] console_users`
   (empty by default = view only), applies it live, saves the config without a
-  restart, and pushes the list to every console. Needs the matching Tetra
-  Dispatch.
-
+  restart, and pushes the list to every console. Needs Tetra Dispatch 1.2.0.
 - **Red marker for a radio in an emergency.** On the MS Map a radio with an
   active emergency (alarm or emergency call) turns red, pulses and its popup
   says EMERGENCY; the map note names it too.
@@ -25,9 +29,7 @@ Unreleased adds:
   calls, relayed ones included) and pushes the list to every connected Tetra
   Dispatch console as a `CLASS_SERVICE` message (type `0x11`) whenever it
   changes, and every 5 s while any is active. A console shows the red ribbon
-  and marker even for an alarm with no call running. Needs the matching
-  Tetra Dispatch.
-
+  and marker even for an alarm with no call running. Needs Tetra Dispatch 1.2.0.
 - **Emergency calls reach dispatch consoles and every server.** An emergency
   group call is now also pushed to every federation peer, even one that does
   not route the group, so it reaches all brew-servers (loop-safe and plain
@@ -39,9 +41,7 @@ Unreleased adds:
   calls at priority 0, so the alarm is what marks them. For consoles and
   federation peers such a call is forwarded with priority 15, and one already
   running when the alarm arrives is upgraded mid-call. Ordinary calls still
-  follow affiliations. Needs a Tetra Dispatch that handles it (see its
-  changelog).
-
+  follow affiliations. Needs Tetra Dispatch 1.2.0.
 - **Red emergency ribbon.** Like FlowStation's: a sticky red "EMERGENCY ACTIVE"
   ribbon at the top of the dashboard lists each active emergency -- a
   Basestation emergency alarm (with the called group once its radio is in a
